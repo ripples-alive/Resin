@@ -38,6 +38,7 @@ func newTestServer() *Server {
 		ProxyTransportMaxIdleConns:                      1024,
 		ProxyTransportMaxIdleConnsPerHost:               64,
 		ProxyTransportIdleConnTimeout:                   90 * time.Second,
+		EnableEmbeddedSecureDNS:                         true,
 		RequestLogQueueSize:                             8192,
 		RequestLogQueueFlushBatchSize:                   4096,
 		RequestLogQueueFlushInterval:                    5 * time.Minute,
@@ -322,6 +323,9 @@ func TestSystemEnvConfig_OK(t *testing.T) {
 	}
 	if body["probe_timeout"] != "15s" {
 		t.Errorf("probe_timeout: got %q, want %q", body["probe_timeout"], "15s")
+	}
+	if body["enable_embedded_secure_dns"] != true {
+		t.Errorf("enable_embedded_secure_dns: got %v, want true", body["enable_embedded_secure_dns"])
 	}
 	if body["admin_token_set"] != true {
 		t.Errorf("admin_token_set: got %v, want true", body["admin_token_set"])

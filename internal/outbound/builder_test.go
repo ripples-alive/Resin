@@ -34,8 +34,31 @@ func TestNewSingboxBuilder(t *testing.T) {
 	}
 }
 
-func TestNewSingboxBuilder_ConfiguresSecureDNSChain(t *testing.T) {
+func TestNewSingboxBuilder_DefaultsToLocalSystemDNS(t *testing.T) {
+	t.Setenv("RESIN_ENABLE_EMBEDDED_SECURE_DNS", "")
 	b, err := NewSingboxBuilder()
+	if err != nil {
+		t.Fatalf("NewSingboxBuilder() error: %v", err)
+	}
+	defer b.Close()
+
+	defaultTransport := b.dnsTransportManager.Default()
+	if defaultTransport == nil {
+		t.Fatal("expected default DNS transport")
+	}
+	if defaultTransport.Tag() != localDNSTransportTag {
+		t.Fatalf("default DNS transport: got %q, want %q", defaultTransport.Tag(), localDNSTransportTag)
+	}
+	if _, ok := b.dnsTransportManager.Transport(localDNSTransportTag); !ok {
+		t.Fatalf("expected local DNS transport %q to be registered", localDNSTransportTag)
+	}
+	if transport, ok := b.dnsTransportManager.Transport(secureDNSFailoverTransportTag); ok || transport != nil {
+		t.Fatalf("secure DNS transport should be disabled by default")
+	}
+}
+
+func TestNewSingboxBuilder_ConfiguresSecureDNSChainWhenEnabled(t *testing.T) {
+	b, err := NewSingboxBuilderWithSecureDNS(true)
 	if err != nil {
 		t.Fatalf("NewSingboxBuilder() error: %v", err)
 	}
@@ -81,6 +104,16 @@ func TestNewSingboxBuilder_ConfiguresSecureDNSChain(t *testing.T) {
 	}
 	if got := failover.Dependencies(); !equalStrings(got, wantFailoverDeps) {
 		t.Fatalf("secure DNS dependencies: got %v, want %v", got, wantFailoverDeps)
+	}
+}
+
+func TestDNSTransportSpecs_LocalOnlyWhenSecureDNSDisabled(t *testing.T) {
+	specs := dnsTransportSpecs(false)
+	if len(specs) != 1 {
+		t.Fatalf("dnsTransportSpecs(false) length: got %d, want 1", len(specs))
+	}
+	if specs[0].tag != localDNSTransportTag {
+		t.Fatalf("dnsTransportSpecs(false)[0].tag: got %q, want %q", specs[0].tag, localDNSTransportTag)
 	}
 }
 

@@ -41,7 +41,17 @@ type SingboxBuilder struct {
 
 // NewSingboxBuilder creates a SingboxBuilder with a complete sing-box service
 // graph (registries + DNS). The caller must call Close() when done.
+//
+// By default Resin uses the system/local DNS transport only. Use
+// NewSingboxBuilderWithSecureDNS(true) to enable the embedded DoH/DoT
+// failover chain.
 func NewSingboxBuilder() (*SingboxBuilder, error) {
+	return NewSingboxBuilderWithSecureDNS(false)
+}
+
+// NewSingboxBuilderWithSecureDNS is NewSingboxBuilder with an explicit secure
+// DNS switch, mainly for tests and callers that already parsed configuration.
+func NewSingboxBuilderWithSecureDNS(enableEmbeddedSecureDNS bool) (*SingboxBuilder, error) {
 	ctx := context.Background()
 	ctx = include.Context(ctx) // inject protocol registries
 
@@ -52,7 +62,9 @@ func NewSingboxBuilder() (*SingboxBuilder, error) {
 	if !ok {
 		return nil, fmt.Errorf("singbox builder: unexpected DNS transport registry type %T", service.FromContext[adapter.DNSTransportRegistry](ctx))
 	}
-	registerSecureDNSTransport(dnsRegistry)
+	if enableEmbeddedSecureDNS {
+		registerSecureDNSTransport(dnsRegistry)
+	}
 
 	// --- Service graph (same order as Demos/simple-proxy/main.go) -----------
 
@@ -69,14 +81,18 @@ func NewSingboxBuilder() (*SingboxBuilder, error) {
 	service.MustRegister[adapter.OutboundManager](ctx, outboundMgr)
 
 	// DNS Transport Manager
-	dnsTransportMgr := dns.NewTransportManager(logger, service.FromContext[adapter.DNSTransportRegistry](ctx), outboundMgr, secureDNSFailoverTransportTag)
+	defaultDNSTransportTag := localDNSTransportTag
+	if enableEmbeddedSecureDNS {
+		defaultDNSTransportTag = secureDNSFailoverTransportTag
+	}
+	dnsTransportMgr := dns.NewTransportManager(logger, service.FromContext[adapter.DNSTransportRegistry](ctx), outboundMgr, defaultDNSTransportTag)
 	service.MustRegister[adapter.DNSTransportManager](ctx, dnsTransportMgr)
 
 	// DNS Router
 	dnsRouter := dns.NewRouter(ctx, logFactory, option.DNSOptions{})
 	service.MustRegister[adapter.DNSRouter](ctx, dnsRouter)
 
-	for _, spec := range secureDNSTransportSpecs() {
+	for _, spec := range dnsTransportSpecs(enableEmbeddedSecureDNS) {
 		if err := dnsTransportMgr.Create(ctx, logger, spec.tag, spec.transportType, spec.options); err != nil {
 			return nil, fmt.Errorf("singbox builder: create DNS transport %s[%s]: %w", spec.transportType, spec.tag, err)
 		}

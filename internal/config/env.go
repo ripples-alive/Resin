@@ -44,6 +44,7 @@ type EnvConfig struct {
 	ProxyTransportMaxIdleConns                      int
 	ProxyTransportMaxIdleConnsPerHost               int
 	ProxyTransportIdleConnTimeout                   time.Duration
+	EnableEmbeddedSecureDNS                         bool
 
 	// Request log
 	RequestLogQueueSize           int
@@ -113,6 +114,7 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	cfg.ProxyTransportMaxIdleConns = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS", 1024, &errs)
 	cfg.ProxyTransportMaxIdleConnsPerHost = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST", 64, &errs)
 	cfg.ProxyTransportIdleConnTimeout = envDuration("RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT", 90*time.Second, &errs)
+	cfg.EnableEmbeddedSecureDNS = envBool("RESIN_ENABLE_EMBEDDED_SECURE_DNS", false, &errs)
 
 	// --- Request log ---
 	cfg.RequestLogQueueSize = envInt("RESIN_REQUEST_LOG_QUEUE_SIZE", 8192, &errs)
@@ -357,6 +359,22 @@ func envDuration(key string, defaultVal time.Duration, errs *[]string) time.Dura
 		return defaultVal
 	}
 	return d
+}
+
+func envBool(key string, defaultVal bool, errs *[]string) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return defaultVal
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		*errs = append(*errs, fmt.Sprintf("%s: invalid boolean %q", key, v))
+		return defaultVal
+	}
 }
 
 func envStringSlice(key string, defaultVal []string, errs *[]string) []string {

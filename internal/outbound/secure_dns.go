@@ -50,6 +50,19 @@ func registerSecureDNSTransport(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[secureDNSFailoverOptions](registry, secureDNSFailoverTransportType, newSecureDNSFailoverTransport)
 }
 
+func dnsTransportSpecs(enableEmbeddedSecureDNS bool) []secureDNSTransportSpec {
+	if !enableEmbeddedSecureDNS {
+		return []secureDNSTransportSpec{
+			{
+				tag:           localDNSTransportTag,
+				transportType: C.DNSTypeLocal,
+				options:       &option.LocalDNSServerOptions{},
+			},
+		}
+	}
+	return secureDNSTransportSpecs()
+}
+
 func secureDNSTransportSpecs() []secureDNSTransportSpec {
 	return []secureDNSTransportSpec{
 		{

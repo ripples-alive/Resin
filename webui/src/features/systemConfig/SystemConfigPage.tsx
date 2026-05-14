@@ -798,6 +798,10 @@ export function SystemConfigPage() {
                       <label className="field-label" style={{ margin: 0 }}>{t("空闲连接超时时间")}</label>
                       <Input readOnly disabled value={envBaseline.proxy_transport_idle_conn_timeout} />
                     </div>
+                    <div className="field-group">
+                      <label className="field-label" style={{ margin: 0 }}>{t("嵌入式安全 DNS")}</label>
+                      <Input readOnly disabled value={envBaseline.enable_embedded_secure_dns ? t("已启用") : t("未启用")} />
+                    </div>
                   </div>
                 </section>
 
