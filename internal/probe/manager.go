@@ -457,10 +457,11 @@ func (m *ProbeManager) scanEgress() {
 			return true // skip nil outbound
 		}
 
-		// Check if due: lastAttempt + interval - lookahead <= now.
+		// Check if due: lastAttempt + backoff(interval, failureCount) - lookahead <= now.
 		lastCheck := entry.LastEgressUpdateAttempt.Load()
 		if lastCheck > 0 {
-			nextDue := time.Unix(0, lastCheck).Add(interval).Add(-lookahead)
+			effectiveInterval := probeFailureBackoffInterval(interval, entry.FailureCount.Load())
+			nextDue := time.Unix(0, lastCheck).Add(effectiveInterval).Add(-lookahead)
 			if now.Before(nextDue) {
 				return true // not yet due
 			}
@@ -726,6 +727,18 @@ func (m *ProbeManager) tryDeleteTaskState(key probeTaskKey, state *probeTaskStat
 // isLatencyProbeDue checks whether a node needs a latency probe, based on
 // last probe-attempt timestamps (not latency-table timestamps).
 
+func probeFailureBackoffInterval(base time.Duration, failureCount int32) time.Duration {
+	if base <= 0 || failureCount <= 0 {
+		return base
+	}
+	exponent := failureCount
+	if exponent > 5 {
+		exponent = 5
+	}
+	multiplier := int64(1) << exponent
+	return base * time.Duration(multiplier)
+}
+
 func (m *ProbeManager) isLatencyProbeDue(
 	entry *node.NodeEntry,
 	now time.Time,
@@ -737,7 +750,8 @@ func (m *ProbeManager) isLatencyProbeDue(
 	if lastAny == 0 {
 		return true
 	}
-	anyDeadline := time.Unix(0, lastAny).Add(maxLatencyInterval).Add(-lookahead)
+	latencyInterval := probeFailureBackoffInterval(maxLatencyInterval, entry.FailureCount.Load())
+	anyDeadline := time.Unix(0, lastAny).Add(latencyInterval).Add(-lookahead)
 	if !now.Before(anyDeadline) {
 		return true
 	}
@@ -750,7 +764,8 @@ func (m *ProbeManager) isLatencyProbeDue(
 	if lastAuthority == 0 {
 		return true
 	}
-	authorityDeadline := time.Unix(0, lastAuthority).Add(maxAuthorityInterval).Add(-lookahead)
+	authorityInterval := probeFailureBackoffInterval(maxAuthorityInterval, entry.FailureCount.Load())
+	authorityDeadline := time.Unix(0, lastAuthority).Add(authorityInterval).Add(-lookahead)
 	return !now.Before(authorityDeadline)
 }
 

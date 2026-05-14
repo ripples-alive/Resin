@@ -1048,6 +1048,43 @@ func TestIsLatencyProbeDue_UsesAttemptTimestamps(t *testing.T) {
 	}
 }
 
+func TestProbeFailureBackoffInterval_CapsAt32x(t *testing.T) {
+	base := time.Hour
+	cases := []struct {
+		failures int32
+		want     time.Duration
+	}{
+		{failures: 0, want: base},
+		{failures: 1, want: 2 * base},
+		{failures: 2, want: 4 * base},
+		{failures: 3, want: 8 * base},
+		{failures: 4, want: 16 * base},
+		{failures: 5, want: 32 * base},
+		{failures: 6, want: 32 * base},
+	}
+	for _, tc := range cases {
+		if got := probeFailureBackoffInterval(base, tc.failures); got != tc.want {
+			t.Fatalf("failures=%d: got %s, want %s", tc.failures, got, tc.want)
+		}
+	}
+}
+
+func TestIsLatencyProbeDue_AppliesFailureBackoff(t *testing.T) {
+	mgr := NewProbeManager(ProbeConfig{})
+	hash := node.HashFromRawOptions([]byte(`{"type":"latency-backoff"}`))
+	entry := node.NewNodeEntry(hash, []byte(`{"type":"latency-backoff"}`), time.Now(), 16)
+	now := time.Now()
+	entry.FailureCount.Store(2) // 4x backoff
+	entry.LastLatencyProbeAttempt.Store(now.Add(-2 * time.Hour).UnixNano())
+	if mgr.isLatencyProbeDue(entry, now, time.Hour, 3*time.Hour, nil, 0) {
+		t.Fatal("expected not due before 4x backoff interval")
+	}
+	entry.LastLatencyProbeAttempt.Store(now.Add(-4 * time.Hour).UnixNano())
+	if !mgr.isLatencyProbeDue(entry, now, time.Hour, 3*time.Hour, nil, 0) {
+		t.Fatal("expected due after 4x backoff interval")
+	}
+}
+
 // TestParseCloudflareTrace_Success verifies IP extraction from trace body.
 func TestParseCloudflareTrace_Success(t *testing.T) {
 	body := []byte("fl=abc\nip=1.2.3.4\nloc=US\nts=12345")
