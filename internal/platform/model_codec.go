@@ -15,6 +15,10 @@ func isLowerAlpha2(s string) bool {
 	return s[0] >= 'a' && s[0] <= 'z' && s[1] >= 'a' && s[1] <= 'z'
 }
 
+func isValidRegionFilterCode(s string) bool {
+	return isLowerAlpha2(s) || s == "global"
+}
+
 // ValidateRegionFilters validates region filters against lowercase ISO alpha-2 format.
 // Entries may optionally be prefixed with "!" to indicate negation (e.g. !hk).
 func ValidateRegionFilters(regionFilters []string) error {
@@ -23,8 +27,8 @@ func ValidateRegionFilters(regionFilters []string) error {
 		if len(r) > 0 && r[0] == '!' {
 			code = r[1:]
 		}
-		if !isLowerAlpha2(code) {
-			return fmt.Errorf("region_filters[%d]: must be a 2-letter lowercase ISO 3166-1 alpha-2 code (e.g. us, jp) or negation (e.g. !hk)", i)
+		if !isValidRegionFilterCode(code) {
+			return fmt.Errorf("region_filters[%d]: must be a 2-letter lowercase ISO 3166-1 alpha-2 code (e.g. us, jp), global, or negation (e.g. !hk)", i)
 		}
 	}
 	return nil

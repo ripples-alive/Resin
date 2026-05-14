@@ -349,13 +349,17 @@ func TestTriggerImmediateEgressProbe_WithFetcher(t *testing.T) {
 	storeOutbound(entry)
 
 	var called sync.WaitGroup
+	var calledOnce sync.Once
 	called.Add(1)
 	mgr := NewProbeManager(ProbeConfig{
 		Pool:        pool,
 		Concurrency: 1,
 		Fetcher: func(_ node.Hash, url string) ([]byte, time.Duration, error) {
-			defer called.Done()
-			return []byte("ip=198.51.100.1"), 10 * time.Millisecond, nil
+			calledOnce.Do(called.Done)
+			if url == egressTraceURL {
+				return []byte("ip=198.51.100.1"), 10 * time.Millisecond, nil
+			}
+			return []byte("198.51.100.1"), 10 * time.Millisecond, nil
 		},
 	})
 	mgr.Start()
@@ -559,11 +563,14 @@ func TestProbeManager_StopWaitsImmediateProbe(t *testing.T) {
 		Pool:        pool,
 		Concurrency: 1,
 		Fetcher: func(_ node.Hash, url string) ([]byte, time.Duration, error) {
-			if calls.Add(1) == 1 {
+			if url == egressTraceURL && calls.Add(1) == 1 {
 				close(started)
 				<-release
 			}
-			return []byte("ip=203.0.113.1"), 10 * time.Millisecond, nil
+			if url == egressTraceURL {
+				return []byte("ip=203.0.113.1"), 10 * time.Millisecond, nil
+			}
+			return []byte("203.0.113.1"), 10 * time.Millisecond, nil
 		},
 	})
 	mgr.Start()
@@ -627,14 +634,17 @@ func TestProbeQueue_DuplicateQueuedNormalDoesNotRequeue(t *testing.T) {
 	mgr := NewProbeManager(ProbeConfig{
 		Pool:        pool,
 		Concurrency: 1,
-		Fetcher: func(hash node.Hash, _ string) ([]byte, time.Duration, error) {
-			if hash == hashBlocker {
+		Fetcher: func(hash node.Hash, url string) ([]byte, time.Duration, error) {
+			if hash == hashBlocker && url == egressTraceURL {
 				close(startedBlocker)
 				<-releaseBlocker
-			} else if hash == hashTarget {
+			} else if hash == hashTarget && url == egressTraceURL {
 				targetCalls.Add(1)
 			}
-			return []byte("ip=198.51.100.31"), 10 * time.Millisecond, nil
+			if url == egressTraceURL {
+				return []byte("ip=198.51.100.31"), 10 * time.Millisecond, nil
+			}
+			return []byte("198.51.100.31"), 10 * time.Millisecond, nil
 		},
 	})
 	defer mgr.Stop()
@@ -681,12 +691,15 @@ func TestProbeQueue_DuplicateRunningNormalDoesNotRequeue(t *testing.T) {
 	mgr := NewProbeManager(ProbeConfig{
 		Pool:        pool,
 		Concurrency: 1,
-		Fetcher: func(_ node.Hash, _ string) ([]byte, time.Duration, error) {
-			if calls.Add(1) == 1 {
+		Fetcher: func(_ node.Hash, url string) ([]byte, time.Duration, error) {
+			if url == egressTraceURL && calls.Add(1) == 1 {
 				close(started)
 				<-release
 			}
-			return []byte("ip=198.51.100.32"), 10 * time.Millisecond, nil
+			if url == egressTraceURL {
+				return []byte("ip=198.51.100.32"), 10 * time.Millisecond, nil
+			}
+			return []byte("198.51.100.32"), 10 * time.Millisecond, nil
 		},
 	})
 	defer mgr.Stop()
@@ -739,9 +752,12 @@ func TestProbeQueue_DequeueChoosesNormalWhenSelectorRequests(t *testing.T) {
 		ChooseNormalWhenBoth: func() bool {
 			return true
 		},
-		Fetcher: func(hash node.Hash, _ string) ([]byte, time.Duration, error) {
-			order <- hash
-			return []byte("ip=198.51.100.20"), 10 * time.Millisecond, nil
+		Fetcher: func(hash node.Hash, url string) ([]byte, time.Duration, error) {
+			if url == egressTraceURL {
+				order <- hash
+				return []byte("ip=198.51.100.20"), 10 * time.Millisecond, nil
+			}
+			return []byte("198.51.100.20"), 10 * time.Millisecond, nil
 		},
 	})
 	defer mgr.Stop()
@@ -794,9 +810,12 @@ func TestProbeQueue_HighUpgradeOfQueuedNormalRunsFirstWithoutExtraRun(t *testing
 		ChooseNormalWhenBoth: func() bool {
 			return false
 		},
-		Fetcher: func(hash node.Hash, _ string) ([]byte, time.Duration, error) {
-			order <- hash
-			return []byte("ip=198.51.100.21"), 10 * time.Millisecond, nil
+		Fetcher: func(hash node.Hash, url string) ([]byte, time.Duration, error) {
+			if url == egressTraceURL {
+				order <- hash
+				return []byte("ip=198.51.100.21"), 10 * time.Millisecond, nil
+			}
+			return []byte("198.51.100.21"), 10 * time.Millisecond, nil
 		},
 	})
 	defer mgr.Stop()
@@ -891,13 +910,16 @@ func TestProbeSync_BypassesAsyncWorkerLimit(t *testing.T) {
 	mgr := NewProbeManager(ProbeConfig{
 		Pool:        pool,
 		Concurrency: 1,
-		Fetcher: func(hash node.Hash, _ string) ([]byte, time.Duration, error) {
-			if hash == hashAsync {
+		Fetcher: func(hash node.Hash, url string) ([]byte, time.Duration, error) {
+			if hash == hashAsync && url == egressTraceURL {
 				startedOnce.Do(func() { close(started) })
 				<-release
 				return []byte("ip=198.51.100.31"), 20 * time.Millisecond, nil
 			}
-			return []byte("ip=198.51.100.32"), 5 * time.Millisecond, nil
+			if url == egressTraceURL {
+				return []byte("ip=198.51.100.32"), 5 * time.Millisecond, nil
+			}
+			return []byte("198.51.100.32"), 5 * time.Millisecond, nil
 		},
 	})
 	mgr.Start()

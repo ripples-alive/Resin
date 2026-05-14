@@ -584,6 +584,7 @@ type NodeSummary struct {
 	CircuitOpenSince                 *string   `json:"circuit_open_since"`
 	FailureCount                     int       `json:"failure_count"`
 	EgressIP                         string    `json:"egress_ip,omitempty"`
+	EgressIPs                        []string  `json:"egress_ips,omitempty"`
 	Region                           string    `json:"region,omitempty"`
 	LastEgressUpdate                 string    `json:"last_egress_update,omitempty"`
 	LastLatencyProbeAttempt          string    `json:"last_latency_probe_attempt,omitempty"`
@@ -629,6 +630,7 @@ func (s *ControlPlaneService) nodeEntryToSummary(h node.Hash, entry *node.NodeEn
 	egressIP := entry.GetEgressIP()
 	if egressIP.IsValid() {
 		ns.EgressIP = egressIP.String()
+		ns.EgressIPs = entry.GetObservedEgressIPStrings()
 		ns.Region = entry.GetRegion(nil)
 		if s.GeoIP != nil {
 			ns.Region = entry.GetRegion(s.GeoIP.Lookup)

@@ -543,6 +543,7 @@ func newFlushReaders(
 				FailureCount:                       int(entry.FailureCount.Load()),
 				CircuitOpenSince:                   entry.CircuitOpenSince.Load(),
 				EgressIP:                           egressStr,
+				EgressIPs:                          entry.GetObservedEgressIPStrings(),
 				EgressRegion:                       entry.GetEgressRegion(),
 				EgressUpdatedAtNs:                  entry.LastEgressUpdate.Load(),
 				LastLatencyProbeAttemptNs:          entry.LastLatencyProbeAttempt.Load(),
@@ -882,6 +883,9 @@ func restoreBootstrapNodeDynamics(
 			if ip, err := netip.ParseAddr(nd.EgressIP); err == nil {
 				entry.SetEgressIP(ip)
 			}
+		}
+		if len(nd.EgressIPs) > 0 {
+			entry.SetObservedEgressIPStrings(nd.EgressIPs)
 		}
 		entry.SetEgressRegion(nd.EgressRegion)
 		entry.LastEgressUpdate.Store(nd.EgressUpdatedAtNs)

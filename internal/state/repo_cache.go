@@ -76,11 +76,16 @@ func (r *CacheRepo) BulkUpsertNodesDynamic(nodes []model.NodeDynamic) error {
 		upsertNodesDynamicSQL,
 		nodes,
 		func(stmt *sql.Stmt, n model.NodeDynamic) error {
-			_, err := stmt.Exec(
+			egressIPsJSON, err := encodeStringSliceJSON(n.EgressIPs)
+			if err != nil {
+				return fmt.Errorf("encode node dynamic egress_ips: %w", err)
+			}
+			_, err = stmt.Exec(
 				n.Hash,
 				n.FailureCount,
 				n.CircuitOpenSince,
 				n.EgressIP,
+				egressIPsJSON,
 				n.EgressRegion,
 				n.EgressUpdatedAtNs,
 				n.LastLatencyProbeAttemptNs,
@@ -108,7 +113,7 @@ func (r *CacheRepo) BulkDeleteNodesDynamic(hashes []string) error {
 // LoadAllNodesDynamic reads all node dynamic records.
 func (r *CacheRepo) LoadAllNodesDynamic() ([]model.NodeDynamic, error) {
 	rows, err := r.db.Query(`
-		SELECT hash, failure_count, circuit_open_since, egress_ip, egress_region, egress_updated_at_ns,
+		SELECT hash, failure_count, circuit_open_since, egress_ip, egress_ips_json, egress_region, egress_updated_at_ns,
 		       last_latency_probe_attempt_ns, last_authority_latency_probe_attempt_ns, last_egress_update_attempt_ns
 		FROM nodes_dynamic`)
 	if err != nil {
@@ -119,11 +124,13 @@ func (r *CacheRepo) LoadAllNodesDynamic() ([]model.NodeDynamic, error) {
 	var result []model.NodeDynamic
 	for rows.Next() {
 		var n model.NodeDynamic
+		var egressIPsJSON string
 		if err := rows.Scan(
 			&n.Hash,
 			&n.FailureCount,
 			&n.CircuitOpenSince,
 			&n.EgressIP,
+			&egressIPsJSON,
 			&n.EgressRegion,
 			&n.EgressUpdatedAtNs,
 			&n.LastLatencyProbeAttemptNs,
@@ -132,6 +139,11 @@ func (r *CacheRepo) LoadAllNodesDynamic() ([]model.NodeDynamic, error) {
 		); err != nil {
 			return nil, err
 		}
+		egressIPs, err := decodeStringSliceJSON(egressIPsJSON)
+		if err != nil {
+			return nil, fmt.Errorf("decode node dynamic egress_ips for %s: %w", n.Hash, err)
+		}
+		n.EgressIPs = egressIPs
 		result = append(result, n)
 	}
 	return result, rows.Err()
@@ -388,11 +400,16 @@ func (r *CacheRepo) FlushTx(ops FlushOps) error {
 		}},
 		{"upsert_nodes_dynamic", upsertNodesDynamicSQL, len(ops.UpsertNodesDynamic), func(s *sql.Stmt, i int) error {
 			n := ops.UpsertNodesDynamic[i]
-			_, err := s.Exec(
+			egressIPsJSON, err := encodeStringSliceJSON(n.EgressIPs)
+			if err != nil {
+				return fmt.Errorf("encode node dynamic egress_ips: %w", err)
+			}
+			_, err = s.Exec(
 				n.Hash,
 				n.FailureCount,
 				n.CircuitOpenSince,
 				n.EgressIP,
+				egressIPsJSON,
 				n.EgressRegion,
 				n.EgressUpdatedAtNs,
 				n.LastLatencyProbeAttemptNs,
@@ -452,14 +469,15 @@ const (
 			created_at_ns    = excluded.created_at_ns`
 
 	upsertNodesDynamicSQL = `INSERT INTO nodes_dynamic (
-			hash, failure_count, circuit_open_since, egress_ip, egress_region, egress_updated_at_ns,
+			hash, failure_count, circuit_open_since, egress_ip, egress_ips_json, egress_region, egress_updated_at_ns,
 			last_latency_probe_attempt_ns, last_authority_latency_probe_attempt_ns, last_egress_update_attempt_ns
 		)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(hash) DO UPDATE SET
 			failure_count                          = excluded.failure_count,
 			circuit_open_since                     = excluded.circuit_open_since,
 			egress_ip                              = excluded.egress_ip,
+			egress_ips_json                        = excluded.egress_ips_json,
 			egress_region                          = excluded.egress_region,
 			egress_updated_at_ns                   = excluded.egress_updated_at_ns,
 			last_latency_probe_attempt_ns          = excluded.last_latency_probe_attempt_ns,

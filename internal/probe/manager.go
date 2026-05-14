@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,6 +77,12 @@ const (
 	defaultLatencyTestURL = "https://www.gstatic.com/generate_204"
 	defaultQueueCap       = 1024
 )
+
+var egressExtraIPURLs = []string{
+	"https://api.ipify.org",
+	"https://api-ipv4.ip.sb/ip",
+	"https://ifconfig.me/ip",
+}
 
 type probePriority uint8
 
@@ -836,8 +843,46 @@ func (m *ProbeManager) performEgressProbe(hash node.Hash) (netip.Addr, egressPro
 		m.pool.UpdateNodeEgressIP(hash, nil, nil)
 		return netip.Addr{}, egressProbeParseError, err
 	}
-	m.pool.UpdateNodeEgressIP(hash, &ip, loc)
+	extraIPs := m.fetchExtraEgressIPs(hash)
+	m.pool.UpdateNodeEgressIP(hash, &ip, loc, extraIPs...)
 	return ip, egressProbeNoError, nil
+}
+
+func (m *ProbeManager) fetchExtraEgressIPs(hash node.Hash) []netip.Addr {
+	type result struct {
+		idx int
+		ip  netip.Addr
+	}
+	ch := make(chan result, len(egressExtraIPURLs))
+	var wg sync.WaitGroup
+	for i, url := range egressExtraIPURLs {
+		wg.Add(1)
+		go func(idx int, url string) {
+			defer wg.Done()
+			body, _, err := m.fetcher(hash, url)
+			if err != nil {
+				return
+			}
+			ip, err := netip.ParseAddr(strings.TrimSpace(string(body)))
+			if err != nil {
+				return
+			}
+			ch <- result{idx: idx, ip: ip}
+		}(i, url)
+	}
+	wg.Wait()
+	close(ch)
+	byIdx := make([]netip.Addr, len(egressExtraIPURLs))
+	for res := range ch {
+		byIdx[res.idx] = res.ip
+	}
+	out := make([]netip.Addr, 0, len(byIdx))
+	for _, ip := range byIdx {
+		if ip.IsValid() {
+			out = append(out, ip)
+		}
+	}
+	return out
 }
 
 func (m *ProbeManager) performLatencyProbe(hash node.Hash, testURL string) error {

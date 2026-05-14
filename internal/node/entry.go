@@ -29,6 +29,7 @@ type NodeEntry struct {
 	mu              sync.RWMutex
 	subscriptionIDs []string
 	LastError       string
+	egressIPs       []netip.Addr
 
 	// Atomic dynamic fields for concurrent hot-path reads.
 	FailureCount     atomic.Int32
@@ -232,6 +233,92 @@ func (e *NodeEntry) GetEgressIP() netip.Addr {
 // SetEgressIP stores the node's egress IP.
 func (e *NodeEntry) SetEgressIP(ip netip.Addr) {
 	e.egressIP.Store(&ip)
+	e.SetObservedEgressIPs(ip, nil)
+}
+
+const maxObservedEgressIPs = 4
+
+// SetObservedEgressIPs stores a bounded, deduplicated observed egress IP list
+// with the primary Cloudflare IP first.
+func (e *NodeEntry) SetObservedEgressIPs(primary netip.Addr, extra []netip.Addr) {
+	seen := make(map[netip.Addr]struct{}, maxObservedEgressIPs)
+	observed := make([]netip.Addr, 0, maxObservedEgressIPs)
+	add := func(ip netip.Addr) {
+		if !ip.IsValid() {
+			return
+		}
+		ip = ip.Unmap()
+		if _, ok := seen[ip]; ok {
+			return
+		}
+		if len(observed) >= maxObservedEgressIPs {
+			return
+		}
+		seen[ip] = struct{}{}
+		observed = append(observed, ip)
+	}
+	add(primary)
+	for _, ip := range extra {
+		add(ip)
+	}
+
+	e.mu.Lock()
+	e.egressIPs = observed
+	e.mu.Unlock()
+}
+
+// GetObservedEgressIPs returns a copy of the bounded observed egress IP list.
+func (e *NodeEntry) GetObservedEgressIPs() []netip.Addr {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]netip.Addr, len(e.egressIPs))
+	copy(out, e.egressIPs)
+	return out
+}
+
+// GetObservedEgressIPStrings returns observed egress IPs as strings for API and persistence.
+func (e *NodeEntry) GetObservedEgressIPStrings() []string {
+	ips := e.GetObservedEgressIPs()
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		if ip.IsValid() {
+			out = append(out, ip.String())
+		}
+	}
+	return out
+}
+
+// HasGlobalEgress reports whether the observed set indicates same-family egress churn.
+func (e *NodeEntry) HasGlobalEgress() bool {
+	var v4, v6 int
+	for _, ip := range e.GetObservedEgressIPs() {
+		if !ip.IsValid() {
+			continue
+		}
+		if ip.Is4() {
+			v4++
+		} else if ip.Is6() {
+			v6++
+		}
+	}
+	return v4 > 1 || v6 > 1
+}
+
+// SetObservedEgressIPStrings restores observed egress IPs from persistence.
+func (e *NodeEntry) SetObservedEgressIPStrings(values []string) {
+	ips := make([]netip.Addr, 0, len(values))
+	for _, value := range values {
+		if ip, err := netip.ParseAddr(strings.TrimSpace(value)); err == nil {
+			ips = append(ips, ip)
+		}
+	}
+	primary := netip.Addr{}
+	extra := []netip.Addr(nil)
+	if len(ips) > 0 {
+		primary = ips[0]
+		extra = ips[1:]
+	}
+	e.SetObservedEgressIPs(primary, extra)
 }
 
 // GetEgressRegion returns the node's stored region from probe metadata,
@@ -258,6 +345,9 @@ func (e *NodeEntry) SetEgressRegion(region string) {
 // GetRegion resolves a node region using explicit probe metadata first,
 // then GeoIP fallback from egress IP.
 func (e *NodeEntry) GetRegion(geoLookup func(netip.Addr) string) string {
+	if e.HasGlobalEgress() {
+		return "global"
+	}
 	if region := e.GetEgressRegion(); region != "" {
 		return region
 	}

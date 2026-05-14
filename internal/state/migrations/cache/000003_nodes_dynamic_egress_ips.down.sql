@@ -1,0 +1,1 @@
+ALTER TABLE nodes_dynamic DROP COLUMN egress_ips_json;

@@ -229,7 +229,7 @@ func (r *Router) createOrAbortStickyLease(
 	hadPreviousLease bool,
 	invalidation leaseInvalidationReason,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
-	newLease, createdResult, err := r.createLease(plat, state, targetDomain, now, nowNs)
+	newLease, createdResult, err := r.createLease(plat, state, targetDomain, now, nowNs, true)
 	if err != nil {
 		r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account)
 		lease, op := abortLeaseCreate(previous, hadPreviousLease)
@@ -255,7 +255,7 @@ func (r *Router) tryLeaseHit(
 	nowNs int64,
 ) (Lease, RouteResult, bool) {
 	entry, ok := r.pool.GetEntry(current.NodeHash)
-	if !ok || !plat.View().Contains(current.NodeHash) || entry.GetEgressIP() != current.EgressIP {
+	if !ok || entry.HasGlobalEgress() || !plat.View().Contains(current.NodeHash) || entry.GetEgressIP() != current.EgressIP {
 		return Lease{}, RouteResult{}, false
 	}
 
@@ -317,8 +317,16 @@ func (r *Router) createLease(
 	targetDomain string,
 	now time.Time,
 	nowNs int64,
+	sticky bool,
 ) (Lease, RouteResult, error) {
-	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain)
+	var h node.Hash
+	var entry *node.NodeEntry
+	var err error
+	if sticky {
+		h, entry, err = r.selectLiveStickyRoute(plat, state.IPLoadStats, targetDomain)
+	} else {
+		h, entry, err = r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain)
+	}
 	if err != nil {
 		return Lease{}, RouteResult{}, err
 	}
@@ -411,6 +419,47 @@ func (r *Router) selectLiveRandomRoute(
 	return node.Zero, nil, ErrNoAvailableNodes
 }
 
+func (r *Router) selectLiveStickyRoute(
+	plat *platform.Platform,
+	stats *IPLoadStats,
+	targetDomain string,
+) (node.Hash, *node.NodeEntry, error) {
+	bestHash := node.Zero
+	var bestEntry *node.NodeEntry
+	bestScore := math.Inf(1)
+	bestFallbackHash := node.Zero
+	var bestFallbackEntry *node.NodeEntry
+	bestFallbackScore := math.Inf(1)
+	now := time.Now()
+	plat.View().Range(func(h node.Hash) bool {
+		entry, ok := r.pool.GetEntry(h)
+		if !ok || entry.HasGlobalEgress() {
+			return true
+		}
+		latency, hasLatency := sameIPCandidateLatency(entry, targetDomain, r.authorities(), r.p2cWindow())
+		score := calculateScore(h, latency, plat, stats, r.pool)
+		if hasLatency && score < bestScore {
+			bestScore = score
+			bestHash = h
+			bestEntry = entry
+			return true
+		}
+		if !hasLatency && now.Sub(entry.CreatedAt) >= 0 && score < bestFallbackScore {
+			bestFallbackScore = score
+			bestFallbackHash = h
+			bestFallbackEntry = entry
+		}
+		return true
+	})
+	if bestHash != node.Zero {
+		return bestHash, bestEntry, nil
+	}
+	if bestFallbackHash != node.Zero {
+		return bestFallbackHash, bestFallbackEntry, nil
+	}
+	return node.Zero, nil, ErrNoAvailableNodes
+}
+
 func chooseSameIPRotationCandidate(
 	plat *platform.Platform,
 	pool PoolAccessor,
@@ -425,7 +474,7 @@ func chooseSameIPRotationCandidate(
 
 	plat.View().Range(func(h node.Hash) bool {
 		entry, ok := pool.GetEntry(h)
-		if !ok || entry.GetEgressIP() != targetIP {
+		if !ok || entry.HasGlobalEgress() || entry.GetEgressIP() != targetIP {
 			return true
 		}
 		if fallbackHash == node.Zero {

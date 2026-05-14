@@ -617,7 +617,7 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 //   - ip=nil,  loc=nil: keep both IP and region unchanged.
 //   - ip!=nil, loc=nil: keep region if IP unchanged; clear region if IP changed.
 //   - loc!=nil: set region to loc (normalized).
-func (p *GlobalNodePool) UpdateNodeEgressIP(hash node.Hash, ip *netip.Addr, loc *string) {
+func (p *GlobalNodePool) UpdateNodeEgressIP(hash node.Hash, ip *netip.Addr, loc *string, observedExtra ...netip.Addr) {
 	entry, ok := p.nodes.Load(hash)
 	if !ok {
 		return
@@ -637,26 +637,32 @@ func (p *GlobalNodePool) UpdateNodeEgressIP(hash node.Hash, ip *netip.Addr, loc 
 			entry.SetEgressIP(*ip)
 			ipChanged = true
 		}
+		entry.SetObservedEgressIPs(*ip, observedExtra)
 	}
 
+	globalChanged := oldRegion != "global" && entry.HasGlobalEgress()
 	regionChanged := false
-	switch {
-	case loc != nil:
-		entry.SetEgressRegion(*loc)
-		regionChanged = oldRegion != entry.GetEgressRegion()
-	case ip == nil:
-		// Attempt-only update: keep region as-is.
-	case !ipChanged:
-		// IP unchanged and no explicit region: keep existing region.
-	default:
-		// IP changed without explicit region: clear stale region metadata.
-		if oldRegion != "" {
-			entry.SetEgressRegion("")
-			regionChanged = true
+	if entry.HasGlobalEgress() {
+		entry.SetEgressRegion("global")
+	} else {
+		switch {
+		case loc != nil:
+			entry.SetEgressRegion(*loc)
+			regionChanged = oldRegion != entry.GetEgressRegion()
+		case ip == nil:
+			// Attempt-only update: keep region as-is.
+		case !ipChanged:
+			// IP unchanged and no explicit region: keep existing region.
+		default:
+			// IP changed without explicit region: clear stale region metadata.
+			if oldRegion != "" {
+				entry.SetEgressRegion("")
+				regionChanged = true
+			}
 		}
 	}
 
-	if ipChanged || regionChanged {
+	if ipChanged || regionChanged || globalChanged {
 		p.notifyAllPlatformsDirty(hash)
 	}
 	if p.onNodeDynamicChanged != nil {
