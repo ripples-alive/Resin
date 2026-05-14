@@ -300,8 +300,9 @@ func (r *StateRepo) UpsertSubscription(s model.Subscription) error {
 
 	_, err := r.db.Exec(`
 		INSERT INTO subscriptions (id, name, source_type, url, content, update_interval_ns, enabled,
-		                           ephemeral, ephemeral_node_evict_delay_ns, created_at_ns, updated_at_ns)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                           ephemeral, ephemeral_node_evict_delay_ns, created_at_ns, updated_at_ns,
+		                           last_checked_ns, last_updated_ns, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name               = excluded.name,
 			source_type        = excluded.source_type,
@@ -313,8 +314,34 @@ func (r *StateRepo) UpsertSubscription(s model.Subscription) error {
 			ephemeral_node_evict_delay_ns = excluded.ephemeral_node_evict_delay_ns,
 			updated_at_ns      = excluded.updated_at_ns
 	`, s.ID, s.Name, s.SourceType, s.URL, s.Content, s.UpdateIntervalNs, s.Enabled,
-		s.Ephemeral, s.EphemeralNodeEvictDelayNs, s.CreatedAtNs, s.UpdatedAtNs)
+		s.Ephemeral, s.EphemeralNodeEvictDelayNs, s.CreatedAtNs, s.UpdatedAtNs,
+		s.LastCheckedNs, s.LastUpdatedNs, s.LastError)
 	return err
+}
+
+// UpdateSubscriptionRefreshState updates runtime refresh bookkeeping without
+// touching subscription config. If updatedNs is nil, last_updated_ns is preserved.
+func (r *StateRepo) UpdateSubscriptionRefreshState(id string, checkedNs int64, updatedNs *int64, lastError string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	query := `UPDATE subscriptions SET last_checked_ns = ?, last_error = ?`
+	args := []any{checkedNs, lastError}
+	if updatedNs != nil {
+		query += `, last_updated_ns = ?`
+		args = append(args, *updatedNs)
+	}
+	query += ` WHERE id = ?`
+	args = append(args, id)
+
+	res, err := r.db.Exec(query, args...)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // DeleteSubscription removes a subscription by ID.
@@ -336,7 +363,8 @@ func (r *StateRepo) DeleteSubscription(id string) error {
 // ListSubscriptions returns all subscriptions.
 func (r *StateRepo) ListSubscriptions() ([]model.Subscription, error) {
 	rows, err := r.db.Query(`SELECT id, name, source_type, url, content, update_interval_ns, enabled,
-		ephemeral, ephemeral_node_evict_delay_ns, created_at_ns, updated_at_ns FROM subscriptions`)
+		ephemeral, ephemeral_node_evict_delay_ns, last_checked_ns, last_updated_ns, last_error,
+		created_at_ns, updated_at_ns FROM subscriptions`)
 	if err != nil {
 		return nil, err
 	}
@@ -346,7 +374,8 @@ func (r *StateRepo) ListSubscriptions() ([]model.Subscription, error) {
 	for rows.Next() {
 		var s model.Subscription
 		if err := rows.Scan(&s.ID, &s.Name, &s.SourceType, &s.URL, &s.Content, &s.UpdateIntervalNs, &s.Enabled,
-			&s.Ephemeral, &s.EphemeralNodeEvictDelayNs, &s.CreatedAtNs, &s.UpdatedAtNs); err != nil {
+			&s.Ephemeral, &s.EphemeralNodeEvictDelayNs, &s.LastCheckedNs, &s.LastUpdatedNs, &s.LastError,
+			&s.CreatedAtNs, &s.UpdatedAtNs); err != nil {
 			return nil, err
 		}
 		if s.SourceType == "" {

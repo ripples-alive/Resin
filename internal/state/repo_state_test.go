@@ -103,8 +103,8 @@ func TestMigrateStateDB_LegacyBaselineAdvancesToLatest(t *testing.T) {
 	if dirty {
 		t.Fatalf("schema_migrations dirty=true")
 	}
-	if version != stateVersionNormalizeMissAction {
-		t.Fatalf("schema_migrations version: got %d, want %d", version, stateVersionNormalizeMissAction)
+	if version != stateVersionSubscriptionRefreshState {
+		t.Fatalf("schema_migrations version: got %d, want %d", version, stateVersionSubscriptionRefreshState)
 	}
 }
 
@@ -175,8 +175,8 @@ func TestMigrateStateDB_NormalizesLegacyRandomMissAction(t *testing.T) {
 	if dirty {
 		t.Fatalf("schema_migrations dirty=true")
 	}
-	if version != stateVersionNormalizeMissAction {
-		t.Fatalf("schema_migrations version: got %d, want %d", version, stateVersionNormalizeMissAction)
+	if version != stateVersionSubscriptionRefreshState {
+		t.Fatalf("schema_migrations version: got %d, want %d", version, stateVersionSubscriptionRefreshState)
 	}
 }
 
@@ -544,6 +544,136 @@ func TestStateRepo_Subscription_LocalSourcePersists(t *testing.T) {
 	}
 	if list[0].Content != "vmess://example" {
 		t.Fatalf("content: got %q", list[0].Content)
+	}
+}
+
+func TestStateRepo_SubscriptionRefreshState_MigrationRoundTrip(t *testing.T) {
+	repo := newTestStateRepo(t)
+	now := time.Now().UnixNano()
+
+	s := model.Subscription{
+		ID:                        "sub-refresh",
+		Name:                      "RefreshSub",
+		SourceType:                "remote",
+		URL:                       "https://subscription.example.test/list",
+		UpdateIntervalNs:          int64(time.Hour),
+		Enabled:                   true,
+		Ephemeral:                 false,
+		EphemeralNodeEvictDelayNs: int64(72 * time.Hour),
+		CreatedAtNs:               now,
+		UpdatedAtNs:               now,
+	}
+	if err := repo.UpsertSubscription(s); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := repo.ListSubscriptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 subscription, got %d", len(list))
+	}
+	if list[0].LastCheckedNs != 0 || list[0].LastUpdatedNs != 0 || list[0].LastError != "" {
+		t.Fatalf(
+			"default refresh state: checked=%d updated=%d error=%q",
+			list[0].LastCheckedNs,
+			list[0].LastUpdatedNs,
+			list[0].LastError,
+		)
+	}
+
+	checkedNs := now + int64(time.Second)
+	updatedNs := now + int64(2*time.Second)
+	if err := repo.UpdateSubscriptionRefreshState(s.ID, checkedNs, &updatedNs, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err = repo.ListSubscriptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list[0].LastCheckedNs != checkedNs {
+		t.Fatalf("last_checked_ns: got %d, want %d", list[0].LastCheckedNs, checkedNs)
+	}
+	if list[0].LastUpdatedNs != updatedNs {
+		t.Fatalf("last_updated_ns: got %d, want %d", list[0].LastUpdatedNs, updatedNs)
+	}
+	if list[0].LastError != "" {
+		t.Fatalf("last_error: got %q, want empty", list[0].LastError)
+	}
+
+	failedCheckedNs := now + int64(3*time.Second)
+	if err := repo.UpdateSubscriptionRefreshState(s.ID, failedCheckedNs, nil, "temporary refresh error"); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err = repo.ListSubscriptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list[0].LastCheckedNs != failedCheckedNs {
+		t.Fatalf("failure last_checked_ns: got %d, want %d", list[0].LastCheckedNs, failedCheckedNs)
+	}
+	if list[0].LastUpdatedNs != updatedNs {
+		t.Fatalf("failure should preserve last_updated_ns: got %d, want %d", list[0].LastUpdatedNs, updatedNs)
+	}
+	if list[0].LastError != "temporary refresh error" {
+		t.Fatalf("failure last_error: got %q", list[0].LastError)
+	}
+}
+
+func TestStateRepo_UpsertSubscription_PreservesRefreshState(t *testing.T) {
+	repo := newTestStateRepo(t)
+	now := time.Now().UnixNano()
+
+	s := model.Subscription{
+		ID:                        "sub-preserve-refresh",
+		Name:                      "PreserveRefreshSub",
+		SourceType:                "remote",
+		URL:                       "https://subscription.example.test/original",
+		UpdateIntervalNs:          int64(time.Hour),
+		Enabled:                   true,
+		Ephemeral:                 false,
+		EphemeralNodeEvictDelayNs: int64(72 * time.Hour),
+		CreatedAtNs:               now,
+		UpdatedAtNs:               now,
+	}
+	if err := repo.UpsertSubscription(s); err != nil {
+		t.Fatal(err)
+	}
+
+	checkedNs := now + int64(time.Second)
+	updatedNs := now + int64(2*time.Second)
+	if err := repo.UpdateSubscriptionRefreshState(s.ID, checkedNs, &updatedNs, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	s.Name = "PreserveRefreshSubRenamed"
+	s.URL = "https://subscription.example.test/updated"
+	s.UpdatedAtNs = now + int64(3*time.Second)
+	if err := repo.UpsertSubscription(s); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := repo.ListSubscriptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 subscription, got %d", len(list))
+	}
+	if list[0].Name != "PreserveRefreshSubRenamed" {
+		t.Fatalf("name was not updated: got %q", list[0].Name)
+	}
+	if list[0].LastCheckedNs != checkedNs {
+		t.Fatalf("last_checked_ns was overwritten: got %d, want %d", list[0].LastCheckedNs, checkedNs)
+	}
+	if list[0].LastUpdatedNs != updatedNs {
+		t.Fatalf("last_updated_ns was overwritten: got %d, want %d", list[0].LastUpdatedNs, updatedNs)
+	}
+	if list[0].LastError != "" {
+		t.Fatalf("last_error was overwritten: got %q", list[0].LastError)
 	}
 }
 

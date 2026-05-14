@@ -337,6 +337,11 @@ func newTopologyRuntime(
 		SubManager: subManager,
 		Pool:       pool,
 		Downloader: downloader,
+		OnSubRefreshState: func(subID string, checkedNs int64, updatedNs *int64, lastError string) {
+			if err := engine.UpdateSubscriptionRefreshState(subID, checkedNs, updatedNs, lastError); err != nil {
+				log.Printf("[scheduler] persist subscription refresh state %s: %v", subID, err)
+			}
+		},
 		OnSubReenabledNode: func(hash node.Hash) {
 			outboundMgr.EnsureNodeOutbound(hash)
 			probeMgr.TriggerImmediateEgressProbe(hash)
@@ -392,6 +397,9 @@ func bootstrapTopology(
 		sub.SetSourceType(ms.SourceType)
 		sub.SetContent(ms.Content)
 		sub.SetEphemeralNodeEvictDelayNs(ms.EphemeralNodeEvictDelayNs)
+		sub.LastCheckedNs.Store(ms.LastCheckedNs)
+		sub.LastUpdatedNs.Store(ms.LastUpdatedNs)
+		sub.SetLastError(ms.LastError)
 		sub.CreatedAtNs = ms.CreatedAtNs
 		sub.UpdatedAtNs = ms.UpdatedAtNs
 		subManager.Register(sub)

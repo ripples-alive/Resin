@@ -83,6 +83,10 @@ func (e *StateEngine) MarkSubscriptionNodeDelete(subID, nodeHash string) {
 	e.dirtySubscriptionNodes.MarkDelete(SubscriptionNodeDirtyKey{SubscriptionID: subID, NodeHash: nodeHash})
 }
 
+func (e *StateEngine) UpdateSubscriptionRefreshState(id string, checkedNs int64, updatedNs *int64, lastError string) error {
+	return e.StateRepo.UpdateSubscriptionRefreshState(id, checkedNs, updatedNs, lastError)
+}
+
 // DirtyCount returns the total number of dirty entries across all sets.
 func (e *StateEngine) DirtyCount() int {
 	return e.dirtyNodesStatic.Len() +

@@ -28,7 +28,8 @@ type SubscriptionScheduler struct {
 	Fetcher func(url string) ([]byte, error)
 
 	// For persistence.
-	onSubUpdated func(sub *subscription.Subscription)
+	onSubUpdated      func(sub *subscription.Subscription)
+	onSubRefreshState func(subID string, checkedNs int64, updatedNs *int64, lastError string)
 	// onSubReenabledNode is called for each non-evicted node hash when a
 	// subscription transitions from disabled to enabled.
 	onSubReenabledNode func(hash node.Hash)
@@ -39,11 +40,12 @@ type SubscriptionScheduler struct {
 
 // SchedulerConfig configures the SubscriptionScheduler.
 type SchedulerConfig struct {
-	SubManager   *SubscriptionManager
-	Pool         *GlobalNodePool
-	Downloader   netutil.Downloader               // shared downloader
-	Fetcher      func(url string) ([]byte, error) // optional, defaults to Downloader.Download
-	OnSubUpdated func(sub *subscription.Subscription)
+	SubManager        *SubscriptionManager
+	Pool              *GlobalNodePool
+	Downloader        netutil.Downloader               // shared downloader
+	Fetcher           func(url string) ([]byte, error) // optional, defaults to Downloader.Download
+	OnSubUpdated      func(sub *subscription.Subscription)
+	OnSubRefreshState func(subID string, checkedNs int64, updatedNs *int64, lastError string)
 	// OnSubReenabledNode is fired after false->true enabled transition.
 	OnSubReenabledNode func(hash node.Hash)
 }
@@ -58,6 +60,7 @@ func NewSubscriptionScheduler(cfg SchedulerConfig) *SubscriptionScheduler {
 		downloadCtx:        downloadCtx,
 		cancelDownload:     cancelDownload,
 		onSubUpdated:       cfg.OnSubUpdated,
+		onSubRefreshState:  cfg.OnSubRefreshState,
 		onSubReenabledNode: cfg.OnSubReenabledNode,
 		stopCh:             make(chan struct{}),
 	}
@@ -294,6 +297,11 @@ func (s *SubscriptionScheduler) UpdateSubscription(sub *subscription.Subscriptio
 	if s.onSubUpdated != nil {
 		s.onSubUpdated(sub)
 	}
+	if s.onSubRefreshState != nil {
+		checkedNs := sub.LastCheckedNs.Load()
+		updatedNs := sub.LastUpdatedNs.Load()
+		s.onSubRefreshState(sub.ID, checkedNs, &updatedNs, "")
+	}
 }
 
 // handleUpdateFailure applies a fetch/parse failure to subscription state.
@@ -328,6 +336,9 @@ func (s *SubscriptionScheduler) handleUpdateFailure(
 	log.Printf("[scheduler] %s %s failed: %v", stage, sub.ID, err)
 	if s.onSubUpdated != nil {
 		s.onSubUpdated(sub)
+	}
+	if s.onSubRefreshState != nil {
+		s.onSubRefreshState(sub.ID, sub.LastCheckedNs.Load(), nil, sub.GetLastError())
 	}
 }
 
