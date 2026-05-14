@@ -599,6 +599,117 @@ func TestProbeManager_StopWaitsImmediateProbe(t *testing.T) {
 	}
 }
 
+func TestProbeQueue_DuplicateQueuedNormalDoesNotRequeue(t *testing.T) {
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+
+	hashBlocker := node.HashFromRawOptions([]byte(`{"type":"normal-duplicate-queued-blocker"}`))
+	hashTarget := node.HashFromRawOptions([]byte(`{"type":"normal-duplicate-queued-target"}`))
+	pool.AddNodeFromSub(hashBlocker, []byte(`{"type":"normal-duplicate-queued-blocker"}`), "sub1")
+	pool.AddNodeFromSub(hashTarget, []byte(`{"type":"normal-duplicate-queued-target"}`), "sub1")
+
+	entryBlocker, ok := pool.GetEntry(hashBlocker)
+	if !ok {
+		t.Fatal("blocker entry not found")
+	}
+	storeOutbound(entryBlocker)
+	entryTarget, ok := pool.GetEntry(hashTarget)
+	if !ok {
+		t.Fatal("target entry not found")
+	}
+	storeOutbound(entryTarget)
+
+	startedBlocker := make(chan struct{})
+	releaseBlocker := make(chan struct{})
+	var targetCalls atomic.Int32
+	mgr := NewProbeManager(ProbeConfig{
+		Pool:        pool,
+		Concurrency: 1,
+		Fetcher: func(hash node.Hash, _ string) ([]byte, time.Duration, error) {
+			if hash == hashBlocker {
+				close(startedBlocker)
+				<-releaseBlocker
+			} else if hash == hashTarget {
+				targetCalls.Add(1)
+			}
+			return []byte("ip=198.51.100.31"), 10 * time.Millisecond, nil
+		},
+	})
+	defer mgr.Stop()
+
+	if ok := mgr.enqueueProbe(hashBlocker, probeTaskKindEgress, probePriorityNormal); !ok {
+		t.Fatal("enqueue blocker should succeed")
+	}
+	if ok := mgr.enqueueProbe(hashTarget, probeTaskKindEgress, probePriorityNormal); !ok {
+		t.Fatal("enqueue target should succeed")
+	}
+	mgr.Start()
+	select {
+	case <-startedBlocker:
+	case <-time.After(time.Second):
+		t.Fatal("blocker did not start")
+	}
+
+	mgr.enqueueProbeIfIdle(hashTarget, probeTaskKindEgress, probePriorityNormal)
+	close(releaseBlocker)
+
+	time.Sleep(150 * time.Millisecond)
+	if got := targetCalls.Load(); got != 1 {
+		t.Fatalf("target probe calls = %d, want 1", got)
+	}
+}
+
+func TestProbeQueue_DuplicateRunningNormalDoesNotRequeue(t *testing.T) {
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+
+	hash := node.HashFromRawOptions([]byte(`{"type":"normal-duplicate-running"}`))
+	pool.AddNodeFromSub(hash, []byte(`{"type":"normal-duplicate-running"}`), "sub1")
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	storeOutbound(entry)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	mgr := NewProbeManager(ProbeConfig{
+		Pool:        pool,
+		Concurrency: 1,
+		Fetcher: func(_ node.Hash, _ string) ([]byte, time.Duration, error) {
+			if calls.Add(1) == 1 {
+				close(started)
+				<-release
+			}
+			return []byte("ip=198.51.100.32"), 10 * time.Millisecond, nil
+		},
+	})
+	defer mgr.Stop()
+
+	if ok := mgr.enqueueProbe(hash, probeTaskKindEgress, probePriorityNormal); !ok {
+		t.Fatal("enqueue should succeed")
+	}
+	mgr.Start()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("probe did not start")
+	}
+
+	mgr.enqueueProbeIfIdle(hash, probeTaskKindEgress, probePriorityNormal)
+	close(release)
+
+	time.Sleep(150 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("probe calls = %d, want 1", got)
+	}
+}
+
 func TestProbeQueue_DequeueChoosesNormalWhenSelectorRequests(t *testing.T) {
 	pool := topology.NewGlobalNodePool(topology.PoolConfig{
 		MaxLatencyTableEntries: 16,

@@ -466,7 +466,7 @@ func (m *ProbeManager) scanEgress() {
 			}
 		}
 
-		m.enqueueProbe(h, probeTaskKindEgress, probePriorityNormal)
+		m.enqueueProbeIfIdle(h, probeTaskKindEgress, probePriorityNormal)
 
 		return true
 	})
@@ -509,7 +509,7 @@ func (m *ProbeManager) scanLatency() {
 			return true
 		}
 
-		m.enqueueProbe(h, probeTaskKindLatency, probePriorityNormal)
+		m.enqueueProbeIfIdle(h, probeTaskKindLatency, probePriorityNormal)
 
 		return true
 	})
@@ -550,6 +550,19 @@ func (m *ProbeManager) executeTask(task probeTask) {
 }
 
 func (m *ProbeManager) enqueueProbe(hash node.Hash, kind probeTaskKind, priority probePriority) bool {
+	return m.enqueueProbeInternal(hash, kind, priority, true)
+}
+
+func (m *ProbeManager) enqueueProbeIfIdle(hash node.Hash, kind probeTaskKind, priority probePriority) bool {
+	return m.enqueueProbeInternal(hash, kind, priority, false)
+}
+
+func (m *ProbeManager) enqueueProbeInternal(
+	hash node.Hash,
+	kind probeTaskKind,
+	priority probePriority,
+	allowRequeue bool,
+) bool {
 	key := probeTaskKey{hash: hash, kind: kind}
 	state, _ := m.taskStates.LoadOrCompute(key, func() (*probeTaskState, bool) {
 		return &probeTaskState{}, false
@@ -559,6 +572,10 @@ func (m *ProbeManager) enqueueProbe(hash node.Hash, kind probeTaskKind, priority
 	for {
 		flags := state.flags.Load()
 		if flags&taskFlagRunning != 0 {
+			if !allowRequeue {
+				return false
+			}
+
 			next := flags | taskFlagDirty
 			if priority == probePriorityHigh {
 				next |= taskFlagDirtyHigh
@@ -570,6 +587,10 @@ func (m *ProbeManager) enqueueProbe(hash node.Hash, kind probeTaskKind, priority
 		}
 
 		if flags&taskFlagQueued != 0 {
+			if !allowRequeue {
+				return false
+			}
+
 			// If a normal-priority task is already queued, add a high-priority token
 			// so the next dequeue can observe the upgraded urgency. The stale normal
 			// token will later no-op when it reaches a worker.
@@ -704,6 +725,7 @@ func (m *ProbeManager) tryDeleteTaskState(key probeTaskKey, state *probeTaskStat
 
 // isLatencyProbeDue checks whether a node needs a latency probe, based on
 // last probe-attempt timestamps (not latency-table timestamps).
+
 func (m *ProbeManager) isLatencyProbeDue(
 	entry *node.NodeEntry,
 	now time.Time,
