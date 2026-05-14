@@ -48,6 +48,16 @@ func HTTPGetViaOutbound(
 		return nil, 0, fmt.Errorf("outbound fetch: outbound is nil")
 	}
 
+	var connMu sync.Mutex
+	var conns []*connCloseHook
+	closeTrackedConns := func() {
+		connMu.Lock()
+		defer connMu.Unlock()
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}
+
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := outbound.DialContext(ctx, network, M.ParseSocksaddr(addr))
@@ -56,17 +66,26 @@ func HTTPGetViaOutbound(
 			}
 			if opts.OnConnLifecycle != nil {
 				opts.OnConnLifecycle(ConnLifecycleOpen)
-				return &connCloseHook{Conn: conn, onClose: func() { opts.OnConnLifecycle(ConnLifecycleClose) }}, nil
 			}
-			return conn, nil
+			tracked := &connCloseHook{Conn: conn, onClose: func() {
+				if opts.OnConnLifecycle != nil {
+					opts.OnConnLifecycle(ConnLifecycleClose)
+				}
+			}}
+			connMu.Lock()
+			conns = append(conns, tracked)
+			connMu.Unlock()
+			return tracked, nil
 		},
 		DisableKeepAlives: true,
 		ForceAttemptHTTP2: true,
 	}
+	defer closeTrackedConns()
 
 	client := &http.Client{
 		Transport: transport,
 	}
+	defer transport.CloseIdleConnections()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
