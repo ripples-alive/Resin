@@ -20,7 +20,7 @@ import type { Platform } from "../platforms/types";
 import { listSubscriptions } from "../subscriptions/api";
 import { getNode, listNodes, probeEgress, probeLatency } from "./api";
 import type { NodeSummary } from "./types";
-import { getAllRegions, getRegionName } from "./regions";
+import { getAllRegions, getCompactRegionLabel, getRegionTitle } from "./regions";
 import type { NodeListFilters, NodeSortBy, SortOrder } from "./types";
 
 type NodeStatusFilter = "all" | "healthy" | "circuit_open" | "error" | "disabled";
@@ -250,14 +250,11 @@ function sortIndicator(active: boolean, order: SortOrder): string {
   return order === "asc" ? "▲" : "▼";
 }
 
-function regionToFlag(region: string | undefined): string {
-  if (!region || region.length !== 2) {
-    return region || "-";
-  }
-  const code = region.toUpperCase();
-  const flag = String.fromCodePoint(...[...code].map((c) => c.charCodeAt(0) + 127397));
-  const name = getRegionName(code);
-  return name ? `${flag} ${code} (${name})` : `${flag} ${code}`;
+function regionToLabel(region: string | undefined): { label: string; title: string } {
+  return {
+    label: getCompactRegionLabel(region),
+    title: getRegionTitle(region),
+  };
 }
 
 export function NodesPage() {
@@ -544,10 +541,10 @@ export function NodesPage() {
         </button>
       ),
       cell: (info) => {
-        const val = regionToFlag(info.getValue());
+        const region = regionToLabel(info.getValue());
         return (
-          <div style={{ maxWidth: "100px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={val}>
-            {val}
+          <div style={{ maxWidth: "100px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={region.title}>
+            {region.label}
           </div>
         );
       },
@@ -919,7 +916,7 @@ export function NodesPage() {
                   <div>
                     <span>{t("出口 / 区域")}</span>
                     <p>
-                      {detailNode.egress_ip || "-"} / {regionToFlag(detailNode.region)}
+                      {detailNode.egress_ip || "-"} / {regionToLabel(detailNode.region).label}
                     </p>
                   </div>
                   <div>
