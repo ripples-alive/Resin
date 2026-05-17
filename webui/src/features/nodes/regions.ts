@@ -5,7 +5,8 @@ import { getCurrentLocale, isEnglishLocale } from "../../i18n/locale";
 
 export const GLOBAL_REGION_CODE = "global";
 export const GLOBAL_REGION_FILTER_VALUE = GLOBAL_REGION_CODE;
-export const GLOBAL_REGION_COMPACT_LABEL = "GL";
+export const GLOBAL_REGION_FILTER_LABEL = "GL";
+export const GLOBAL_REGION_COMPACT_LABEL = "🌐 GL";
 
 countries.registerLocale(enLocale);
 countries.registerLocale(zhLocale);
@@ -29,7 +30,7 @@ export const getAllRegions = (): RegionOption[] => {
     return [
         {
             code: GLOBAL_REGION_FILTER_VALUE,
-            name: `${GLOBAL_REGION_COMPACT_LABEL} (${isEnglishLocale(getCurrentLocale()) ? "Global" : "全球"})`,
+            name: `${GLOBAL_REGION_FILTER_LABEL} (${isEnglishLocale(getCurrentLocale()) ? "Global" : "全球"})`,
         },
         ...countryRegions,
     ];
