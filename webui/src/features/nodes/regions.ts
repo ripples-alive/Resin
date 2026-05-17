@@ -5,7 +5,7 @@ import { getCurrentLocale, isEnglishLocale } from "../../i18n/locale";
 
 export const GLOBAL_REGION_CODE = "global";
 export const GLOBAL_REGION_FILTER_VALUE = GLOBAL_REGION_CODE;
-export const GLOBAL_REGION_COMPACT_LABEL = "🌐 GL";
+export const GLOBAL_REGION_COMPACT_LABEL = "GL";
 
 countries.registerLocale(enLocale);
 countries.registerLocale(zhLocale);
