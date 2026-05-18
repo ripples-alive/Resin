@@ -150,13 +150,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Derive branch image tag
+        id: branch_tag
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#ripples/}"
+          tag="${tag//\//-}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value={{branch}},prefix=,enable=${{ startsWith(github.ref_name, 'ripples/') }}
+            type=raw,value=${{ steps.branch_tag.outputs.tag }}
             type=sha,prefix=sha-
 
       - name: Build and push Docker image
