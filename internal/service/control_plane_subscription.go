@@ -178,7 +178,7 @@ func (s *ControlPlaneService) CreateSubscription(req CreateSubscriptionRequest) 
 		return nil, invalidArg("source_type: must be remote or local")
 	}
 
-	updateInterval := 5 * time.Minute
+	updateInterval := 6 * time.Hour
 	if req.UpdateInterval != nil {
 		d, err := time.ParseDuration(*req.UpdateInterval)
 		if err != nil {

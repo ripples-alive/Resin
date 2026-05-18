@@ -1339,6 +1339,9 @@ func TestAPIContract_SubscriptionUpdateIntervalMinimum(t *testing.T) {
 		t.Fatalf("create subscription status: got %d, want %d, body=%s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
 	body := decodeJSONMap(t, rec)
+	if body["update_interval"] != "6h0m0s" {
+		t.Fatalf("default update_interval: got %v, want %q", body["update_interval"], "6h0m0s")
+	}
 	subID, _ := body["id"].(string)
 	if subID == "" {
 		t.Fatalf("create subscription missing id: body=%s", rec.Body.String())
