@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
@@ -132,17 +133,32 @@ func NewSingboxBuilderWithSecureDNS(enableEmbeddedSecureDNS bool) (*SingboxBuild
 // Build parses rawOptions (a complete sing-box outbound JSON object with
 // type/tag fields) into a real adapter.Outbound and runs it through the
 // lifecycle stages.
-func (b *SingboxBuilder) Build(rawOptions json.RawMessage) (adapter.Outbound, error) {
+func (b *SingboxBuilder) Build(rawOptions json.RawMessage) (ob adapter.Outbound, err error) {
+	outboundType := "unknown"
+	defer func() {
+		if r := recover(); r != nil {
+			if ob != nil {
+				_ = common.Close(ob)
+				ob = nil
+			}
+			err = fmt.Errorf("panic while building outbound [%s]: %v", outboundType, r)
+			debug.PrintStack()
+		}
+	}()
+
 	// 1. Parse via official option.Outbound path (strips type/tag, creates
 	//    typed options via OutboundOptionsRegistry + badjson.UnmarshallExcluded).
 	var outboundConfig option.Outbound
 	if err := sJson.UnmarshalContext(b.ctx, rawOptions, &outboundConfig); err != nil {
 		return nil, fmt.Errorf("parse outbound options: %w", err)
 	}
+	if outboundConfig.Type != "" {
+		outboundType = outboundConfig.Type
+	}
 
 	// 2. Create the outbound instance via the registry.
 	logger := b.logFactory.NewLogger("outbound/" + outboundConfig.Type)
-	ob, err := b.registry.CreateOutbound(
+	ob, err = b.registry.CreateOutbound(
 		b.ctx,
 		nil, // router — not needed for simple dialing
 		logger,

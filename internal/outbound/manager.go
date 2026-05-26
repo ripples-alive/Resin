@@ -3,7 +3,9 @@ package outbound
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"runtime/debug"
 	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
@@ -41,6 +43,20 @@ func (m *OutboundManager) isLiveEntry(hash node.Hash, entry *node.NodeEntry) boo
 	return ok && current == entry
 }
 
+func (m *OutboundManager) buildSafely(rawOptions []byte) (ob adapter.Outbound, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if ob != nil {
+				closeOutbound(ob)
+				ob = nil
+			}
+			err = fmt.Errorf("panic in outbound builder: %v", r)
+			debug.PrintStack()
+		}
+	}()
+	return m.builder.Build(rawOptions)
+}
+
 // EnsureNodeOutbound idempotently creates and stores an outbound for a node.
 // Uses CompareAndSwap(nil, &wrapped) to guarantee only one goroutine's build
 // result is stored. Losers discard their result (stage 6 adds io.Closer release).
@@ -54,7 +70,7 @@ func (m *OutboundManager) EnsureNodeOutbound(hash node.Hash) {
 		return
 	}
 
-	ob, err := m.builder.Build(entry.RawOptions)
+	ob, err := m.buildSafely(entry.RawOptions)
 	if err != nil {
 		entry.SetLastError("outbound build: " + err.Error())
 		return

@@ -562,6 +562,49 @@ func TestSingboxBuilder_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestSingboxBuilder_RecoverRealityShortIDPanic(t *testing.T) {
+	b, err := NewSingboxBuilder()
+	if err != nil {
+		t.Fatalf("NewSingboxBuilder() error: %v", err)
+	}
+	defer b.Close()
+
+	raw := json.RawMessage(`{
+		"type": "vless",
+		"tag": "bad-reality-short-id",
+		"server": "127.0.0.1",
+		"server_port": 443,
+		"uuid": "11111111-2222-3333-4444-555555555555",
+		"flow": "xtls-rprx-vision",
+		"tls": {
+			"enabled": true,
+			"server_name": "example.com",
+			"utls": {"enabled": true, "fingerprint": "chrome"},
+			"reality": {
+				"enabled": true,
+				"public_key": "R1f59A5fR4m6SZHjH2lSQw4mYcpq2bHKuX1N0rD2wQ0",
+				"short_id": "0123456789abcdef01234"
+			}
+		}
+	}`)
+	ob, err := b.Build(raw)
+	if err == nil {
+		if ob != nil {
+			closeOutbound(ob)
+		}
+		t.Fatal("expected malformed Reality short_id to return an error")
+	}
+	if ob != nil {
+		t.Fatalf("expected nil outbound on recovered panic, got %T", ob)
+	}
+	if strings.Contains(err.Error(), "uTLS, which is required by reality is not included") {
+		t.Skipf("Reality panic regression requires with_utls build tag: %v", err)
+	}
+	if !strings.Contains(err.Error(), "panic while building outbound [vless]") {
+		t.Fatalf("expected panic conversion error, got: %v", err)
+	}
+}
+
 func TestStubOutboundBuilder_Build(t *testing.T) {
 	ob, err := (&testutil.StubOutboundBuilder{}).Build(nil)
 	if err != nil {

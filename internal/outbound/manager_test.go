@@ -49,6 +49,13 @@ func (b *failBuilder) Build(_ json.RawMessage) (adapter.Outbound, error) {
 	return nil, errors.New("simulated build failure")
 }
 
+// panicBuilder simulates a sing-box/library panic during outbound creation.
+type panicBuilder struct{}
+
+func (b *panicBuilder) Build(_ json.RawMessage) (adapter.Outbound, error) {
+	panic("simulated builder panic")
+}
+
 type closableOnly struct {
 	closed atomic.Bool
 }
@@ -184,6 +191,23 @@ func TestEnsureNodeOutbound_BuildFailure(t *testing.T) {
 	}
 	if entry.GetLastError() == "" {
 		t.Fatal("expected GetLastError() non-empty after build failure")
+	}
+}
+
+func TestEnsureNodeOutbound_BuilderPanicSetsLastError(t *testing.T) {
+	entry := newTestEntry(`{"type":"panic"}`)
+	pool := &mockPool{}
+	pool.addEntry(entry)
+
+	mgr := NewOutboundManager(pool, &panicBuilder{})
+	mgr.EnsureNodeOutbound(entry.Hash)
+
+	if entry.HasOutbound() {
+		t.Fatal("expected HasOutbound() == false after builder panic")
+	}
+	lastErr := entry.GetLastError()
+	if !strings.Contains(lastErr, "panic in outbound builder") || !strings.Contains(lastErr, "simulated builder panic") {
+		t.Fatalf("expected panic to be recorded as LastError, got %q", lastErr)
 	}
 }
 
