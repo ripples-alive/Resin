@@ -172,6 +172,12 @@ func (p *GlobalNodePool) Size() int {
 	return p.nodes.Size()
 }
 
+// DeleteNodeFromBootstrap removes a node during bootstrap shaping without dirty
+// marks, outbound cleanup callbacks, or platform notifications.
+func (p *GlobalNodePool) DeleteNodeFromBootstrap(hash node.Hash) {
+	p.nodes.Delete(hash)
+}
+
 // LoadNodeFromBootstrap inserts a node during bootstrap recovery.
 // No dirty-marks, no platform notifications.
 func (p *GlobalNodePool) LoadNodeFromBootstrap(entry *node.NodeEntry) {

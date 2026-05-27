@@ -300,6 +300,86 @@ func (r *CacheRepo) LoadAllSubscriptionNodes() ([]model.SubscriptionNode, error)
 	return result, rows.Err()
 }
 
+// LoadSubscriptionNodes reads subscription-node links for one subscription.
+func (r *CacheRepo) LoadSubscriptionNodes(subID string) ([]model.SubscriptionNode, error) {
+	rows, err := r.db.Query(
+		"SELECT subscription_id, node_hash, tags_json, evicted FROM subscription_nodes WHERE subscription_id = ?",
+		subID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []model.SubscriptionNode
+	for rows.Next() {
+		var sn model.SubscriptionNode
+		var tagsJSON string
+		if err := rows.Scan(&sn.SubscriptionID, &sn.NodeHash, &tagsJSON, &sn.Evicted); err != nil {
+			return nil, err
+		}
+		tags, err := decodeStringSliceJSON(tagsJSON)
+		if err != nil {
+			return nil, fmt.Errorf("decode subscription node tags_json for %s/%s: %w", sn.SubscriptionID, sn.NodeHash, err)
+		}
+		sn.Tags = tags
+		result = append(result, sn)
+	}
+	return result, rows.Err()
+}
+
+// ReplaceSubscriptionRefresh atomically applies a DB-first refresh catalog diff.
+// It upserts parsed node static rows before subscription-node relation changes
+// so cold candidates are durable even when they are not promoted to memory.
+func (r *CacheRepo) ReplaceSubscriptionRefresh(
+	subID string,
+	statics []model.NodeStatic,
+	upserts []model.SubscriptionNode,
+	deletes []model.SubscriptionNodeKey,
+) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin subscription refresh tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := bulkExecTx(tx, upsertNodesStaticSQL, len(statics), func(stmt *sql.Stmt, i int) error {
+		n := statics[i]
+		_, err := stmt.Exec(n.Hash, string(n.RawOptions), n.CreatedAtNs)
+		return err
+	}); err != nil {
+		return fmt.Errorf("upsert refresh nodes_static: %w", err)
+	}
+
+	if err := bulkExecTx(tx, upsertSubscriptionNodesSQL, len(upserts), func(stmt *sql.Stmt, i int) error {
+		sn := upserts[i]
+		if sn.SubscriptionID == "" {
+			sn.SubscriptionID = subID
+		}
+		tagsJSON, err := encodeStringSliceJSON(sn.Tags)
+		if err != nil {
+			return fmt.Errorf("encode subscription node tags: %w", err)
+		}
+		_, err = stmt.Exec(sn.SubscriptionID, sn.NodeHash, tagsJSON, sn.Evicted)
+		return err
+	}); err != nil {
+		return fmt.Errorf("upsert refresh subscription_nodes: %w", err)
+	}
+
+	if err := bulkExecTx(tx, deleteSubscriptionNodesSQL, len(deletes), func(stmt *sql.Stmt, i int) error {
+		key := deletes[i]
+		if key.SubscriptionID == "" {
+			key.SubscriptionID = subID
+		}
+		_, err := stmt.Exec(key.SubscriptionID, key.NodeHash)
+		return err
+	}); err != nil {
+		return fmt.Errorf("delete refresh subscription_nodes: %w", err)
+	}
+
+	return tx.Commit()
+}
+
 // --- internal helpers ---
 
 // bulkExecTx runs a prepared statement within an existing transaction for n rows.

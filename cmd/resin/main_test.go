@@ -1,22 +1,28 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/netip"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Resinat/Resin/internal/config"
+	"github.com/Resinat/Resin/internal/geoip"
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/state"
+	"github.com/Resinat/Resin/internal/subscription"
 	"github.com/Resinat/Resin/internal/testutil"
 	"github.com/Resinat/Resin/internal/topology"
+	"github.com/sagernet/sing-box/adapter"
 )
 
 func newBootstrapTestRuntime(runtimeCfg *config.RuntimeConfig) (*topology.SubscriptionManager, *topology.GlobalNodePool) {
@@ -44,6 +50,64 @@ func newDefaultPlatformEnvConfig() *config.EnvConfig {
 		DefaultPlatformReverseProxyFixedAccountHeader:   "Authorization",
 		DefaultPlatformAllocationPolicy:                 "BALANCED",
 	}
+}
+
+type trackingBootstrapBuilder struct {
+	failRaw map[string]bool
+	built   []string
+}
+
+func (b *trackingBootstrapBuilder) Build(raw json.RawMessage) (adapter.Outbound, error) {
+	b.built = append(b.built, string(raw))
+	if b.failRaw[string(raw)] {
+		return nil, errors.New("bootstrap build failed")
+	}
+	return testutil.NewNoopOutbound(), nil
+}
+
+type staticSubscriptionDownloader struct {
+	body []byte
+	err  error
+}
+
+func (d staticSubscriptionDownloader) Download(_ context.Context, _ string) ([]byte, error) {
+	if d.err != nil {
+		return nil, d.err
+	}
+	return append([]byte(nil), d.body...), nil
+}
+
+func newColdCheckTestRuntime(
+	engine *state.StateEngine,
+	runtimeCfg *config.RuntimeConfig,
+) (*topology.SubscriptionManager, *topology.GlobalNodePool) {
+	subManager := topology.NewSubscriptionManager()
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup:              subManager.Lookup,
+		GeoLookup:              func(netip.Addr) string { return "us" },
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return runtimeCfg.MaxConsecutiveFailures },
+		LatencyDecayWindow: func() time.Duration {
+			return time.Duration(runtimeCfg.LatencyDecayWindow)
+		},
+		OnNodeAdded: func(hash node.Hash) {
+			engine.MarkNodeStatic(hash.Hex())
+		},
+		OnSubNodeChanged: func(subID string, hash node.Hash, added bool) {
+			if added {
+				engine.MarkSubscriptionNode(subID, hash.Hex())
+			} else {
+				engine.MarkSubscriptionNodeDelete(subID, hash.Hex())
+			}
+		},
+		OnNodeDynamicChanged: func(hash node.Hash) {
+			engine.MarkNodeDynamic(hash.Hex())
+		},
+		OnNodeLatencyChanged: func(hash node.Hash, domain string) {
+			engine.MarkNodeLatency(hash.Hex(), domain)
+		},
+	})
+	return subManager, pool
 }
 
 func TestAuthVersionStartupWarning_LegacyV0(t *testing.T) {
@@ -738,6 +802,427 @@ func TestBootstrapNodes_RestoreEvictedSubscriptionNodeWithoutPoolRef(t *testing.
 	}
 }
 
+func TestBootstrapNodes_ActiveOnlySelectsEnabledNonEvictedCircuitClosedWithLatency(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const (
+		enabledSubID  = "sub-active-enabled"
+		disabledSubID = "sub-active-disabled"
+	)
+	now := time.Now().UnixNano()
+	for _, sub := range []model.Subscription{
+		{
+			ID:               enabledSubID,
+			Name:             "BootstrapActive",
+			URL:              "https://example.com/enabled",
+			UpdateIntervalNs: int64(30 * time.Minute),
+			Enabled:          true,
+			LastError:        "previous refresh failure must not filter active bootstrap",
+			CreatedAtNs:      now,
+			UpdatedAtNs:      now,
+		},
+		{
+			ID:               disabledSubID,
+			Name:             "BootstrapDisabled",
+			URL:              "https://example.com/disabled",
+			UpdateIntervalNs: int64(30 * time.Minute),
+			Enabled:          false,
+			CreatedAtNs:      now,
+			UpdatedAtNs:      now,
+		},
+	} {
+		if err := engine.UpsertSubscription(sub); err != nil {
+			t.Fatalf("UpsertSubscription(%s): %v", sub.ID, err)
+		}
+	}
+
+	rawActive := json.RawMessage(`{"type":"stub","server":"198.51.100.10","server_port":443}`)
+	rawDisabled := json.RawMessage(`{"type":"stub","server":"198.51.100.11","server_port":443}`)
+	rawEvicted := json.RawMessage(`{"type":"stub","server":"198.51.100.12","server_port":443}`)
+	rawCircuitOpen := json.RawMessage(`{"type":"stub","server":"198.51.100.13","server_port":443}`)
+	rawAttemptOnly := json.RawMessage(`{"type":"stub","server":"198.51.100.14","server_port":443}`)
+	rawBuildFail := json.RawMessage(`{"type":"stub","server":"198.51.100.15","server_port":443}`)
+	hashByRaw := map[string]node.Hash{
+		string(rawActive):      node.HashFromRawOptions(rawActive),
+		string(rawDisabled):    node.HashFromRawOptions(rawDisabled),
+		string(rawEvicted):     node.HashFromRawOptions(rawEvicted),
+		string(rawCircuitOpen): node.HashFromRawOptions(rawCircuitOpen),
+		string(rawAttemptOnly): node.HashFromRawOptions(rawAttemptOnly),
+		string(rawBuildFail):   node.HashFromRawOptions(rawBuildFail),
+	}
+
+	var statics []model.NodeStatic
+	for rawString, hash := range hashByRaw {
+		statics = append(statics, model.NodeStatic{
+			Hash:        hash.Hex(),
+			RawOptions:  json.RawMessage(rawString),
+			CreatedAtNs: now - int64(time.Hour),
+		})
+	}
+	if err := engine.BulkUpsertNodesStatic(statics); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{SubscriptionID: enabledSubID, NodeHash: hashByRaw[string(rawActive)].Hex(), Tags: []string{"active"}},
+		{SubscriptionID: disabledSubID, NodeHash: hashByRaw[string(rawDisabled)].Hex(), Tags: []string{"disabled"}},
+		{SubscriptionID: enabledSubID, NodeHash: hashByRaw[string(rawEvicted)].Hex(), Tags: []string{"evicted"}, Evicted: true},
+		{SubscriptionID: enabledSubID, NodeHash: hashByRaw[string(rawCircuitOpen)].Hex(), Tags: []string{"circuit-open"}},
+		{SubscriptionID: enabledSubID, NodeHash: hashByRaw[string(rawAttemptOnly)].Hex(), Tags: []string{"attempt-only"}},
+		{SubscriptionID: enabledSubID, NodeHash: hashByRaw[string(rawBuildFail)].Hex(), Tags: []string{"build-fail"}},
+	}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+	if err := engine.BulkUpsertNodesDynamic([]model.NodeDynamic{
+		{Hash: hashByRaw[string(rawActive)].Hex(), CircuitOpenSince: 0, EgressIP: ""},
+		{Hash: hashByRaw[string(rawDisabled)].Hex(), CircuitOpenSince: 0},
+		{Hash: hashByRaw[string(rawEvicted)].Hex(), CircuitOpenSince: 0},
+		{Hash: hashByRaw[string(rawCircuitOpen)].Hex(), CircuitOpenSince: now - int64(time.Minute)},
+		{Hash: hashByRaw[string(rawAttemptOnly)].Hex(), CircuitOpenSince: 0, LastLatencyProbeAttemptNs: now - int64(time.Second)},
+		{Hash: hashByRaw[string(rawBuildFail)].Hex(), CircuitOpenSince: 0},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
+	if err := engine.BulkUpsertNodeLatency([]model.NodeLatency{
+		{NodeHash: hashByRaw[string(rawActive)].Hex(), Domain: "example.com", EwmaNs: int64(42 * time.Millisecond), LastUpdatedNs: now},
+		{NodeHash: hashByRaw[string(rawDisabled)].Hex(), Domain: "example.com", EwmaNs: int64(43 * time.Millisecond), LastUpdatedNs: now},
+		{NodeHash: hashByRaw[string(rawEvicted)].Hex(), Domain: "example.com", EwmaNs: int64(44 * time.Millisecond), LastUpdatedNs: now},
+		{NodeHash: hashByRaw[string(rawCircuitOpen)].Hex(), Domain: "example.com", EwmaNs: int64(45 * time.Millisecond), LastUpdatedNs: now},
+		{NodeHash: hashByRaw[string(rawBuildFail)].Hex(), Domain: "example.com", EwmaNs: int64(46 * time.Millisecond), LastUpdatedNs: now},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodeLatency: %v", err)
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	envCfg := newDefaultPlatformEnvConfig()
+	envCfg.MaxLatencyTableEntries = 16
+	envCfg.ActiveOnlyBootstrap = true
+	subManager, pool := newBootstrapTestRuntime(runtimeCfg)
+
+	if err := bootstrapTopology(engine, subManager, pool, envCfg); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	builder := &trackingBootstrapBuilder{
+		failRaw: map[string]bool{string(rawBuildFail): true},
+	}
+	outboundMgr := outbound.NewOutboundManager(pool, builder)
+	if err := bootstrapNodes(engine, pool, subManager, outboundMgr, envCfg, runtimeCfg.LatencyAuthorities); err != nil {
+		t.Fatalf("bootstrapNodes: %v", err)
+	}
+
+	activeHash := hashByRaw[string(rawActive)]
+	entry, ok := pool.GetEntry(activeHash)
+	if !ok {
+		t.Fatalf("active node %s missing after active-only bootstrap", activeHash.Hex())
+	}
+	if !entry.HasOutbound() {
+		t.Fatal("active node should have outbound after active-only bootstrap")
+	}
+	if entry.IsCircuitOpen() {
+		t.Fatal("persisted circuit-closed dynamic state should be restored")
+	}
+	if entry.GetEgressIP().IsValid() {
+		t.Fatal("test setup should prove empty egress_ip did not prevent active bootstrap")
+	}
+	if !entry.HasLatency() {
+		t.Fatal("active node should restore durable latency sample")
+	}
+
+	for rawString, hash := range hashByRaw {
+		if hash == activeHash {
+			continue
+		}
+		if _, ok := pool.GetEntry(hash); ok {
+			t.Fatalf("node %s (%s) should not be active after active-only bootstrap", rawString, hash.Hex())
+		}
+	}
+	if got := builder.built; !reflect.DeepEqual(got, []string{string(rawActive), string(rawBuildFail)}) {
+		t.Fatalf("outbound build candidates: got %v, want active and build-fail only", got)
+	}
+
+	sub, ok := subManager.Get(enabledSubID)
+	if !ok {
+		t.Fatalf("subscription %s missing", enabledSubID)
+	}
+	if _, ok := sub.ManagedNodes().LoadNode(activeHash); !ok {
+		t.Fatal("active node relation should be restored into subscription managed nodes")
+	}
+	for _, raw := range []json.RawMessage{rawEvicted, rawCircuitOpen, rawAttemptOnly, rawBuildFail} {
+		hash := hashByRaw[string(raw)]
+		if _, ok := sub.ManagedNodes().LoadNode(hash); ok {
+			t.Fatalf("inactive node %s should not be restored into active managed nodes", hash.Hex())
+		}
+	}
+}
+
+func TestBootstrapNodes_ActiveOnlyExcludesAttemptOnlyWithoutLatencySample(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-active-attempt-only"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "BootstrapAttemptOnly",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.16","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{{
+		Hash:        hash.Hex(),
+		RawOptions:  raw,
+		CreatedAtNs: now - int64(time.Hour),
+	}}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: subID,
+		NodeHash:       hash.Hex(),
+		Tags:           []string{"attempt-only"},
+	}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+	if err := engine.BulkUpsertNodesDynamic([]model.NodeDynamic{{
+		Hash:                      hash.Hex(),
+		CircuitOpenSince:          0,
+		LastLatencyProbeAttemptNs: now - int64(time.Second),
+	}}); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	envCfg := newDefaultPlatformEnvConfig()
+	envCfg.MaxLatencyTableEntries = 16
+	envCfg.ActiveOnlyBootstrap = true
+	subManager, pool := newBootstrapTestRuntime(runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, envCfg); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	builder := &trackingBootstrapBuilder{}
+	outboundMgr := outbound.NewOutboundManager(pool, builder)
+	if err := bootstrapNodes(engine, pool, subManager, outboundMgr, envCfg, runtimeCfg.LatencyAuthorities); err != nil {
+		t.Fatalf("bootstrapNodes: %v", err)
+	}
+	if _, ok := pool.GetEntry(hash); ok {
+		t.Fatal("attempt-only node should not enter active-only bootstrap memory")
+	}
+	if len(builder.built) != 0 {
+		t.Fatalf("attempt-only node should not get outbound build, got builds=%v", builder.built)
+	}
+}
+
+func TestColdSubscriptionNodeCheck_PromotesOnLatencySuccessAndPersists(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-cold-success"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "ColdSuccess",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.70","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	candidate := topology.ColdNodeCandidate{
+		SubscriptionID: subID,
+		Hash:           hash,
+		RawOptions:     raw,
+		Tags:           []string{"cold-success"},
+	}
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
+		pool.RecordResult(hash, true)
+		latency := 25 * time.Millisecond
+		pool.RecordLatency(hash, "example.com", &latency)
+		return nil
+	})
+
+	checker.Check(candidate)
+
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("successful cold check should promote node into memory")
+	}
+	if !entry.HasOutbound() {
+		t.Fatal("promoted cold node should have outbound")
+	}
+	if entry.IsCircuitOpen() {
+		t.Fatal("successful cold check should close circuit")
+	}
+	if !entry.HasLatency() {
+		t.Fatal("successful cold check should record latency")
+	}
+	sub, ok := subManager.Get(subID)
+	if !ok {
+		t.Fatalf("subscription %s missing", subID)
+	}
+	managed, ok := sub.ManagedNodes().LoadNode(hash)
+	if !ok {
+		t.Fatal("successful cold check should add active subscription relation")
+	}
+	if !reflect.DeepEqual(managed.Tags, []string{"cold-success"}) {
+		t.Fatalf("managed tags: got %v, want [cold-success]", managed.Tags)
+	}
+
+	if err := engine.FlushDirtySets(newFlushReaders(pool, subManager, nil)); err != nil {
+		t.Fatalf("FlushDirtySets: %v", err)
+	}
+	statics, err := engine.LoadAllNodesStatic()
+	if err != nil {
+		t.Fatalf("LoadAllNodesStatic: %v", err)
+	}
+	if len(statics) != 1 || statics[0].Hash != hash.Hex() {
+		t.Fatalf("persisted statics: got %+v, want %s", statics, hash.Hex())
+	}
+	dynamics, err := engine.LoadAllNodesDynamic()
+	if err != nil {
+		t.Fatalf("LoadAllNodesDynamic: %v", err)
+	}
+	if len(dynamics) != 1 || dynamics[0].Hash != hash.Hex() || dynamics[0].CircuitOpenSince != 0 {
+		t.Fatalf("persisted dynamics: got %+v, want circuit closed row for %s", dynamics, hash.Hex())
+	}
+	latencies, err := engine.LoadAllNodeLatency()
+	if err != nil {
+		t.Fatalf("LoadAllNodeLatency: %v", err)
+	}
+	if len(latencies) != 1 || latencies[0].NodeHash != hash.Hex() || latencies[0].EwmaNs <= 0 {
+		t.Fatalf("persisted latency: got %+v, want positive EWMA for %s", latencies, hash.Hex())
+	}
+	subNodes, err := engine.LoadAllSubscriptionNodes()
+	if err != nil {
+		t.Fatalf("LoadAllSubscriptionNodes: %v", err)
+	}
+	if len(subNodes) != 1 || subNodes[0].SubscriptionID != subID || subNodes[0].NodeHash != hash.Hex() || subNodes[0].Evicted {
+		t.Fatalf("persisted relation: got %+v, want active relation for %s", subNodes, hash.Hex())
+	}
+}
+
+func TestColdSubscriptionNodeCheck_FailurePersistsFailureAndDoesNotRetainMemory(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-cold-failure"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "ColdFailure",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	runtimeCfg.MaxConsecutiveFailures = 1
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.71","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{{
+		Hash:        hash.Hex(),
+		RawOptions:  raw,
+		CreatedAtNs: now,
+	}}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: subID,
+		NodeHash:       hash.Hex(),
+		Tags:           []string{"cold-failure"},
+	}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	candidate := topology.ColdNodeCandidate{
+		SubscriptionID: subID,
+		Hash:           hash,
+		RawOptions:     raw,
+		Tags:           []string{"cold-failure"},
+	}
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
+		pool.RecordResult(hash, false)
+		pool.RecordLatency(hash, "example.com", nil)
+		return errors.New("cold latency failed")
+	})
+
+	checker.Check(candidate)
+
+	if _, ok := pool.GetEntry(hash); ok {
+		t.Fatal("failed cold check should not retain node in memory")
+	}
+	sub, ok := subManager.Get(subID)
+	if !ok {
+		t.Fatalf("subscription %s missing", subID)
+	}
+	if _, ok := sub.ManagedNodes().LoadNode(hash); ok {
+		t.Fatal("failed cold check should not retain active managed relation")
+	}
+	if err := engine.FlushDirtySets(newFlushReaders(pool, subManager, nil)); err != nil {
+		t.Fatalf("FlushDirtySets: %v", err)
+	}
+	statics, err := engine.LoadAllNodesStatic()
+	if err != nil {
+		t.Fatalf("LoadAllNodesStatic: %v", err)
+	}
+	if len(statics) != 1 || statics[0].Hash != hash.Hex() {
+		t.Fatalf("cold catalog static row should remain after failed check, got %+v", statics)
+	}
+	dynamics, err := engine.LoadAllNodesDynamic()
+	if err != nil {
+		t.Fatalf("LoadAllNodesDynamic: %v", err)
+	}
+	if len(dynamics) != 1 || dynamics[0].Hash != hash.Hex() || dynamics[0].CircuitOpenSince == 0 || dynamics[0].FailureCount == 0 {
+		t.Fatalf("failed cold check should persist circuit/failure dynamic row, got %+v", dynamics)
+	}
+	subNodes, err := engine.LoadAllSubscriptionNodes()
+	if err != nil {
+		t.Fatalf("LoadAllSubscriptionNodes: %v", err)
+	}
+	if len(subNodes) != 1 || subNodes[0].NodeHash != hash.Hex() || subNodes[0].Evicted {
+		t.Fatalf("failed cold check should keep non-evicted catalog relation, got %+v", subNodes)
+	}
+}
+
 func TestBootstrapNodes_TrimRegularLatencyKeepsAuthorities(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
@@ -959,5 +1444,147 @@ func TestMarkNodeRemovedDirty_DeletesStaticDynamicAndLatency(t *testing.T) {
 	}
 	if len(latencies) != 0 {
 		t.Fatalf("node_latency not deleted: %+v", latencies)
+	}
+}
+
+func TestNewTopologyRuntime_WiresDBFirstRefreshCatalogAndColdQueue(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-runtime-db-first"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "RuntimeDBFirst",
+		SourceType:       subscription.SourceTypeRemote,
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	raw := `{"type":"shadowsocks","tag":"runtime-db-first","server":"198.51.100.90","server_port":443}`
+	hash := node.HashFromRawOptions([]byte(raw))
+	body := []byte(`{"outbounds":[` + raw + `]}`)
+	envCfg := newDefaultPlatformEnvConfig()
+	envCfg.DBFirstRefresh = true
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	var runtimePtr atomic.Pointer[config.RuntimeConfig]
+	runtimePtr.Store(runtimeCfg)
+	geoSvc := geoip.NewService(geoip.ServiceConfig{OpenDB: geoip.NoOpOpen})
+
+	rt, err := newTopologyRuntime(
+		engine,
+		envCfg,
+		&runtimePtr,
+		geoSvc,
+		staticSubscriptionDownloader{body: body},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("newTopologyRuntime: %v", err)
+	}
+	if rt.scheduler == nil {
+		t.Fatal("runtime scheduler should be initialized")
+	}
+	if rt.coldNodeQueue == nil {
+		t.Fatal("runtime should wire a cold-node queue when DB-first refresh is enabled")
+	}
+
+	if err := bootstrapTopology(engine, rt.subManager, rt.pool, envCfg); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+	sub := rt.subManager.Lookup(subID)
+	if sub == nil {
+		t.Fatalf("subscription %s not bootstrapped", subID)
+	}
+
+	rt.scheduler.UpdateSubscription(sub)
+
+	statics, err := engine.LoadAllNodesStatic()
+	if err != nil {
+		t.Fatalf("LoadAllNodesStatic: %v", err)
+	}
+	if len(statics) != 1 || statics[0].Hash != hash.Hex() {
+		t.Fatalf("DB-first runtime should persist parsed node static catalog, got %+v want %s", statics, hash.Hex())
+	}
+	subNodes, err := engine.LoadSubscriptionNodes(subID)
+	if err != nil {
+		t.Fatalf("LoadSubscriptionNodes: %v", err)
+	}
+	if len(subNodes) != 1 || subNodes[0].NodeHash != hash.Hex() || subNodes[0].Evicted {
+		t.Fatalf("DB-first runtime should persist subscription relation before promotion, got %+v", subNodes)
+	}
+	if rt.pool.Size() != 0 {
+		t.Fatalf("new DB-first nodes should stay cold until check promotion, pool size=%d", rt.pool.Size())
+	}
+}
+
+func TestNewTopologyRuntime_LeavesDBFirstRefreshDisabledByDefault(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-runtime-default"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "RuntimeDefault",
+		SourceType:       subscription.SourceTypeRemote,
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	raw := `{"type":"shadowsocks","tag":"runtime-default","server":"198.51.100.91","server_port":443}`
+	hash := node.HashFromRawOptions([]byte(raw))
+	body := []byte(`{"outbounds":[` + raw + `]}`)
+	envCfg := newDefaultPlatformEnvConfig()
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	var runtimePtr atomic.Pointer[config.RuntimeConfig]
+	runtimePtr.Store(runtimeCfg)
+	geoSvc := geoip.NewService(geoip.ServiceConfig{OpenDB: geoip.NoOpOpen})
+
+	rt, err := newTopologyRuntime(
+		engine,
+		envCfg,
+		&runtimePtr,
+		geoSvc,
+		staticSubscriptionDownloader{body: body},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("newTopologyRuntime: %v", err)
+	}
+	if rt.scheduler == nil {
+		t.Fatal("runtime scheduler should be initialized")
+	}
+	if rt.coldNodeQueue != nil {
+		t.Fatal("runtime should not allocate cold-node queue when DB-first refresh is disabled")
+	}
+	if err := bootstrapTopology(engine, rt.subManager, rt.pool, envCfg); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+	sub := rt.subManager.Lookup(subID)
+	if sub == nil {
+		t.Fatalf("subscription %s not bootstrapped", subID)
+	}
+	rt.scheduler.UpdateSubscription(sub)
+	if _, ok := rt.pool.GetEntry(hash); !ok {
+		t.Fatalf("default refresh should promote parsed node directly into memory, want %s", hash.Hex())
 	}
 }

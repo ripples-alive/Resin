@@ -1120,6 +1120,12 @@ func TestAPIContract_SystemEnvConfigSnapshot(t *testing.T) {
 	if body["enable_embedded_secure_dns"] != true {
 		t.Fatalf("enable_embedded_secure_dns: got %v, want true", body["enable_embedded_secure_dns"])
 	}
+	if body["active_only_bootstrap"] != false {
+		t.Fatalf("active_only_bootstrap: got %v, want false", body["active_only_bootstrap"])
+	}
+	if body["db_first_refresh"] != false {
+		t.Fatalf("db_first_refresh: got %v, want false", body["db_first_refresh"])
+	}
 	if body["admin_token_set"] != false {
 		t.Fatalf("admin_token_set: got %v, want false", body["admin_token_set"])
 	}

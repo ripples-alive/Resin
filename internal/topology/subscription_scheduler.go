@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/scanloop"
@@ -34,8 +35,35 @@ type SubscriptionScheduler struct {
 	// subscription transitions from disabled to enabled.
 	onSubReenabledNode func(hash node.Hash)
 
+	dbFirstRefresh   bool
+	catalog          SubscriptionCatalog
+	coldNodeQueue    ColdNodeQueue
+	coldQueueMaxSize int
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
+}
+
+// ColdNodeCandidate describes a catalog node that should be checked before it
+// can be promoted into the active in-memory pool.
+type ColdNodeCandidate struct {
+	SubscriptionID string
+	Hash           node.Hash
+	RawOptions     []byte
+	Tags           []string
+}
+
+// ColdNodeQueue accepts bounded cold-node check work. Returning false means the
+// candidate was dropped because the queue is full or disabled.
+type ColdNodeQueue interface {
+	EnqueueColdNodeCheck(ColdNodeCandidate) bool
+}
+
+// SubscriptionCatalog persists the full DB-backed subscription catalog during
+// DB-first refreshes.
+type SubscriptionCatalog interface {
+	LoadSubscriptionNodes(subID string) ([]model.SubscriptionNode, error)
+	ReplaceSubscriptionRefresh(subID string, statics []model.NodeStatic, upserts []model.SubscriptionNode, deletes []model.SubscriptionNodeKey) error
 }
 
 // SchedulerConfig configures the SubscriptionScheduler.
@@ -48,6 +76,12 @@ type SchedulerConfig struct {
 	OnSubRefreshState func(subID string, checkedNs int64, updatedNs *int64, lastError string)
 	// OnSubReenabledNode is fired after false->true enabled transition.
 	OnSubReenabledNode func(hash node.Hash)
+
+	// DBFirstRefresh persists parsed catalog rows before memory promotion.
+	DBFirstRefresh   bool
+	Catalog          SubscriptionCatalog
+	ColdNodeQueue    ColdNodeQueue
+	ColdQueueMaxSize int
 }
 
 // NewSubscriptionScheduler creates a new scheduler.
@@ -62,6 +96,10 @@ func NewSubscriptionScheduler(cfg SchedulerConfig) *SubscriptionScheduler {
 		onSubUpdated:       cfg.OnSubUpdated,
 		onSubRefreshState:  cfg.OnSubRefreshState,
 		onSubReenabledNode: cfg.OnSubReenabledNode,
+		dbFirstRefresh:     cfg.DBFirstRefresh,
+		catalog:            cfg.Catalog,
+		coldNodeQueue:      cfg.ColdNodeQueue,
+		coldQueueMaxSize:   cfg.ColdQueueMaxSize,
 		stopCh:             make(chan struct{}),
 	}
 	if cfg.Fetcher != nil {
@@ -235,6 +273,11 @@ func (s *SubscriptionScheduler) UpdateSubscription(sub *subscription.Subscriptio
 		}
 	}
 
+	if s.dbFirstRefresh && s.catalog != nil {
+		s.updateSubscriptionDBFirst(sub, attemptStartedNs, attemptConfigVersion, newManagedNodes, rawByHash)
+		return
+	}
+
 	// 4. Diff, swap, add/remove — under lock.
 	applied := false
 	sub.WithOpLock(func() {
@@ -302,6 +345,160 @@ func (s *SubscriptionScheduler) UpdateSubscription(sub *subscription.Subscriptio
 		updatedNs := sub.LastUpdatedNs.Load()
 		s.onSubRefreshState(sub.ID, checkedNs, &updatedNs, "")
 	}
+}
+
+func (s *SubscriptionScheduler) updateSubscriptionDBFirst(
+	sub *subscription.Subscription,
+	attemptStartedNs int64,
+	attemptConfigVersion int64,
+	newManagedNodes *subscription.ManagedNodes,
+	rawByHash map[node.Hash][]byte,
+) {
+	oldRows, err := s.catalog.LoadSubscriptionNodes(sub.ID)
+	if err != nil {
+		s.handleUpdateFailure(sub, attemptStartedNs, attemptConfigVersion, "catalog load", err)
+		return
+	}
+
+	oldView := subscription.NewManagedNodes()
+	for _, row := range oldRows {
+		h, err := node.ParseHex(row.NodeHash)
+		if err != nil {
+			continue
+		}
+		oldView.StoreNode(h, subscription.ManagedNode{Tags: append([]string(nil), row.Tags...), Evicted: row.Evicted})
+	}
+
+	sub.ManagedNodes().RangeNodes(func(h node.Hash, managed subscription.ManagedNode) bool {
+		if entry, ok := s.pool.GetEntry(h); ok {
+			if s.shouldRetainDBFirstLiveRelation(entry) {
+				oldView.StoreNode(h, subscription.ManagedNode{Tags: append([]string(nil), managed.Tags...), Evicted: managed.Evicted})
+			}
+		}
+		return true
+	})
+
+	oldView.RangeNodes(func(h node.Hash, oldNode subscription.ManagedNode) bool {
+		if !oldNode.Evicted {
+			return true
+		}
+		nextNode, ok := newManagedNodes.LoadNode(h)
+		if !ok {
+			return true
+		}
+		nextNode.Evicted = true
+		newManagedNodes.StoreNode(h, nextNode)
+		return true
+	})
+
+	activeNext := subscription.NewManagedNodes()
+	statics := make([]model.NodeStatic, 0, len(rawByHash))
+	upsertsByHash := make(map[node.Hash]model.SubscriptionNode)
+	deletes := make([]model.SubscriptionNodeKey, 0)
+	queued := make([]ColdNodeCandidate, 0)
+	nowForRows := time.Now().UnixNano()
+
+	newManagedNodes.RangeNodes(func(h node.Hash, managed subscription.ManagedNode) bool {
+		raw := rawByHash[h]
+		statics = append(statics, model.NodeStatic{Hash: h.Hex(), RawOptions: append([]byte(nil), raw...), CreatedAtNs: nowForRows})
+		row := model.SubscriptionNode{SubscriptionID: sub.ID, NodeHash: h.Hex(), Tags: append([]string(nil), managed.Tags...), Evicted: managed.Evicted}
+		upsertsByHash[h] = row
+		if managed.Evicted {
+			return true
+		}
+		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainDBFirstLiveRelation(entry) {
+			activeNext.StoreNode(h, managed)
+			return true
+		}
+		if s.coldNodeQueue != nil && (s.coldQueueMaxSize <= 0 || len(queued) < s.coldQueueMaxSize) {
+			queued = append(queued, ColdNodeCandidate{SubscriptionID: sub.ID, Hash: h, RawOptions: append([]byte(nil), raw...), Tags: append([]string(nil), managed.Tags...)})
+		}
+		return true
+	})
+
+	oldView.RangeNodes(func(h node.Hash, oldNode subscription.ManagedNode) bool {
+		if _, ok := upsertsByHash[h]; ok {
+			return true
+		}
+		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainDBFirstLiveRelation(entry) && !oldNode.Evicted {
+			activeNext.StoreNode(h, oldNode)
+			upsertsByHash[h] = model.SubscriptionNode{SubscriptionID: sub.ID, NodeHash: h.Hex(), Tags: append([]string(nil), oldNode.Tags...), Evicted: false}
+			return true
+		}
+		deletes = append(deletes, model.SubscriptionNodeKey{SubscriptionID: sub.ID, NodeHash: h.Hex()})
+		return true
+	})
+
+	upserts := make([]model.SubscriptionNode, 0, len(upsertsByHash))
+	for _, row := range upsertsByHash {
+		upserts = append(upserts, row)
+	}
+
+	applied := false
+	var replaceErr error
+	sub.WithOpLock(func() {
+		if sub.ConfigVersion() != attemptConfigVersion {
+			return
+		}
+		if sub.LastUpdatedNs.Load() > attemptStartedNs {
+			return
+		}
+		if err := s.catalog.ReplaceSubscriptionRefresh(sub.ID, statics, upserts, deletes); err != nil {
+			replaceErr = err
+			return
+		}
+
+		oldActive := sub.ManagedNodes()
+		oldActive.RangeNodes(func(h node.Hash, _ subscription.ManagedNode) bool {
+			if _, ok := activeNext.LoadNode(h); !ok {
+				s.pool.RemoveNodeFromSub(h, sub.ID)
+			}
+			return true
+		})
+		activeNext.RangeNodes(func(h node.Hash, managed subscription.ManagedNode) bool {
+			if managed.Evicted {
+				return true
+			}
+			if raw, ok := rawByHash[h]; ok {
+				s.pool.AddNodeFromSub(h, raw, sub.ID)
+			}
+			return true
+		})
+
+		sub.SwapManagedNodes(activeNext)
+		now := time.Now().UnixNano()
+		sub.LastCheckedNs.Store(now)
+		sub.LastUpdatedNs.Store(now)
+		sub.SetLastError("")
+		applied = true
+	})
+	if replaceErr != nil {
+		s.handleUpdateFailure(sub, attemptStartedNs, attemptConfigVersion, "catalog replace", replaceErr)
+		return
+	}
+	if !applied {
+		log.Printf("[scheduler] stale db-first success ignored for %s", sub.ID)
+		return
+	}
+
+	for _, candidate := range queued {
+		s.coldNodeQueue.EnqueueColdNodeCheck(candidate)
+	}
+	if s.onSubUpdated != nil {
+		s.onSubUpdated(sub)
+	}
+	if s.onSubRefreshState != nil {
+		checkedNs := sub.LastCheckedNs.Load()
+		updatedNs := sub.LastUpdatedNs.Load()
+		s.onSubRefreshState(sub.ID, checkedNs, &updatedNs, "")
+	}
+}
+
+func (s *SubscriptionScheduler) shouldRetainDBFirstLiveRelation(entry *node.NodeEntry) bool {
+	if entry == nil {
+		return false
+	}
+	return !entry.IsCircuitOpen() && entry.HasOutbound()
 }
 
 // handleUpdateFailure applies a fetch/parse failure to subscription state.
