@@ -1,21 +1,40 @@
 package main
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"testing"
-
-	"github.com/Resinat/Resin/internal/config"
 )
 
-func TestShouldForceRefreshSubscriptionsAtStartup_ActiveOnlySkipsForceRefresh(t *testing.T) {
-	envCfg := &config.EnvConfig{ActiveOnlyRuntime: true}
-	if shouldForceRefreshSubscriptionsAtStartup(envCfg) {
-		t.Fatal("active-only startup should skip force refresh")
+func TestStartBackgroundServicesDoesNotForceRefreshSubscriptions(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "app_runtime.go", nil, 0)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
 	}
-}
 
-func TestShouldForceRefreshSubscriptionsAtStartup_LegacyRuntimeForcesRefresh(t *testing.T) {
-	envCfg := &config.EnvConfig{ActiveOnlyRuntime: false}
-	if !shouldForceRefreshSubscriptionsAtStartup(envCfg) {
-		t.Fatal("legacy runtime should force startup refresh")
+	var fn *ast.FuncDecl
+	for _, decl := range file.Decls {
+		candidate, ok := decl.(*ast.FuncDecl)
+		if ok && candidate.Name.Name == "startBackgroundServices" {
+			fn = candidate
+			break
+		}
 	}
+	if fn == nil {
+		t.Fatal("startBackgroundServices not found")
+	}
+
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		switch sel.Sel.Name {
+		case "ForceRefreshAll", "ForceRefreshAllAsync":
+			t.Fatalf("startBackgroundServices must not call %s; startup refresh is controlled by stored subscription timestamps", sel.Sel.Name)
+		}
+		return true
+	})
 }

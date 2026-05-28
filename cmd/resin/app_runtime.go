@@ -357,16 +357,7 @@ func (a *resinApp) startBackgroundServices() {
 
 	// --- Step 8 Batch 3: Subscription scheduler ---
 	a.topoRuntime.scheduler.Start()
-	if shouldForceRefreshSubscriptionsAtStartup(a.envCfg) {
-		a.topoRuntime.scheduler.ForceRefreshAllAsync()
-		log.Println("Subscription scheduler started; forced full refresh running in background (batch 3)")
-	} else {
-		log.Println("Subscription scheduler started; startup force refresh skipped by active-only runtime")
-	}
-}
-
-func shouldForceRefreshSubscriptionsAtStartup(envCfg *config.EnvConfig) bool {
-	return envCfg == nil || !envCfg.ActiveOnlyRuntime
+	log.Println("Subscription scheduler started (batch 3)")
 }
 
 func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
