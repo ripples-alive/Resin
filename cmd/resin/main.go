@@ -340,7 +340,7 @@ func newTopologyRuntime(
 	log.Println("ProbeManager initialized")
 
 	var coldNodeQueue *coldSubscriptionNodeCheckQueue
-	var catalog topology.SubscriptionCatalog
+	var inventoryStore topology.SubscriptionInventoryStore
 	if envCfg.ActiveOnlyRuntime {
 		coldChecker := newColdSubscriptionNodeChecker(engine, pool, subManager, singboxBuilder, func(hash node.Hash) error {
 			_, err := probeMgr.ProbeLatencySync(hash)
@@ -351,14 +351,14 @@ func newTopologyRuntime(
 			coldSubscriptionNodeWorkerCount,
 			coldSubscriptionNodeQueueCapacity,
 		)
-		catalog = engine
+		inventoryStore = engine
 	}
 
 	scheduler := topology.NewSubscriptionScheduler(topology.SchedulerConfig{
 		SubManager:       subManager,
 		Pool:             pool,
 		Downloader:       downloader,
-		Catalog:          catalog,
+		InventoryStore:   inventoryStore,
 		ColdNodeQueue:    coldNodeQueue,
 		ColdQueueMaxSize: coldSubscriptionNodeQueueCapacity,
 		OnSubRefreshState: func(subID string, checkedNs int64, updatedNs *int64, lastError string) {

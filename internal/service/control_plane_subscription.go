@@ -39,7 +39,7 @@ type SubscriptionResponse struct {
 	LastError               string `json:"last_error,omitempty"`
 }
 
-func (s *ControlPlaneService) subscriptionCatalogNodeCount(sub *subscription.Subscription) int {
+func (s *ControlPlaneService) subscriptionInventoryNodeCount(sub *subscription.Subscription) int {
 	fallback := func() int {
 		count := 0
 		if managed := sub.ManagedNodes(); managed != nil {
@@ -69,7 +69,7 @@ func (s *ControlPlaneService) subscriptionCatalogNodeCount(sub *subscription.Sub
 }
 
 func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) SubscriptionResponse {
-	nodeCount := s.subscriptionCatalogNodeCount(sub)
+	nodeCount := s.subscriptionInventoryNodeCount(sub)
 	healthyNodeCount := 0
 	var isHealthyAndEnabled func(*node.NodeEntry) bool
 	if sub.Enabled() && s != nil && s.Pool != nil {

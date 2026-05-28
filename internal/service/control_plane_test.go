@@ -1247,7 +1247,7 @@ func TestListAccountHeaderRules_FailsFastOnCorruptPersistedHeadersColumn(t *test
 	}
 }
 
-func TestGetSubscription_NodeCountUsesCatalogRowsWhenAvailable(t *testing.T) {
+func TestGetSubscription_NodeCountUsesInventoryRowsWhenAvailable(t *testing.T) {
 	dir := t.TempDir()
 	engine, closer, err := state.PersistenceBootstrap(filepath.Join(dir, "state"), filepath.Join(dir, "cache"))
 	if err != nil {
@@ -1301,7 +1301,7 @@ func TestGetSubscription_NodeCountUsesCatalogRowsWhenAvailable(t *testing.T) {
 		t.Fatalf("GetSubscription: %v", err)
 	}
 	if resp.NodeCount != 2 {
-		t.Fatalf("node_count = %d, want catalog count 2", resp.NodeCount)
+		t.Fatalf("node_count = %d, want DB inventory count 2", resp.NodeCount)
 	}
 	if resp.HealthyNodeCount != 1 {
 		t.Fatalf("healthy_node_count = %d, want active healthy count 1", resp.HealthyNodeCount)

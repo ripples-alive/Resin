@@ -50,23 +50,23 @@ func newTestScheduler(subMgr *SubscriptionManager, pool *GlobalNodePool, fetcher
 	})
 }
 
-type recordingSubscriptionCatalog struct {
+type recordingSubscriptionInventoryStore struct {
 	loadRows []model.SubscriptionNode
 
-	replaceCalls []catalogReplaceCall
+	replaceCalls []inventoryReplaceCall
 	onReplace    func()
 }
 
-type catalogReplaceCall struct {
+type inventoryReplaceCall struct {
 	subID   string
 	statics []model.NodeStatic
 	upserts []model.SubscriptionNode
 	deletes []model.SubscriptionNodeKey
 }
 
-func (c *recordingSubscriptionCatalog) LoadSubscriptionNodes(subID string) ([]model.SubscriptionNode, error) {
-	out := make([]model.SubscriptionNode, 0, len(c.loadRows))
-	for _, row := range c.loadRows {
+func (s *recordingSubscriptionInventoryStore) LoadSubscriptionNodes(subID string) ([]model.SubscriptionNode, error) {
+	out := make([]model.SubscriptionNode, 0, len(s.loadRows))
+	for _, row := range s.loadRows {
 		if row.SubscriptionID == subID {
 			out = append(out, row)
 		}
@@ -74,16 +74,16 @@ func (c *recordingSubscriptionCatalog) LoadSubscriptionNodes(subID string) ([]mo
 	return out, nil
 }
 
-func (c *recordingSubscriptionCatalog) ReplaceSubscriptionRefresh(
+func (s *recordingSubscriptionInventoryStore) ReplaceSubscriptionRefresh(
 	subID string,
 	statics []model.NodeStatic,
 	upserts []model.SubscriptionNode,
 	deletes []model.SubscriptionNodeKey,
 ) error {
-	if c.onReplace != nil {
-		c.onReplace()
+	if s.onReplace != nil {
+		s.onReplace()
 	}
-	c.replaceCalls = append(c.replaceCalls, catalogReplaceCall{
+	s.replaceCalls = append(s.replaceCalls, inventoryReplaceCall{
 		subID:   subID,
 		statics: append([]model.NodeStatic(nil), statics...),
 		upserts: append([]model.SubscriptionNode(nil), upserts...),
@@ -424,7 +424,7 @@ func TestScheduler_UpdateSubscription_KeepEvictedDoesNotReAddToPool(t *testing.T
 	}
 }
 
-func TestScheduler_CatalogRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueuesColdCheck(t *testing.T) {
+func TestScheduler_InventoryRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueuesColdCheck(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
 	subMgr.Register(sub)
@@ -433,13 +433,13 @@ func TestScheduler_CatalogRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueues
 	raw := `{"type":"shadowsocks","tag":"cold-node","server":"1.1.1.1","server_port":443}`
 	hash := node.HashFromRawOptions([]byte(raw))
 	body := makeSubscriptionJSON(raw)
-	catalog := &recordingSubscriptionCatalog{
+	inventoryStore := &recordingSubscriptionInventoryStore{
 		onReplace: func() {
 			if pool.Size() != 0 {
-				t.Fatalf("catalog persistence must happen before memory promotion, pool size=%d", pool.Size())
+				t.Fatalf("inventory persistence must happen before memory promotion, pool size=%d", pool.Size())
 			}
 			if got := managedNodeCount(sub.ManagedNodes()); got != 0 {
-				t.Fatalf("catalog persistence must happen before active managed update, got %d managed nodes", got)
+				t.Fatalf("inventory persistence must happen before active managed update, got %d managed nodes", got)
 			}
 		},
 	}
@@ -448,35 +448,35 @@ func TestScheduler_CatalogRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueues
 		SubManager:       subMgr,
 		Pool:             pool,
 		Fetcher:          makeMockFetcher(body, nil),
-		Catalog:          catalog,
+		InventoryStore:   inventoryStore,
 		ColdNodeQueue:    coldQueue,
 		ColdQueueMaxSize: 8,
 	})
 
 	sched.UpdateSubscription(sub)
 
-	if len(catalog.replaceCalls) != 1 {
-		t.Fatalf("expected one catalog replace call, got %d", len(catalog.replaceCalls))
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
 	}
-	call := catalog.replaceCalls[0]
+	call := inventoryStore.replaceCalls[0]
 	if call.subID != sub.ID {
-		t.Fatalf("catalog subID: got %q, want %q", call.subID, sub.ID)
+		t.Fatalf("inventory subID: got %q, want %q", call.subID, sub.ID)
 	}
 	if len(call.statics) != 1 || call.statics[0].Hash != hash.Hex() || string(call.statics[0].RawOptions) != raw {
-		t.Fatalf("catalog statics: got %+v, want hash %s raw %s", call.statics, hash.Hex(), raw)
+		t.Fatalf("inventory statics: got %+v, want hash %s raw %s", call.statics, hash.Hex(), raw)
 	}
 	if len(call.upserts) != 1 {
-		t.Fatalf("catalog upserts: got %+v, want one relation", call.upserts)
+		t.Fatalf("inventory upserts: got %+v, want one relation", call.upserts)
 	}
 	upsert := call.upserts[0]
 	if upsert.SubscriptionID != sub.ID || upsert.NodeHash != hash.Hex() || upsert.Evicted {
-		t.Fatalf("catalog relation: got %+v, want non-evicted relation for %s", upsert, hash.Hex())
+		t.Fatalf("inventory relation: got %+v, want non-evicted relation for %s", upsert, hash.Hex())
 	}
 	if !reflect.DeepEqual(upsert.Tags, []string{"cold-node"}) {
-		t.Fatalf("catalog tags: got %v, want [cold-node]", upsert.Tags)
+		t.Fatalf("inventory tags: got %v, want [cold-node]", upsert.Tags)
 	}
 	if len(call.deletes) != 0 {
-		t.Fatalf("unexpected catalog deletes: %+v", call.deletes)
+		t.Fatalf("unexpected inventory deletes: %+v", call.deletes)
 	}
 	if pool.Size() != 0 {
 		t.Fatalf("new cold node must not be promoted into memory before check, pool size=%d", pool.Size())
@@ -496,7 +496,7 @@ func TestScheduler_CatalogRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueues
 	}
 }
 
-func TestScheduler_CatalogRefresh_OldViewMergesCatalogAndLiveWithLiveWinning(t *testing.T) {
+func TestScheduler_InventoryRefresh_OldViewMergesInventoryAndLiveWithLiveWinning(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
 	subMgr.Register(sub)
@@ -521,7 +521,7 @@ func TestScheduler_CatalogRefresh_OldViewMergesCatalogAndLiveWithLiveWinning(t *
 	entry.Outbound.Store(&ob)
 	entry.CircuitOpenSince.Store(0)
 
-	catalog := &recordingSubscriptionCatalog{
+	inventoryStore := &recordingSubscriptionInventoryStore{
 		loadRows: []model.SubscriptionNode{
 			{SubscriptionID: sub.ID, NodeHash: liveHash.Hex(), Tags: []string{"db-live-old"}, Evicted: true},
 			{SubscriptionID: sub.ID, NodeHash: removedColdHash.Hex(), Tags: []string{"removed-cold"}, Evicted: false},
@@ -532,23 +532,23 @@ func TestScheduler_CatalogRefresh_OldViewMergesCatalogAndLiveWithLiveWinning(t *
 		SubManager:       subMgr,
 		Pool:             pool,
 		Fetcher:          makeMockFetcher(makeSubscriptionJSON(rawLive, rawNewCold), nil),
-		Catalog:          catalog,
+		InventoryStore:   inventoryStore,
 		ColdNodeQueue:    coldQueue,
 		ColdQueueMaxSize: 8,
 	})
 
 	sched.UpdateSubscription(sub)
 
-	if len(catalog.replaceCalls) != 1 {
-		t.Fatalf("expected one catalog replace call, got %d", len(catalog.replaceCalls))
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
 	}
-	call := catalog.replaceCalls[0]
+	call := inventoryStore.replaceCalls[0]
 	liveRow, ok := subscriptionNodeByHash(call.upserts, liveHash)
 	if !ok {
 		t.Fatalf("live relation missing from upserts: %+v", call.upserts)
 	}
 	if liveRow.Evicted {
-		t.Fatalf("live state should override catalog evicted row, got %+v", liveRow)
+		t.Fatalf("live state should override inventory evicted row, got %+v", liveRow)
 	}
 	if !reflect.DeepEqual(liveRow.Tags, []string{"live-new"}) {
 		t.Fatalf("live relation tags: got %v, want [live-new]", liveRow.Tags)
@@ -557,14 +557,14 @@ func TestScheduler_CatalogRefresh_OldViewMergesCatalogAndLiveWithLiveWinning(t *
 		t.Fatalf("new cold relation missing from upserts: %+v", call.upserts)
 	}
 	if len(call.deletes) != 1 || call.deletes[0].NodeHash != removedColdHash.Hex() {
-		t.Fatalf("removed catalog relation deletes: got %+v, want %s", call.deletes, removedColdHash.Hex())
+		t.Fatalf("removed inventory relation deletes: got %+v, want %s", call.deletes, removedColdHash.Hex())
 	}
 	managed, ok := sub.ManagedNodes().LoadNode(liveHash)
 	if !ok {
 		t.Fatal("live relation should remain in active managed memory")
 	}
 	if managed.Evicted {
-		t.Fatal("live relation should not become evicted from DB catalog row")
+		t.Fatal("live relation should not become evicted from DB inventory row")
 	}
 	if _, ok := sub.ManagedNodes().LoadNode(newColdHash); ok {
 		t.Fatal("new cold relation should not enter active managed memory before cold check")
@@ -574,7 +574,7 @@ func TestScheduler_CatalogRefresh_OldViewMergesCatalogAndLiveWithLiveWinning(t *
 	}
 }
 
-func TestScheduler_CatalogRefresh_RetainsRemovedButLiveActiveRelation(t *testing.T) {
+func TestScheduler_InventoryRefresh_RetainsRemovedButLiveActiveRelation(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
 	subMgr.Register(sub)
@@ -594,12 +594,12 @@ func TestScheduler_CatalogRefresh_RetainsRemovedButLiveActiveRelation(t *testing
 	entry.Outbound.Store(&ob)
 	entry.CircuitOpenSince.Store(0)
 
-	catalog := &recordingSubscriptionCatalog{}
+	inventoryStore := &recordingSubscriptionInventoryStore{}
 	sched := NewSubscriptionScheduler(SchedulerConfig{
-		SubManager: subMgr,
-		Pool:       pool,
-		Fetcher:    makeMockFetcher(makeSubscriptionJSON(), nil),
-		Catalog:    catalog,
+		SubManager:     subMgr,
+		Pool:           pool,
+		Fetcher:        makeMockFetcher(makeSubscriptionJSON(), nil),
+		InventoryStore: inventoryStore,
 	})
 
 	sched.UpdateSubscription(sub)
@@ -610,18 +610,18 @@ func TestScheduler_CatalogRefresh_RetainsRemovedButLiveActiveRelation(t *testing
 	if _, ok := sub.ManagedNodes().LoadNode(liveHash); !ok {
 		t.Fatal("removed-but-live active relation should stay in managed memory")
 	}
-	if len(catalog.replaceCalls) != 1 {
-		t.Fatalf("expected one catalog replace call, got %d", len(catalog.replaceCalls))
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
 	}
-	if _, ok := subscriptionNodeByHash(catalog.replaceCalls[0].upserts, liveHash); !ok {
-		t.Fatalf("removed-but-live active relation should be retained in catalog upserts: %+v", catalog.replaceCalls[0].upserts)
+	if _, ok := subscriptionNodeByHash(inventoryStore.replaceCalls[0].upserts, liveHash); !ok {
+		t.Fatalf("removed-but-live active relation should be retained in inventory upserts: %+v", inventoryStore.replaceCalls[0].upserts)
 	}
-	if len(catalog.replaceCalls[0].deletes) != 0 {
-		t.Fatalf("removed-but-live active relation should not be deleted: %+v", catalog.replaceCalls[0].deletes)
+	if len(inventoryStore.replaceCalls[0].deletes) != 0 {
+		t.Fatalf("removed-but-live active relation should not be deleted: %+v", inventoryStore.replaceCalls[0].deletes)
 	}
 }
 
-func TestScheduler_CatalogRefresh_EvictedRelationNotRevived(t *testing.T) {
+func TestScheduler_InventoryRefresh_EvictedRelationNotRevived(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
 	subMgr.Register(sub)
@@ -629,7 +629,7 @@ func TestScheduler_CatalogRefresh_EvictedRelationNotRevived(t *testing.T) {
 	pool := newTestPool(subMgr)
 	raw := `{"type":"shadowsocks","tag":"evicted-node","server":"1.1.1.1","server_port":443}`
 	hash := node.HashFromRawOptions([]byte(raw))
-	catalog := &recordingSubscriptionCatalog{
+	inventoryStore := &recordingSubscriptionInventoryStore{
 		loadRows: []model.SubscriptionNode{
 			{SubscriptionID: sub.ID, NodeHash: hash.Hex(), Tags: []string{"old-evicted"}, Evicted: true},
 		},
@@ -639,7 +639,7 @@ func TestScheduler_CatalogRefresh_EvictedRelationNotRevived(t *testing.T) {
 		SubManager:       subMgr,
 		Pool:             pool,
 		Fetcher:          makeMockFetcher(makeSubscriptionJSON(raw), nil),
-		Catalog:          catalog,
+		InventoryStore:   inventoryStore,
 		ColdNodeQueue:    coldQueue,
 		ColdQueueMaxSize: 8,
 	})
@@ -655,12 +655,12 @@ func TestScheduler_CatalogRefresh_EvictedRelationNotRevived(t *testing.T) {
 	if len(coldQueue.candidates) != 0 {
 		t.Fatalf("evicted relation should not queue cold check: %+v", coldQueue.candidates)
 	}
-	if len(catalog.replaceCalls) != 1 {
-		t.Fatalf("expected one catalog replace call, got %d", len(catalog.replaceCalls))
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
 	}
-	row, ok := subscriptionNodeByHash(catalog.replaceCalls[0].upserts, hash)
+	row, ok := subscriptionNodeByHash(inventoryStore.replaceCalls[0].upserts, hash)
 	if !ok {
-		t.Fatalf("evicted relation should stay in catalog upserts: %+v", catalog.replaceCalls[0].upserts)
+		t.Fatalf("evicted relation should stay in inventory upserts: %+v", inventoryStore.replaceCalls[0].upserts)
 	}
 	if !row.Evicted {
 		t.Fatalf("evicted relation was revived: %+v", row)

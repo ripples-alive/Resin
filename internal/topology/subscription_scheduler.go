@@ -35,7 +35,7 @@ type SubscriptionScheduler struct {
 	// subscription transitions from disabled to enabled.
 	onSubReenabledNode func(hash node.Hash)
 
-	catalog          SubscriptionCatalog
+	inventoryStore   SubscriptionInventoryStore
 	coldNodeQueue    ColdNodeQueue
 	coldQueueMaxSize int
 
@@ -43,7 +43,7 @@ type SubscriptionScheduler struct {
 	wg     sync.WaitGroup
 }
 
-// ColdNodeCandidate describes a catalog node that should be checked before it
+// ColdNodeCandidate describes an inventory node that should be checked before it
 // can be promoted into the active in-memory pool.
 type ColdNodeCandidate struct {
 	SubscriptionID string
@@ -58,9 +58,9 @@ type ColdNodeQueue interface {
 	EnqueueColdNodeCheck(ColdNodeCandidate) bool
 }
 
-// SubscriptionCatalog persists the full DB-backed subscription catalog during
+// SubscriptionInventoryStore persists the full DB-backed subscription inventory during
 // subscription refreshes before cold-node promotion.
-type SubscriptionCatalog interface {
+type SubscriptionInventoryStore interface {
 	LoadSubscriptionNodes(subID string) ([]model.SubscriptionNode, error)
 	ReplaceSubscriptionRefresh(subID string, statics []model.NodeStatic, upserts []model.SubscriptionNode, deletes []model.SubscriptionNodeKey) error
 }
@@ -76,7 +76,7 @@ type SchedulerConfig struct {
 	// OnSubReenabledNode is fired after false->true enabled transition.
 	OnSubReenabledNode func(hash node.Hash)
 
-	Catalog          SubscriptionCatalog
+	InventoryStore   SubscriptionInventoryStore
 	ColdNodeQueue    ColdNodeQueue
 	ColdQueueMaxSize int
 }
@@ -93,7 +93,7 @@ func NewSubscriptionScheduler(cfg SchedulerConfig) *SubscriptionScheduler {
 		onSubUpdated:       cfg.OnSubUpdated,
 		onSubRefreshState:  cfg.OnSubRefreshState,
 		onSubReenabledNode: cfg.OnSubReenabledNode,
-		catalog:            cfg.Catalog,
+		inventoryStore:     cfg.InventoryStore,
 		coldNodeQueue:      cfg.ColdNodeQueue,
 		coldQueueMaxSize:   cfg.ColdQueueMaxSize,
 		stopCh:             make(chan struct{}),
@@ -268,8 +268,8 @@ func (s *SubscriptionScheduler) UpdateSubscription(sub *subscription.Subscriptio
 		}
 	}
 
-	if s.catalog != nil {
-		s.updateSubscriptionCatalogFirst(sub, attemptStartedNs, attemptConfigVersion, newManagedNodes, rawByHash)
+	if s.inventoryStore != nil {
+		s.updateSubscriptionInventoryFirst(sub, attemptStartedNs, attemptConfigVersion, newManagedNodes, rawByHash)
 		return
 	}
 
@@ -342,16 +342,16 @@ func (s *SubscriptionScheduler) UpdateSubscription(sub *subscription.Subscriptio
 	}
 }
 
-func (s *SubscriptionScheduler) updateSubscriptionCatalogFirst(
+func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 	sub *subscription.Subscription,
 	attemptStartedNs int64,
 	attemptConfigVersion int64,
 	newManagedNodes *subscription.ManagedNodes,
 	rawByHash map[node.Hash][]byte,
 ) {
-	oldRows, err := s.catalog.LoadSubscriptionNodes(sub.ID)
+	oldRows, err := s.inventoryStore.LoadSubscriptionNodes(sub.ID)
 	if err != nil {
-		s.handleUpdateFailure(sub, attemptStartedNs, attemptConfigVersion, "catalog load", err)
+		s.handleUpdateFailure(sub, attemptStartedNs, attemptConfigVersion, "inventory load", err)
 		return
 	}
 
@@ -366,7 +366,7 @@ func (s *SubscriptionScheduler) updateSubscriptionCatalogFirst(
 
 	sub.ManagedNodes().RangeNodes(func(h node.Hash, managed subscription.ManagedNode) bool {
 		if entry, ok := s.pool.GetEntry(h); ok {
-			if s.shouldRetainCatalogLiveRelation(entry) {
+			if s.shouldRetainInventoryLiveRelation(entry) {
 				oldView.StoreNode(h, subscription.ManagedNode{Tags: append([]string(nil), managed.Tags...), Evicted: managed.Evicted})
 			}
 		}
@@ -401,7 +401,7 @@ func (s *SubscriptionScheduler) updateSubscriptionCatalogFirst(
 		if managed.Evicted {
 			return true
 		}
-		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainCatalogLiveRelation(entry) {
+		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainInventoryLiveRelation(entry) {
 			activeNext.StoreNode(h, managed)
 			return true
 		}
@@ -415,7 +415,7 @@ func (s *SubscriptionScheduler) updateSubscriptionCatalogFirst(
 		if _, ok := upsertsByHash[h]; ok {
 			return true
 		}
-		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainCatalogLiveRelation(entry) && !oldNode.Evicted {
+		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainInventoryLiveRelation(entry) && !oldNode.Evicted {
 			activeNext.StoreNode(h, oldNode)
 			upsertsByHash[h] = model.SubscriptionNode{SubscriptionID: sub.ID, NodeHash: h.Hex(), Tags: append([]string(nil), oldNode.Tags...), Evicted: false}
 			return true
@@ -438,7 +438,7 @@ func (s *SubscriptionScheduler) updateSubscriptionCatalogFirst(
 		if sub.LastUpdatedNs.Load() > attemptStartedNs {
 			return
 		}
-		if err := s.catalog.ReplaceSubscriptionRefresh(sub.ID, statics, upserts, deletes); err != nil {
+		if err := s.inventoryStore.ReplaceSubscriptionRefresh(sub.ID, statics, upserts, deletes); err != nil {
 			replaceErr = err
 			return
 		}
@@ -468,11 +468,11 @@ func (s *SubscriptionScheduler) updateSubscriptionCatalogFirst(
 		applied = true
 	})
 	if replaceErr != nil {
-		s.handleUpdateFailure(sub, attemptStartedNs, attemptConfigVersion, "catalog replace", replaceErr)
+		s.handleUpdateFailure(sub, attemptStartedNs, attemptConfigVersion, "inventory replace", replaceErr)
 		return
 	}
 	if !applied {
-		log.Printf("[scheduler] stale catalog success ignored for %s", sub.ID)
+		log.Printf("[scheduler] stale inventory success ignored for %s", sub.ID)
 		return
 	}
 
@@ -489,7 +489,7 @@ func (s *SubscriptionScheduler) updateSubscriptionCatalogFirst(
 	}
 }
 
-func (s *SubscriptionScheduler) shouldRetainCatalogLiveRelation(entry *node.NodeEntry) bool {
+func (s *SubscriptionScheduler) shouldRetainInventoryLiveRelation(entry *node.NodeEntry) bool {
 	if entry == nil {
 		return false
 	}

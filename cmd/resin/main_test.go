@@ -623,7 +623,7 @@ func TestBootstrapTopology_V1RejectsAllPersistedInvalidPlatformNames(t *testing.
 	}
 }
 
-func TestBootstrapNodes_MissingDynamicStaysColdInCatalog(t *testing.T) {
+func TestBootstrapNodes_MissingDynamicStaysColdInInventory(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -684,11 +684,11 @@ func TestBootstrapNodes_MissingDynamicStaysColdInCatalog(t *testing.T) {
 		t.Fatalf("LoadSubscriptionNodes: %v", err)
 	}
 	if len(rows) != 1 || rows[0].NodeHash != hash.Hex() {
-		t.Fatalf("cold catalog relation missing after bootstrapNodes, got %+v want %s", rows, hash.Hex())
+		t.Fatalf("cold inventory relation missing after bootstrapNodes, got %+v want %s", rows, hash.Hex())
 	}
 }
 
-func TestBootstrapNodes_CircuitClosedWithoutLatencyStaysColdInCatalog(t *testing.T) {
+func TestBootstrapNodes_CircuitClosedWithoutLatencyStaysColdInInventory(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -756,7 +756,7 @@ func TestBootstrapNodes_CircuitClosedWithoutLatencyStaysColdInCatalog(t *testing
 		t.Fatalf("LoadSubscriptionNodes: %v", err)
 	}
 	if len(rows) != 1 || rows[0].NodeHash != hash.Hex() {
-		t.Fatalf("cold catalog relation missing after bootstrapNodes, got %+v want %s", rows, hash.Hex())
+		t.Fatalf("cold inventory relation missing after bootstrapNodes, got %+v want %s", rows, hash.Hex())
 	}
 }
 
@@ -819,7 +819,7 @@ func TestBootstrapNodes_RestoreEvictedSubscriptionNodeWithoutPoolRef(t *testing.
 		t.Fatalf("LoadSubscriptionNodes: %v", err)
 	}
 	if len(rows) != 1 || rows[0].NodeHash != hash.Hex() || !rows[0].Evicted {
-		t.Fatalf("evicted catalog relation not preserved, got %+v want evicted %s", rows, hash.Hex())
+		t.Fatalf("evicted inventory relation not preserved, got %+v want evicted %s", rows, hash.Hex())
 	}
 	if _, ok := pool.GetEntry(hash); ok {
 		t.Fatal("evicted subscription node should not restore subscription hold in pool")
@@ -1227,7 +1227,7 @@ func TestColdSubscriptionNodeCheck_FailurePersistsFailureAndDoesNotRetainMemory(
 		t.Fatalf("LoadAllNodesStatic: %v", err)
 	}
 	if len(statics) != 1 || statics[0].Hash != hash.Hex() {
-		t.Fatalf("cold catalog static row should remain after failed check, got %+v", statics)
+		t.Fatalf("cold inventory static row should remain after failed check, got %+v", statics)
 	}
 	dynamics, err := engine.LoadAllNodesDynamic()
 	if err != nil {
@@ -1241,7 +1241,7 @@ func TestColdSubscriptionNodeCheck_FailurePersistsFailureAndDoesNotRetainMemory(
 		t.Fatalf("LoadAllSubscriptionNodes: %v", err)
 	}
 	if len(subNodes) != 1 || subNodes[0].NodeHash != hash.Hex() || subNodes[0].Evicted {
-		t.Fatalf("failed cold check should keep non-evicted catalog relation, got %+v", subNodes)
+		t.Fatalf("failed cold check should keep non-evicted inventory relation, got %+v", subNodes)
 	}
 }
 
@@ -1482,11 +1482,11 @@ func TestNewTopologyRuntime_WiresActiveOnlyRefreshAndColdQueue(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = closer.Close() })
 
-	const subID = "sub-runtime-catalog"
+	const subID = "sub-runtime-inventory"
 	now := time.Now().UnixNano()
 	if err := engine.UpsertSubscription(model.Subscription{
 		ID:               subID,
-		Name:             "RuntimeCatalog",
+		Name:             "RuntimeInventory",
 		SourceType:       subscription.SourceTypeRemote,
 		URL:              "https://example.com/sub",
 		UpdateIntervalNs: int64(30 * time.Minute),
@@ -1497,7 +1497,7 @@ func TestNewTopologyRuntime_WiresActiveOnlyRefreshAndColdQueue(t *testing.T) {
 		t.Fatalf("UpsertSubscription: %v", err)
 	}
 
-	raw := `{"type":"shadowsocks","tag":"runtime-catalog","server":"198.51.100.90","server_port":443}`
+	raw := `{"type":"shadowsocks","tag":"runtime-inventory","server":"198.51.100.90","server_port":443}`
 	hash := node.HashFromRawOptions([]byte(raw))
 	body := []byte(`{"outbounds":[` + raw + `]}`)
 	envCfg := newDefaultPlatformEnvConfig()
@@ -1522,7 +1522,7 @@ func TestNewTopologyRuntime_WiresActiveOnlyRefreshAndColdQueue(t *testing.T) {
 		t.Fatal("runtime scheduler should be initialized")
 	}
 	if rt.coldNodeQueue == nil {
-		t.Fatal("runtime should wire a cold-node queue for catalog refresh")
+		t.Fatal("runtime should wire a cold-node queue for inventory refresh")
 	}
 
 	if err := bootstrapTopology(engine, rt.subManager, rt.pool, envCfg); err != nil {
@@ -1540,21 +1540,21 @@ func TestNewTopologyRuntime_WiresActiveOnlyRefreshAndColdQueue(t *testing.T) {
 		t.Fatalf("LoadAllNodesStatic: %v", err)
 	}
 	if len(statics) != 1 || statics[0].Hash != hash.Hex() {
-		t.Fatalf("catalog refresh should persist parsed node static catalog, got %+v want %s", statics, hash.Hex())
+		t.Fatalf("inventory refresh should persist parsed node static inventory, got %+v want %s", statics, hash.Hex())
 	}
 	subNodes, err := engine.LoadSubscriptionNodes(subID)
 	if err != nil {
 		t.Fatalf("LoadSubscriptionNodes: %v", err)
 	}
 	if len(subNodes) != 1 || subNodes[0].NodeHash != hash.Hex() || subNodes[0].Evicted {
-		t.Fatalf("catalog refresh should persist subscription relation before promotion, got %+v", subNodes)
+		t.Fatalf("inventory refresh should persist subscription relation before promotion, got %+v", subNodes)
 	}
 	if rt.pool.Size() != 0 {
-		t.Fatalf("new catalog nodes should stay cold until check promotion, pool size=%d", rt.pool.Size())
+		t.Fatalf("new inventory nodes should stay cold until check promotion, pool size=%d", rt.pool.Size())
 	}
 }
 
-func TestNewTopologyRuntime_LegacyRuntimeDoesNotWireCatalogQueue(t *testing.T) {
+func TestNewTopologyRuntime_LegacyRuntimeDoesNotWireInventoryQueue(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)

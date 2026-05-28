@@ -284,7 +284,7 @@ func TestHandleListNodes_EnabledFilter(t *testing.T) {
 	}
 }
 
-func seedCatalogNodeForNodeListTest(
+func seedInventoryNodeForNodeListTest(
 	t *testing.T,
 	cp *service.ControlPlaneService,
 	sub *subscription.Subscription,
@@ -312,7 +312,7 @@ func TestHandleListNodes_ListsActiveRuntimeNodesOnly(t *testing.T) {
 	activeRaw := `{"type":"ss","server":"1.1.1.1","port":443}`
 	coldRaw := `{"type":"ss","server":"2.2.2.2","port":443}`
 	activeHash := node.HashFromRawOptions([]byte(activeRaw)).Hex()
-	coldHash := seedCatalogNodeForNodeListTest(t, cp, subA, coldRaw, "cold-tag")
+	coldHash := seedInventoryNodeForNodeListTest(t, cp, subA, coldRaw, "cold-tag")
 
 	addNodeForNodeListTestWithTag(t, cp, subA, activeRaw, "203.0.113.10", "active-tag")
 	if err := cp.Engine.ReplaceSubscriptionRefresh(subA.ID,
@@ -320,7 +320,7 @@ func TestHandleListNodes_ListsActiveRuntimeNodesOnly(t *testing.T) {
 		[]model.SubscriptionNode{{SubscriptionID: subA.ID, NodeHash: activeHash, Tags: []string{"active-tag"}}},
 		nil,
 	); err != nil {
-		t.Fatalf("seed active catalog row: %v", err)
+		t.Fatalf("seed active inventory row: %v", err)
 	}
 
 	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subA.ID, nil, true)
@@ -339,6 +339,6 @@ func TestHandleListNodes_ListsActiveRuntimeNodesOnly(t *testing.T) {
 		t.Fatalf("active runtime hashes = %v, want active %s", seen, activeHash)
 	}
 	if seen[coldHash] {
-		t.Fatalf("active runtime hashes = %v, should not include catalog-only %s", seen, coldHash)
+		t.Fatalf("active runtime hashes = %v, should not include inventory-only %s", seen, coldHash)
 	}
 }

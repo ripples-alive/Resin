@@ -328,7 +328,7 @@ func (r *CacheRepo) LoadSubscriptionNodes(subID string) ([]model.SubscriptionNod
 	return result, rows.Err()
 }
 
-// ReplaceSubscriptionRefresh atomically applies a DB-first refresh catalog diff.
+// ReplaceSubscriptionRefresh atomically applies a DB-first refresh inventory diff.
 // It upserts parsed node static rows before subscription-node relation changes
 // so cold candidates are durable even when they are not promoted to memory.
 func (r *CacheRepo) ReplaceSubscriptionRefresh(
