@@ -49,6 +49,7 @@ func newDefaultPlatformEnvConfig() *config.EnvConfig {
 		DefaultPlatformReverseProxyEmptyAccountBehavior: "ACCOUNT_HEADER_RULE",
 		DefaultPlatformReverseProxyFixedAccountHeader:   "Authorization",
 		DefaultPlatformAllocationPolicy:                 "BALANCED",
+		CatalogFirstRuntime:                             true,
 	}
 }
 
@@ -1533,5 +1534,36 @@ func TestNewTopologyRuntime_WiresCatalogRefreshAndColdQueue(t *testing.T) {
 	}
 	if rt.pool.Size() != 0 {
 		t.Fatalf("new catalog nodes should stay cold until check promotion, pool size=%d", rt.pool.Size())
+	}
+}
+
+func TestNewTopologyRuntime_LegacyRuntimeDoesNotWireCatalogQueue(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	envCfg := newDefaultPlatformEnvConfig()
+	envCfg.CatalogFirstRuntime = false
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	var runtimePtr atomic.Pointer[config.RuntimeConfig]
+	runtimePtr.Store(runtimeCfg)
+	geoSvc := geoip.NewService(geoip.ServiceConfig{OpenDB: geoip.NoOpOpen})
+
+	rt, err := newTopologyRuntime(
+		engine,
+		envCfg,
+		&runtimePtr,
+		geoSvc,
+		staticSubscriptionDownloader{body: []byte(`{"outbounds":[]}`)},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("newTopologyRuntime: %v", err)
+	}
+	if rt.coldNodeQueue != nil {
+		t.Fatal("legacy runtime should not allocate cold-node queue")
 	}
 }

@@ -45,6 +45,9 @@ type EnvConfig struct {
 	ProxyTransportMaxIdleConnsPerHost               int
 	ProxyTransportIdleConnTimeout                   time.Duration
 	EnableEmbeddedSecureDNS                         bool
+	// CatalogFirstRuntime enables the catalog-first hot/cold runtime: DB catalog is the
+	// full inventory source, while only routable nodes are restored/promoted into memory.
+	CatalogFirstRuntime bool
 
 	// Request log
 	RequestLogQueueSize           int
@@ -115,6 +118,7 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	cfg.ProxyTransportMaxIdleConnsPerHost = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST", 64, &errs)
 	cfg.ProxyTransportIdleConnTimeout = envDuration("RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT", 90*time.Second, &errs)
 	cfg.EnableEmbeddedSecureDNS = envBool("RESIN_ENABLE_EMBEDDED_SECURE_DNS", false, &errs)
+	cfg.CatalogFirstRuntime = envBool("RESIN_CATALOG_FIRST_RUNTIME", true, &errs)
 
 	// --- Request log ---
 	cfg.RequestLogQueueSize = envInt("RESIN_REQUEST_LOG_QUEUE_SIZE", 8192, &errs)
