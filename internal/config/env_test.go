@@ -69,7 +69,7 @@ func TestLoadEnvConfig_Defaults(t *testing.T) {
 	assertEqual(t, "ProxyTransportMaxIdleConnsPerHost", cfg.ProxyTransportMaxIdleConnsPerHost, 64)
 	assertEqual(t, "ProxyTransportIdleConnTimeout", cfg.ProxyTransportIdleConnTimeout, 90*time.Second)
 	assertEqual(t, "EnableEmbeddedSecureDNS", cfg.EnableEmbeddedSecureDNS, false)
-	assertEqual(t, "CatalogFirstRuntime", cfg.CatalogFirstRuntime, true)
+	assertEqual(t, "ActiveOnlyRuntime", cfg.ActiveOnlyRuntime, true)
 
 	// Request log
 	assertEqual(t, "RequestLogQueueSize", cfg.RequestLogQueueSize, 8192)
@@ -113,7 +113,7 @@ func TestLoadEnvConfig_EnvOverrides(t *testing.T) {
 	envs["RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST"] = "128"
 	envs["RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT"] = "2m"
 	envs["RESIN_ENABLE_EMBEDDED_SECURE_DNS"] = "true"
-	envs["RESIN_CATALOG_FIRST_RUNTIME"] = "false"
+	envs["RESIN_ACTIVE_ONLY_RUNTIME"] = "false"
 	envs["RESIN_REQUEST_LOG_QUEUE_FLUSH_INTERVAL"] = "10m"
 	setEnvs(t, envs)
 
@@ -154,7 +154,7 @@ func TestLoadEnvConfig_EnvOverrides(t *testing.T) {
 	assertEqual(t, "ProxyTransportMaxIdleConnsPerHost", cfg.ProxyTransportMaxIdleConnsPerHost, 128)
 	assertEqual(t, "ProxyTransportIdleConnTimeout", cfg.ProxyTransportIdleConnTimeout, 2*time.Minute)
 	assertEqual(t, "EnableEmbeddedSecureDNS", cfg.EnableEmbeddedSecureDNS, true)
-	assertEqual(t, "CatalogFirstRuntime", cfg.CatalogFirstRuntime, false)
+	assertEqual(t, "ActiveOnlyRuntime", cfg.ActiveOnlyRuntime, false)
 	if cfg.RequestLogQueueFlushInterval.String() != "10m0s" {
 		t.Errorf("RequestLogQueueFlushInterval: got %v, want 10m", cfg.RequestLogQueueFlushInterval)
 	}
@@ -172,16 +172,16 @@ func TestLoadEnvConfig_InvalidBool(t *testing.T) {
 	assertContains(t, err.Error(), "RESIN_ENABLE_EMBEDDED_SECURE_DNS")
 }
 
-func TestLoadEnvConfig_InvalidCatalogFirstRuntimeBool(t *testing.T) {
+func TestLoadEnvConfig_InvalidActiveOnlyRuntimeBool(t *testing.T) {
 	envs := requiredEnvs()
-	envs["RESIN_CATALOG_FIRST_RUNTIME"] = "maybe"
+	envs["RESIN_ACTIVE_ONLY_RUNTIME"] = "maybe"
 	setEnvs(t, envs)
 
 	_, err := LoadEnvConfig()
 	if err == nil {
-		t.Fatal("expected error for invalid RESIN_CATALOG_FIRST_RUNTIME")
+		t.Fatal("expected error for invalid RESIN_ACTIVE_ONLY_RUNTIME")
 	}
-	assertContains(t, err.Error(), "RESIN_CATALOG_FIRST_RUNTIME")
+	assertContains(t, err.Error(), "RESIN_ACTIVE_ONLY_RUNTIME")
 }
 
 func TestLoadEnvConfig_DefaultPlatformFixedHeaderMultiline(t *testing.T) {

@@ -341,7 +341,7 @@ func newTopologyRuntime(
 
 	var coldNodeQueue *coldSubscriptionNodeCheckQueue
 	var catalog topology.SubscriptionCatalog
-	if envCfg.CatalogFirstRuntime {
+	if envCfg.ActiveOnlyRuntime {
 		coldChecker := newColdSubscriptionNodeChecker(engine, pool, subManager, singboxBuilder, func(hash node.Hash) error {
 			_, err := probeMgr.ProbeLatencySync(hash)
 			return err
@@ -1242,11 +1242,11 @@ func bootstrapNodes(
 	); err != nil {
 		return err
 	}
-	if envCfg.CatalogFirstRuntime {
+	if envCfg.ActiveOnlyRuntime {
 		hashes = activeOnlyBootstrapHashes(pool, subManager)
 	}
 	warmupBootstrapOutbounds(hashes, outboundMgr)
-	if envCfg.CatalogFirstRuntime {
+	if envCfg.ActiveOnlyRuntime {
 		pruneColdBootstrapNodes(pool, subManager)
 	}
 	return nil

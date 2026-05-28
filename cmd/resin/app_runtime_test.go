@@ -6,15 +6,15 @@ import (
 	"github.com/Resinat/Resin/internal/config"
 )
 
-func TestShouldForceRefreshSubscriptionsAtStartup_CatalogFirstSkipsForceRefresh(t *testing.T) {
-	envCfg := &config.EnvConfig{CatalogFirstRuntime: true}
+func TestShouldForceRefreshSubscriptionsAtStartup_ActiveOnlySkipsForceRefresh(t *testing.T) {
+	envCfg := &config.EnvConfig{ActiveOnlyRuntime: true}
 	if shouldForceRefreshSubscriptionsAtStartup(envCfg) {
-		t.Fatal("catalog-first startup should skip force refresh")
+		t.Fatal("active-only startup should skip force refresh")
 	}
 }
 
 func TestShouldForceRefreshSubscriptionsAtStartup_LegacyRuntimeForcesRefresh(t *testing.T) {
-	envCfg := &config.EnvConfig{CatalogFirstRuntime: false}
+	envCfg := &config.EnvConfig{ActiveOnlyRuntime: false}
 	if !shouldForceRefreshSubscriptionsAtStartup(envCfg) {
 		t.Fatal("legacy runtime should force startup refresh")
 	}

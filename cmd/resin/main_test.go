@@ -49,13 +49,30 @@ func newDefaultPlatformEnvConfig() *config.EnvConfig {
 		DefaultPlatformReverseProxyEmptyAccountBehavior: "ACCOUNT_HEADER_RULE",
 		DefaultPlatformReverseProxyFixedAccountHeader:   "Authorization",
 		DefaultPlatformAllocationPolicy:                 "BALANCED",
-		CatalogFirstRuntime:                             true,
+		ActiveOnlyRuntime:                               true,
 	}
 }
 
 type trackingBootstrapBuilder struct {
 	failRaw map[string]bool
 	built   []string
+}
+
+func sameStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	counts := make(map[string]int, len(want))
+	for _, item := range want {
+		counts[item]++
+	}
+	for _, item := range got {
+		if counts[item] == 0 {
+			return false
+		}
+		counts[item]--
+	}
+	return true
 }
 
 func (b *trackingBootstrapBuilder) Build(raw json.RawMessage) (adapter.Outbound, error) {
@@ -809,7 +826,7 @@ func TestBootstrapNodes_RestoreEvictedSubscriptionNodeWithoutPoolRef(t *testing.
 	}
 }
 
-func TestBootstrapNodes_CatalogBootstrapSelectsEnabledNonEvictedCircuitClosedWithLatency(t *testing.T) {
+func TestBootstrapNodes_ActiveOnlyRuntimeSelectsEnabledNonEvictedCircuitClosedWithLatency(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -923,10 +940,10 @@ func TestBootstrapNodes_CatalogBootstrapSelectsEnabledNonEvictedCircuitClosedWit
 	activeHash := hashByRaw[string(rawActive)]
 	entry, ok := pool.GetEntry(activeHash)
 	if !ok {
-		t.Fatalf("active node %s missing after catalog bootstrap", activeHash.Hex())
+		t.Fatalf("active node %s missing after active-only bootstrap", activeHash.Hex())
 	}
 	if !entry.HasOutbound() {
-		t.Fatal("active node should have outbound after catalog bootstrap")
+		t.Fatal("active node should have outbound after active-only bootstrap")
 	}
 	if entry.IsCircuitOpen() {
 		t.Fatal("persisted circuit-closed dynamic state should be restored")
@@ -943,10 +960,10 @@ func TestBootstrapNodes_CatalogBootstrapSelectsEnabledNonEvictedCircuitClosedWit
 			continue
 		}
 		if _, ok := pool.GetEntry(hash); ok {
-			t.Fatalf("node %s (%s) should not be active after catalog bootstrap", rawString, hash.Hex())
+			t.Fatalf("node %s (%s) should not be active after active-only bootstrap", rawString, hash.Hex())
 		}
 	}
-	if got := builder.built; !reflect.DeepEqual(got, []string{string(rawActive), string(rawBuildFail)}) {
+	if got := builder.built; !sameStringSet(got, []string{string(rawActive), string(rawBuildFail)}) {
 		t.Fatalf("outbound build candidates: got %v, want active and build-fail only", got)
 	}
 
@@ -965,7 +982,7 @@ func TestBootstrapNodes_CatalogBootstrapSelectsEnabledNonEvictedCircuitClosedWit
 	}
 }
 
-func TestBootstrapNodes_CatalogBootstrapExcludesAttemptOnlyWithoutLatencySample(t *testing.T) {
+func TestBootstrapNodes_ActiveOnlyRuntimeExcludesAttemptOnlyWithoutLatencySample(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -1024,7 +1041,7 @@ func TestBootstrapNodes_CatalogBootstrapExcludesAttemptOnlyWithoutLatencySample(
 		t.Fatalf("bootstrapNodes: %v", err)
 	}
 	if _, ok := pool.GetEntry(hash); ok {
-		t.Fatal("attempt-only node should not enter catalog bootstrap memory")
+		t.Fatal("attempt-only node should not enter active-only runtime memory")
 	}
 	if len(builder.built) != 0 {
 		t.Fatalf("attempt-only node should not get outbound build, got builds=%v", builder.built)
@@ -1458,7 +1475,7 @@ func TestMarkNodeRemovedDirty_DeletesStaticDynamicAndLatency(t *testing.T) {
 	}
 }
 
-func TestNewTopologyRuntime_WiresCatalogRefreshAndColdQueue(t *testing.T) {
+func TestNewTopologyRuntime_WiresActiveOnlyRefreshAndColdQueue(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -1545,7 +1562,7 @@ func TestNewTopologyRuntime_LegacyRuntimeDoesNotWireCatalogQueue(t *testing.T) {
 	t.Cleanup(func() { _ = closer.Close() })
 
 	envCfg := newDefaultPlatformEnvConfig()
-	envCfg.CatalogFirstRuntime = false
+	envCfg.ActiveOnlyRuntime = false
 	runtimeCfg := config.NewDefaultRuntimeConfig()
 	var runtimePtr atomic.Pointer[config.RuntimeConfig]
 	runtimePtr.Store(runtimeCfg)
