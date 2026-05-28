@@ -3,10 +3,12 @@ package api
 import (
 	"net/http"
 	"net/netip"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/Resinat/Resin/internal/config"
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/probe"
 	"github.com/Resinat/Resin/internal/service"
@@ -280,5 +282,150 @@ func TestHandleListNodes_EnabledFilter(t *testing.T) {
 	body = decodeJSONMap(t, rec)
 	if body["total"] != float64(1) {
 		t.Fatalf("enabled=false total: got %v, want 1", body["total"])
+	}
+}
+
+func seedCatalogNodeForNodeListTest(
+	t *testing.T,
+	cp *service.ControlPlaneService,
+	sub *subscription.Subscription,
+	raw string,
+	tag string,
+) string {
+	t.Helper()
+	hash := node.HashFromRawOptions([]byte(raw))
+	if err := cp.Engine.ReplaceSubscriptionRefresh(sub.ID,
+		[]model.NodeStatic{{Hash: hash.Hex(), RawOptions: []byte(raw), CreatedAtNs: time.Now().Add(-time.Minute).UnixNano()}},
+		[]model.SubscriptionNode{{SubscriptionID: sub.ID, NodeHash: hash.Hex(), Tags: []string{tag}}},
+		nil,
+	); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh: %v", err)
+	}
+	return hash.Hex()
+}
+
+func TestHandleListNodes_DefaultActiveScopeAndCatalogScope(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+
+	subA := subscription.NewSubscription("11111111-1111-1111-1111-111111111111", "sub-a", "https://example.com/a", true, false)
+	cp.SubMgr.Register(subA)
+
+	activeRaw := `{"type":"ss","server":"1.1.1.1","port":443}`
+	coldRaw := `{"type":"ss","server":"2.2.2.2","port":443}`
+	activeHash := node.HashFromRawOptions([]byte(activeRaw)).Hex()
+	coldHash := seedCatalogNodeForNodeListTest(t, cp, subA, coldRaw, "cold-tag")
+
+	addNodeForNodeListTestWithTag(t, cp, subA, activeRaw, "203.0.113.10", "active-tag")
+	if err := cp.Engine.ReplaceSubscriptionRefresh(subA.ID,
+		[]model.NodeStatic{{Hash: activeHash, RawOptions: []byte(activeRaw), CreatedAtNs: time.Now().Add(-2 * time.Minute).UnixNano()}},
+		[]model.SubscriptionNode{{SubscriptionID: subA.ID, NodeHash: activeHash, Tags: []string{"active-tag"}}},
+		nil,
+	); err != nil {
+		t.Fatalf("seed active catalog row: %v", err)
+	}
+
+	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subA.ID, nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default list status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := decodeJSONMap(t, rec)
+	if body["total"] != float64(1) {
+		t.Fatalf("default active total: got %v, want 1", body["total"])
+	}
+	items := body["items"].([]any)
+	if got := items[0].(map[string]any)["node_hash"]; got != activeHash {
+		t.Fatalf("default active node_hash: got %v, want %s", got, activeHash)
+	}
+
+	rec = doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?scope=all&subscription_id="+subA.ID, nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("catalog list status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body = decodeJSONMap(t, rec)
+	if body["total"] != float64(2) {
+		t.Fatalf("catalog total: got %v, want 2 body=%s", body["total"], rec.Body.String())
+	}
+	seen := map[string]bool{}
+	for _, item := range body["items"].([]any) {
+		seen[item.(map[string]any)["node_hash"].(string)] = true
+	}
+	if !seen[activeHash] || !seen[coldHash] {
+		t.Fatalf("catalog hashes = %v, want active %s and cold %s", seen, activeHash, coldHash)
+	}
+}
+
+func TestHandleListNodes_InvalidScope(t *testing.T) {
+	srv, _, _ := newControlPlaneTestServer(t)
+
+	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?scope=everything", nil, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid scope status: got %d, want %d, body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	assertErrorCode(t, rec, "INVALID_ARGUMENT")
+}
+
+func TestHandleListNodes_CatalogScopeFiltersPersistedDynamicState(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+
+	subEnabled := subscription.NewSubscription("11111111-1111-1111-1111-111111111111", "sub-enabled", "https://example.com/a", true, false)
+	subDisabled := subscription.NewSubscription("22222222-2222-2222-2222-222222222222", "sub-disabled", "https://example.com/b", false, false)
+	cp.SubMgr.Register(subEnabled)
+	cp.SubMgr.Register(subDisabled)
+
+	now := time.Now()
+	matchRaw := []byte(`{"type":"ss","server":"10.0.0.1","port":443}`)
+	disabledRaw := []byte(`{"type":"ss","server":"10.0.0.2","port":443}`)
+	matchHash := node.HashFromRawOptions(matchRaw)
+	disabledHash := node.HashFromRawOptions(disabledRaw)
+
+	if err := cp.Engine.ReplaceSubscriptionRefresh(subEnabled.ID,
+		[]model.NodeStatic{{Hash: matchHash.Hex(), RawOptions: matchRaw, CreatedAtNs: now.Add(-2 * time.Minute).UnixNano()}},
+		[]model.SubscriptionNode{{SubscriptionID: subEnabled.ID, NodeHash: matchHash.Hex(), Tags: []string{"tokyo-fast"}}},
+		nil,
+	); err != nil {
+		t.Fatalf("seed enabled catalog: %v", err)
+	}
+	if err := cp.Engine.ReplaceSubscriptionRefresh(subDisabled.ID,
+		[]model.NodeStatic{{Hash: disabledHash.Hex(), RawOptions: disabledRaw, CreatedAtNs: now.Add(-time.Minute).UnixNano()}},
+		[]model.SubscriptionNode{{SubscriptionID: subDisabled.ID, NodeHash: disabledHash.Hex(), Tags: []string{"disabled"}}},
+		nil,
+	); err != nil {
+		t.Fatalf("seed disabled catalog: %v", err)
+	}
+	if err := cp.Engine.BulkUpsertNodesDynamic([]model.NodeDynamic{
+		{
+			Hash:                      matchHash.Hex(),
+			FailureCount:              2,
+			CircuitOpenSince:          now.Add(-30 * time.Second).UnixNano(),
+			EgressIP:                  "203.0.113.44",
+			EgressIPs:                 []string{"203.0.113.44"},
+			EgressRegion:              "jp",
+			LastLatencyProbeAttemptNs: now.Add(-10 * time.Second).UnixNano(),
+		},
+		{Hash: disabledHash.Hex(), EgressIP: "203.0.113.45", EgressRegion: "sg"},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
+
+	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?scope=catalog&enabled=true&tag_keyword=TOKYO&region=jp&egress_ip=203.0.113.44&circuit_open=true&has_outbound=false&probed_since="+url.QueryEscape(now.Add(-20*time.Second).Format(time.RFC3339Nano)), nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("catalog filtered status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := decodeJSONMap(t, rec)
+	if body["total"] != float64(1) {
+		t.Fatalf("catalog filtered total: got %v, want 1 body=%s", body["total"], rec.Body.String())
+	}
+	item := body["items"].([]any)[0].(map[string]any)
+	if item["node_hash"] != matchHash.Hex() {
+		t.Fatalf("filtered node_hash = %v, want %s", item["node_hash"], matchHash.Hex())
+	}
+
+	rec = doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?scope=all&enabled=false", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("catalog enabled=false status: got %d, body=%s", rec.Code, rec.Body.String())
+	}
+	body = decodeJSONMap(t, rec)
+	if body["total"] != float64(1) {
+		t.Fatalf("catalog enabled=false total: got %v, want 1 body=%s", body["total"], rec.Body.String())
 	}
 }

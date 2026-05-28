@@ -146,7 +146,21 @@ func HandleListNodes(cp *service.ControlPlaneService) http.HandlerFunc {
 			filters.ProbedSince = &t
 		}
 
-		nodes, err := cp.ListNodes(filters)
+		scope := strings.ToLower(strings.TrimSpace(q.Get("scope")))
+		if scope == "" {
+			scope = string(service.NodeListScopeActive)
+		}
+		var nodes []service.NodeSummary
+		var err error
+		switch scope {
+		case string(service.NodeListScopeActive):
+			nodes, err = cp.ListNodes(filters)
+		case "all", string(service.NodeListScopeCatalog):
+			nodes, err = cp.ListCatalogNodes(filters)
+		default:
+			writeInvalidArgument(w, "scope: must be active, all, or catalog")
+			return
+		}
 		if err != nil {
 			writeServiceError(w, err)
 			return

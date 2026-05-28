@@ -1246,3 +1246,64 @@ func TestListAccountHeaderRules_FailsFastOnCorruptPersistedHeadersColumn(t *test
 		t.Fatalf("unexpected wrapped service error: %v", serviceErr.Err)
 	}
 }
+
+func TestGetSubscription_NodeCountUsesCatalogRowsWhenAvailable(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(filepath.Join(dir, "state"), filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	subMgr := topology.NewSubscriptionManager()
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup:              subMgr.Lookup,
+		GeoLookup:              func(netip.Addr) string { return "us" },
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+		LatencyDecayWindow:     func() time.Duration { return 10 * time.Minute },
+	})
+	sub := subscription.NewSubscription("sub-a", "sub-a", "https://example.com/a", true, false)
+	subMgr.Register(sub)
+
+	activeRaw := []byte(`{"type":"ss","server":"1.1.1.1","port":443}`)
+	coldRaw := []byte(`{"type":"ss","server":"2.2.2.2","port":443}`)
+	activeHash := node.HashFromRawOptions(activeRaw)
+	coldHash := node.HashFromRawOptions(coldRaw)
+
+	pool.AddNodeFromSub(activeHash, activeRaw, sub.ID)
+	sub.ManagedNodes().StoreNode(activeHash, subscription.ManagedNode{Tags: []string{"active"}})
+	entry, ok := pool.GetEntry(activeHash)
+	if !ok {
+		t.Fatal("active entry missing")
+	}
+	outbound := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&outbound)
+	pool.RecordResult(activeHash, true)
+
+	if err := engine.ReplaceSubscriptionRefresh(sub.ID,
+		[]model.NodeStatic{
+			{Hash: activeHash.Hex(), RawOptions: activeRaw, CreatedAtNs: time.Now().Add(-2 * time.Minute).UnixNano()},
+			{Hash: coldHash.Hex(), RawOptions: coldRaw, CreatedAtNs: time.Now().Add(-time.Minute).UnixNano()},
+		},
+		[]model.SubscriptionNode{
+			{SubscriptionID: sub.ID, NodeHash: activeHash.Hex(), Tags: []string{"active"}},
+			{SubscriptionID: sub.ID, NodeHash: coldHash.Hex(), Tags: []string{"cold"}},
+		},
+		nil,
+	); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh: %v", err)
+	}
+
+	cp := &ControlPlaneService{Engine: engine, Pool: pool, SubMgr: subMgr}
+	resp, err := cp.GetSubscription(sub.ID)
+	if err != nil {
+		t.Fatalf("GetSubscription: %v", err)
+	}
+	if resp.NodeCount != 2 {
+		t.Fatalf("node_count = %d, want catalog count 2", resp.NodeCount)
+	}
+	if resp.HealthyNodeCount != 1 {
+		t.Fatalf("healthy_node_count = %d, want active healthy count 1", resp.HealthyNodeCount)
+	}
+}

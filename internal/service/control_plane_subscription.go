@@ -39,8 +39,37 @@ type SubscriptionResponse struct {
 	LastError               string `json:"last_error,omitempty"`
 }
 
+func (s *ControlPlaneService) subscriptionCatalogNodeCount(sub *subscription.Subscription) int {
+	fallback := func() int {
+		count := 0
+		if managed := sub.ManagedNodes(); managed != nil {
+			managed.RangeNodes(func(_ node.Hash, n subscription.ManagedNode) bool {
+				if !n.Evicted {
+					count++
+				}
+				return true
+			})
+		}
+		return count
+	}
+	if s == nil || s.Engine == nil || sub == nil {
+		return fallback()
+	}
+	relations, err := s.Engine.LoadSubscriptionNodes(sub.ID)
+	if err != nil || len(relations) == 0 {
+		return fallback()
+	}
+	count := 0
+	for _, rel := range relations {
+		if !rel.Evicted {
+			count++
+		}
+	}
+	return count
+}
+
 func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) SubscriptionResponse {
-	nodeCount := 0
+	nodeCount := s.subscriptionCatalogNodeCount(sub)
 	healthyNodeCount := 0
 	var isHealthyAndEnabled func(*node.NodeEntry) bool
 	if sub.Enabled() && s != nil && s.Pool != nil {
@@ -51,7 +80,6 @@ func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) Subs
 			if n.Evicted {
 				return true
 			}
-			nodeCount++
 			if isHealthyAndEnabled != nil {
 				entry, ok := s.Pool.GetEntry(h)
 				if ok && isHealthyAndEnabled(entry) {
