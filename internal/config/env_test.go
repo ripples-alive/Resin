@@ -69,8 +69,6 @@ func TestLoadEnvConfig_Defaults(t *testing.T) {
 	assertEqual(t, "ProxyTransportMaxIdleConnsPerHost", cfg.ProxyTransportMaxIdleConnsPerHost, 64)
 	assertEqual(t, "ProxyTransportIdleConnTimeout", cfg.ProxyTransportIdleConnTimeout, 90*time.Second)
 	assertEqual(t, "EnableEmbeddedSecureDNS", cfg.EnableEmbeddedSecureDNS, false)
-	assertEqual(t, "ActiveOnlyBootstrap", cfg.ActiveOnlyBootstrap, false)
-	assertEqual(t, "DBFirstRefresh", cfg.DBFirstRefresh, false)
 
 	// Request log
 	assertEqual(t, "RequestLogQueueSize", cfg.RequestLogQueueSize, 8192)
@@ -114,8 +112,6 @@ func TestLoadEnvConfig_EnvOverrides(t *testing.T) {
 	envs["RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST"] = "128"
 	envs["RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT"] = "2m"
 	envs["RESIN_ENABLE_EMBEDDED_SECURE_DNS"] = "true"
-	envs["RESIN_ACTIVE_ONLY_BOOTSTRAP"] = "true"
-	envs["RESIN_DB_FIRST_REFRESH"] = "true"
 	envs["RESIN_REQUEST_LOG_QUEUE_FLUSH_INTERVAL"] = "10m"
 	setEnvs(t, envs)
 
@@ -156,8 +152,6 @@ func TestLoadEnvConfig_EnvOverrides(t *testing.T) {
 	assertEqual(t, "ProxyTransportMaxIdleConnsPerHost", cfg.ProxyTransportMaxIdleConnsPerHost, 128)
 	assertEqual(t, "ProxyTransportIdleConnTimeout", cfg.ProxyTransportIdleConnTimeout, 2*time.Minute)
 	assertEqual(t, "EnableEmbeddedSecureDNS", cfg.EnableEmbeddedSecureDNS, true)
-	assertEqual(t, "ActiveOnlyBootstrap", cfg.ActiveOnlyBootstrap, true)
-	assertEqual(t, "DBFirstRefresh", cfg.DBFirstRefresh, true)
 	if cfg.RequestLogQueueFlushInterval.String() != "10m0s" {
 		t.Errorf("RequestLogQueueFlushInterval: got %v, want 10m", cfg.RequestLogQueueFlushInterval)
 	}
@@ -173,30 +167,6 @@ func TestLoadEnvConfig_InvalidBool(t *testing.T) {
 		t.Fatal("expected error for invalid RESIN_ENABLE_EMBEDDED_SECURE_DNS")
 	}
 	assertContains(t, err.Error(), "RESIN_ENABLE_EMBEDDED_SECURE_DNS")
-}
-
-func TestLoadEnvConfig_InvalidActiveOnlyBootstrapBool(t *testing.T) {
-	envs := requiredEnvs()
-	envs["RESIN_ACTIVE_ONLY_BOOTSTRAP"] = "sometimes"
-	setEnvs(t, envs)
-
-	_, err := LoadEnvConfig()
-	if err == nil {
-		t.Fatal("expected error for invalid RESIN_ACTIVE_ONLY_BOOTSTRAP")
-	}
-	assertContains(t, err.Error(), "RESIN_ACTIVE_ONLY_BOOTSTRAP")
-}
-
-func TestLoadEnvConfig_InvalidDBFirstRefreshBool(t *testing.T) {
-	envs := requiredEnvs()
-	envs["RESIN_DB_FIRST_REFRESH"] = "sometimes"
-	setEnvs(t, envs)
-
-	_, err := LoadEnvConfig()
-	if err == nil {
-		t.Fatal("expected error for invalid RESIN_DB_FIRST_REFRESH")
-	}
-	assertContains(t, err.Error(), "RESIN_DB_FIRST_REFRESH")
 }
 
 func TestLoadEnvConfig_DefaultPlatformFixedHeaderMultiline(t *testing.T) {

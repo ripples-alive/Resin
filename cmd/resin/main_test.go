@@ -605,7 +605,7 @@ func TestBootstrapTopology_V1RejectsAllPersistedInvalidPlatformNames(t *testing.
 	}
 }
 
-func TestBootstrapNodes_MissingDynamicDefaultsCircuitOpen(t *testing.T) {
+func TestBootstrapNodes_MissingDynamicStaysColdInCatalog(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -658,19 +658,19 @@ func TestBootstrapNodes_MissingDynamicDefaultsCircuitOpen(t *testing.T) {
 		t.Fatalf("bootstrapNodes: %v", err)
 	}
 
-	entry, ok := pool.GetEntry(hash)
-	if !ok {
-		t.Fatalf("node %s missing after bootstrapNodes", hash.Hex())
+	if _, ok := pool.GetEntry(hash); ok {
+		t.Fatalf("node %s without dynamic/latency evidence should stay cold after bootstrapNodes", hash.Hex())
 	}
-	if !entry.IsCircuitOpen() {
-		t.Fatal("node without dynamic record should default to circuit-open on bootstrap")
+	rows, err := engine.LoadSubscriptionNodes(subID)
+	if err != nil {
+		t.Fatalf("LoadSubscriptionNodes: %v", err)
 	}
-	if entry.CircuitOpenSince.Load() <= 0 {
-		t.Fatalf("CircuitOpenSince should be set, got %d", entry.CircuitOpenSince.Load())
+	if len(rows) != 1 || rows[0].NodeHash != hash.Hex() {
+		t.Fatalf("cold catalog relation missing after bootstrapNodes, got %+v want %s", rows, hash.Hex())
 	}
 }
 
-func TestBootstrapNodes_DynamicRecordOverridesDefaultCircuitOpen(t *testing.T) {
+func TestBootstrapNodes_CircuitClosedWithoutLatencyStaysColdInCatalog(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -730,12 +730,15 @@ func TestBootstrapNodes_DynamicRecordOverridesDefaultCircuitOpen(t *testing.T) {
 		t.Fatalf("bootstrapNodes: %v", err)
 	}
 
-	entry, ok := pool.GetEntry(hash)
-	if !ok {
-		t.Fatalf("node %s missing after bootstrapNodes", hash.Hex())
+	if _, ok := pool.GetEntry(hash); ok {
+		t.Fatalf("node %s without durable latency evidence should stay cold after bootstrapNodes", hash.Hex())
 	}
-	if entry.IsCircuitOpen() {
-		t.Fatal("persisted nodes_dynamic should override bootstrap default circuit-open")
+	rows, err := engine.LoadSubscriptionNodes(subID)
+	if err != nil {
+		t.Fatalf("LoadSubscriptionNodes: %v", err)
+	}
+	if len(rows) != 1 || rows[0].NodeHash != hash.Hex() {
+		t.Fatalf("cold catalog relation missing after bootstrapNodes, got %+v want %s", rows, hash.Hex())
 	}
 }
 
@@ -790,19 +793,22 @@ func TestBootstrapNodes_RestoreEvictedSubscriptionNodeWithoutPoolRef(t *testing.
 	if !ok {
 		t.Fatalf("subscription %q missing after bootstrap", subID)
 	}
-	managed, ok := sub.ManagedNodes().LoadNode(hash)
-	if !ok {
-		t.Fatalf("evicted subscription node %s missing from managed view", hash.Hex())
+	if _, ok := sub.ManagedNodes().LoadNode(hash); ok {
+		t.Fatalf("evicted subscription node %s should stay out of active managed view", hash.Hex())
 	}
-	if !managed.Evicted {
-		t.Fatal("restored subscription node should keep Evicted=true")
+	rows, err := engine.LoadSubscriptionNodes(subID)
+	if err != nil {
+		t.Fatalf("LoadSubscriptionNodes: %v", err)
+	}
+	if len(rows) != 1 || rows[0].NodeHash != hash.Hex() || !rows[0].Evicted {
+		t.Fatalf("evicted catalog relation not preserved, got %+v want evicted %s", rows, hash.Hex())
 	}
 	if _, ok := pool.GetEntry(hash); ok {
 		t.Fatal("evicted subscription node should not restore subscription hold in pool")
 	}
 }
 
-func TestBootstrapNodes_ActiveOnlySelectsEnabledNonEvictedCircuitClosedWithLatency(t *testing.T) {
+func TestBootstrapNodes_CatalogBootstrapSelectsEnabledNonEvictedCircuitClosedWithLatency(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -899,7 +905,6 @@ func TestBootstrapNodes_ActiveOnlySelectsEnabledNonEvictedCircuitClosedWithLaten
 	runtimeCfg := config.NewDefaultRuntimeConfig()
 	envCfg := newDefaultPlatformEnvConfig()
 	envCfg.MaxLatencyTableEntries = 16
-	envCfg.ActiveOnlyBootstrap = true
 	subManager, pool := newBootstrapTestRuntime(runtimeCfg)
 
 	if err := bootstrapTopology(engine, subManager, pool, envCfg); err != nil {
@@ -917,10 +922,10 @@ func TestBootstrapNodes_ActiveOnlySelectsEnabledNonEvictedCircuitClosedWithLaten
 	activeHash := hashByRaw[string(rawActive)]
 	entry, ok := pool.GetEntry(activeHash)
 	if !ok {
-		t.Fatalf("active node %s missing after active-only bootstrap", activeHash.Hex())
+		t.Fatalf("active node %s missing after catalog bootstrap", activeHash.Hex())
 	}
 	if !entry.HasOutbound() {
-		t.Fatal("active node should have outbound after active-only bootstrap")
+		t.Fatal("active node should have outbound after catalog bootstrap")
 	}
 	if entry.IsCircuitOpen() {
 		t.Fatal("persisted circuit-closed dynamic state should be restored")
@@ -937,7 +942,7 @@ func TestBootstrapNodes_ActiveOnlySelectsEnabledNonEvictedCircuitClosedWithLaten
 			continue
 		}
 		if _, ok := pool.GetEntry(hash); ok {
-			t.Fatalf("node %s (%s) should not be active after active-only bootstrap", rawString, hash.Hex())
+			t.Fatalf("node %s (%s) should not be active after catalog bootstrap", rawString, hash.Hex())
 		}
 	}
 	if got := builder.built; !reflect.DeepEqual(got, []string{string(rawActive), string(rawBuildFail)}) {
@@ -959,7 +964,7 @@ func TestBootstrapNodes_ActiveOnlySelectsEnabledNonEvictedCircuitClosedWithLaten
 	}
 }
 
-func TestBootstrapNodes_ActiveOnlyExcludesAttemptOnlyWithoutLatencySample(t *testing.T) {
+func TestBootstrapNodes_CatalogBootstrapExcludesAttemptOnlyWithoutLatencySample(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -1007,7 +1012,6 @@ func TestBootstrapNodes_ActiveOnlyExcludesAttemptOnlyWithoutLatencySample(t *tes
 	runtimeCfg := config.NewDefaultRuntimeConfig()
 	envCfg := newDefaultPlatformEnvConfig()
 	envCfg.MaxLatencyTableEntries = 16
-	envCfg.ActiveOnlyBootstrap = true
 	subManager, pool := newBootstrapTestRuntime(runtimeCfg)
 	if err := bootstrapTopology(engine, subManager, pool, envCfg); err != nil {
 		t.Fatalf("bootstrapTopology: %v", err)
@@ -1019,7 +1023,7 @@ func TestBootstrapNodes_ActiveOnlyExcludesAttemptOnlyWithoutLatencySample(t *tes
 		t.Fatalf("bootstrapNodes: %v", err)
 	}
 	if _, ok := pool.GetEntry(hash); ok {
-		t.Fatal("attempt-only node should not enter active-only bootstrap memory")
+		t.Fatal("attempt-only node should not enter catalog bootstrap memory")
 	}
 	if len(builder.built) != 0 {
 		t.Fatalf("attempt-only node should not get outbound build, got builds=%v", builder.built)
@@ -1262,6 +1266,12 @@ func TestBootstrapNodes_TrimRegularLatencyKeepsAuthorities(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
 	}
+	if err := engine.BulkUpsertNodesDynamic([]model.NodeDynamic{{
+		Hash:             hashHex,
+		CircuitOpenSince: 0,
+	}}); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
 
 	// 2 authority domains + 3 regular domains (capacity=2, one regular should be trimmed).
 	if err := engine.BulkUpsertNodeLatency([]model.NodeLatency{
@@ -1447,18 +1457,18 @@ func TestMarkNodeRemovedDirty_DeletesStaticDynamicAndLatency(t *testing.T) {
 	}
 }
 
-func TestNewTopologyRuntime_WiresDBFirstRefreshCatalogAndColdQueue(t *testing.T) {
+func TestNewTopologyRuntime_WiresCatalogRefreshAndColdQueue(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
 	}
 	t.Cleanup(func() { _ = closer.Close() })
 
-	const subID = "sub-runtime-db-first"
+	const subID = "sub-runtime-catalog"
 	now := time.Now().UnixNano()
 	if err := engine.UpsertSubscription(model.Subscription{
 		ID:               subID,
-		Name:             "RuntimeDBFirst",
+		Name:             "RuntimeCatalog",
 		SourceType:       subscription.SourceTypeRemote,
 		URL:              "https://example.com/sub",
 		UpdateIntervalNs: int64(30 * time.Minute),
@@ -1469,11 +1479,10 @@ func TestNewTopologyRuntime_WiresDBFirstRefreshCatalogAndColdQueue(t *testing.T)
 		t.Fatalf("UpsertSubscription: %v", err)
 	}
 
-	raw := `{"type":"shadowsocks","tag":"runtime-db-first","server":"198.51.100.90","server_port":443}`
+	raw := `{"type":"shadowsocks","tag":"runtime-catalog","server":"198.51.100.90","server_port":443}`
 	hash := node.HashFromRawOptions([]byte(raw))
 	body := []byte(`{"outbounds":[` + raw + `]}`)
 	envCfg := newDefaultPlatformEnvConfig()
-	envCfg.DBFirstRefresh = true
 	runtimeCfg := config.NewDefaultRuntimeConfig()
 	var runtimePtr atomic.Pointer[config.RuntimeConfig]
 	runtimePtr.Store(runtimeCfg)
@@ -1495,7 +1504,7 @@ func TestNewTopologyRuntime_WiresDBFirstRefreshCatalogAndColdQueue(t *testing.T)
 		t.Fatal("runtime scheduler should be initialized")
 	}
 	if rt.coldNodeQueue == nil {
-		t.Fatal("runtime should wire a cold-node queue when DB-first refresh is enabled")
+		t.Fatal("runtime should wire a cold-node queue for catalog refresh")
 	}
 
 	if err := bootstrapTopology(engine, rt.subManager, rt.pool, envCfg); err != nil {
@@ -1513,78 +1522,16 @@ func TestNewTopologyRuntime_WiresDBFirstRefreshCatalogAndColdQueue(t *testing.T)
 		t.Fatalf("LoadAllNodesStatic: %v", err)
 	}
 	if len(statics) != 1 || statics[0].Hash != hash.Hex() {
-		t.Fatalf("DB-first runtime should persist parsed node static catalog, got %+v want %s", statics, hash.Hex())
+		t.Fatalf("catalog refresh should persist parsed node static catalog, got %+v want %s", statics, hash.Hex())
 	}
 	subNodes, err := engine.LoadSubscriptionNodes(subID)
 	if err != nil {
 		t.Fatalf("LoadSubscriptionNodes: %v", err)
 	}
 	if len(subNodes) != 1 || subNodes[0].NodeHash != hash.Hex() || subNodes[0].Evicted {
-		t.Fatalf("DB-first runtime should persist subscription relation before promotion, got %+v", subNodes)
+		t.Fatalf("catalog refresh should persist subscription relation before promotion, got %+v", subNodes)
 	}
 	if rt.pool.Size() != 0 {
-		t.Fatalf("new DB-first nodes should stay cold until check promotion, pool size=%d", rt.pool.Size())
-	}
-}
-
-func TestNewTopologyRuntime_LeavesDBFirstRefreshDisabledByDefault(t *testing.T) {
-	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
-	if err != nil {
-		t.Fatalf("PersistenceBootstrap: %v", err)
-	}
-	t.Cleanup(func() { _ = closer.Close() })
-
-	const subID = "sub-runtime-default"
-	now := time.Now().UnixNano()
-	if err := engine.UpsertSubscription(model.Subscription{
-		ID:               subID,
-		Name:             "RuntimeDefault",
-		SourceType:       subscription.SourceTypeRemote,
-		URL:              "https://example.com/sub",
-		UpdateIntervalNs: int64(30 * time.Minute),
-		Enabled:          true,
-		CreatedAtNs:      now,
-		UpdatedAtNs:      now,
-	}); err != nil {
-		t.Fatalf("UpsertSubscription: %v", err)
-	}
-
-	raw := `{"type":"shadowsocks","tag":"runtime-default","server":"198.51.100.91","server_port":443}`
-	hash := node.HashFromRawOptions([]byte(raw))
-	body := []byte(`{"outbounds":[` + raw + `]}`)
-	envCfg := newDefaultPlatformEnvConfig()
-	runtimeCfg := config.NewDefaultRuntimeConfig()
-	var runtimePtr atomic.Pointer[config.RuntimeConfig]
-	runtimePtr.Store(runtimeCfg)
-	geoSvc := geoip.NewService(geoip.ServiceConfig{OpenDB: geoip.NoOpOpen})
-
-	rt, err := newTopologyRuntime(
-		engine,
-		envCfg,
-		&runtimePtr,
-		geoSvc,
-		staticSubscriptionDownloader{body: body},
-		nil,
-		nil,
-	)
-	if err != nil {
-		t.Fatalf("newTopologyRuntime: %v", err)
-	}
-	if rt.scheduler == nil {
-		t.Fatal("runtime scheduler should be initialized")
-	}
-	if rt.coldNodeQueue != nil {
-		t.Fatal("runtime should not allocate cold-node queue when DB-first refresh is disabled")
-	}
-	if err := bootstrapTopology(engine, rt.subManager, rt.pool, envCfg); err != nil {
-		t.Fatalf("bootstrapTopology: %v", err)
-	}
-	sub := rt.subManager.Lookup(subID)
-	if sub == nil {
-		t.Fatalf("subscription %s not bootstrapped", subID)
-	}
-	rt.scheduler.UpdateSubscription(sub)
-	if _, ok := rt.pool.GetEntry(hash); !ok {
-		t.Fatalf("default refresh should promote parsed node directly into memory, want %s", hash.Hex())
+		t.Fatalf("new catalog nodes should stay cold until check promotion, pool size=%d", rt.pool.Size())
 	}
 }

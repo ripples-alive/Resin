@@ -35,7 +35,6 @@ type SubscriptionScheduler struct {
 	// subscription transitions from disabled to enabled.
 	onSubReenabledNode func(hash node.Hash)
 
-	dbFirstRefresh   bool
 	catalog          SubscriptionCatalog
 	coldNodeQueue    ColdNodeQueue
 	coldQueueMaxSize int
@@ -60,7 +59,7 @@ type ColdNodeQueue interface {
 }
 
 // SubscriptionCatalog persists the full DB-backed subscription catalog during
-// DB-first refreshes.
+// subscription refreshes before cold-node promotion.
 type SubscriptionCatalog interface {
 	LoadSubscriptionNodes(subID string) ([]model.SubscriptionNode, error)
 	ReplaceSubscriptionRefresh(subID string, statics []model.NodeStatic, upserts []model.SubscriptionNode, deletes []model.SubscriptionNodeKey) error
@@ -77,8 +76,6 @@ type SchedulerConfig struct {
 	// OnSubReenabledNode is fired after false->true enabled transition.
 	OnSubReenabledNode func(hash node.Hash)
 
-	// DBFirstRefresh persists parsed catalog rows before memory promotion.
-	DBFirstRefresh   bool
 	Catalog          SubscriptionCatalog
 	ColdNodeQueue    ColdNodeQueue
 	ColdQueueMaxSize int
@@ -96,7 +93,6 @@ func NewSubscriptionScheduler(cfg SchedulerConfig) *SubscriptionScheduler {
 		onSubUpdated:       cfg.OnSubUpdated,
 		onSubRefreshState:  cfg.OnSubRefreshState,
 		onSubReenabledNode: cfg.OnSubReenabledNode,
-		dbFirstRefresh:     cfg.DBFirstRefresh,
 		catalog:            cfg.Catalog,
 		coldNodeQueue:      cfg.ColdNodeQueue,
 		coldQueueMaxSize:   cfg.ColdQueueMaxSize,
@@ -273,8 +269,8 @@ func (s *SubscriptionScheduler) UpdateSubscription(sub *subscription.Subscriptio
 		}
 	}
 
-	if s.dbFirstRefresh && s.catalog != nil {
-		s.updateSubscriptionDBFirst(sub, attemptStartedNs, attemptConfigVersion, newManagedNodes, rawByHash)
+	if s.catalog != nil {
+		s.updateSubscriptionCatalogFirst(sub, attemptStartedNs, attemptConfigVersion, newManagedNodes, rawByHash)
 		return
 	}
 
@@ -347,7 +343,7 @@ func (s *SubscriptionScheduler) UpdateSubscription(sub *subscription.Subscriptio
 	}
 }
 
-func (s *SubscriptionScheduler) updateSubscriptionDBFirst(
+func (s *SubscriptionScheduler) updateSubscriptionCatalogFirst(
 	sub *subscription.Subscription,
 	attemptStartedNs int64,
 	attemptConfigVersion int64,
@@ -371,7 +367,7 @@ func (s *SubscriptionScheduler) updateSubscriptionDBFirst(
 
 	sub.ManagedNodes().RangeNodes(func(h node.Hash, managed subscription.ManagedNode) bool {
 		if entry, ok := s.pool.GetEntry(h); ok {
-			if s.shouldRetainDBFirstLiveRelation(entry) {
+			if s.shouldRetainCatalogLiveRelation(entry) {
 				oldView.StoreNode(h, subscription.ManagedNode{Tags: append([]string(nil), managed.Tags...), Evicted: managed.Evicted})
 			}
 		}
@@ -406,7 +402,7 @@ func (s *SubscriptionScheduler) updateSubscriptionDBFirst(
 		if managed.Evicted {
 			return true
 		}
-		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainDBFirstLiveRelation(entry) {
+		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainCatalogLiveRelation(entry) {
 			activeNext.StoreNode(h, managed)
 			return true
 		}
@@ -420,7 +416,7 @@ func (s *SubscriptionScheduler) updateSubscriptionDBFirst(
 		if _, ok := upsertsByHash[h]; ok {
 			return true
 		}
-		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainDBFirstLiveRelation(entry) && !oldNode.Evicted {
+		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainCatalogLiveRelation(entry) && !oldNode.Evicted {
 			activeNext.StoreNode(h, oldNode)
 			upsertsByHash[h] = model.SubscriptionNode{SubscriptionID: sub.ID, NodeHash: h.Hex(), Tags: append([]string(nil), oldNode.Tags...), Evicted: false}
 			return true
@@ -477,7 +473,7 @@ func (s *SubscriptionScheduler) updateSubscriptionDBFirst(
 		return
 	}
 	if !applied {
-		log.Printf("[scheduler] stale db-first success ignored for %s", sub.ID)
+		log.Printf("[scheduler] stale catalog success ignored for %s", sub.ID)
 		return
 	}
 
@@ -494,7 +490,7 @@ func (s *SubscriptionScheduler) updateSubscriptionDBFirst(
 	}
 }
 
-func (s *SubscriptionScheduler) shouldRetainDBFirstLiveRelation(entry *node.NodeEntry) bool {
+func (s *SubscriptionScheduler) shouldRetainCatalogLiveRelation(entry *node.NodeEntry) bool {
 	if entry == nil {
 		return false
 	}

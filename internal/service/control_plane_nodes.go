@@ -130,7 +130,7 @@ func (s *ControlPlaneService) ListNodes(filters NodeFilters) ([]NodeSummary, err
 
 // ListCatalogNodes returns nodes from the persistent catalog without promoting
 // cold nodes into the hot routing pool. It is intended for admin inventory APIs
-// when active-only bootstrap keeps memory limited to routable nodes.
+// when catalog bootstrap keeps memory limited to routable nodes.
 func (s *ControlPlaneService) ListCatalogNodes(filters NodeFilters) ([]NodeSummary, error) {
 	if s == nil || s.Engine == nil {
 		return nil, internal("catalog store unavailable", nil)

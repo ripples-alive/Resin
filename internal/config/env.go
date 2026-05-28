@@ -45,12 +45,6 @@ type EnvConfig struct {
 	ProxyTransportMaxIdleConnsPerHost               int
 	ProxyTransportIdleConnTimeout                   time.Duration
 	EnableEmbeddedSecureDNS                         bool
-	// ActiveOnlyBootstrap keeps the persisted DB catalog cold/full while bootstrapping
-	// only previously-active, routable nodes into memory. Defaults false.
-	ActiveOnlyBootstrap bool
-	// DBFirstRefresh persists parsed subscription refresh catalog rows before
-	// promoting nodes into the active in-memory pool. Defaults false.
-	DBFirstRefresh bool
 
 	// Request log
 	RequestLogQueueSize           int
@@ -121,8 +115,6 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	cfg.ProxyTransportMaxIdleConnsPerHost = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST", 64, &errs)
 	cfg.ProxyTransportIdleConnTimeout = envDuration("RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT", 90*time.Second, &errs)
 	cfg.EnableEmbeddedSecureDNS = envBool("RESIN_ENABLE_EMBEDDED_SECURE_DNS", false, &errs)
-	cfg.ActiveOnlyBootstrap = envBool("RESIN_ACTIVE_ONLY_BOOTSTRAP", false, &errs)
-	cfg.DBFirstRefresh = envBool("RESIN_DB_FIRST_REFRESH", false, &errs)
 
 	// --- Request log ---
 	cfg.RequestLogQueueSize = envInt("RESIN_REQUEST_LOG_QUEUE_SIZE", 8192, &errs)

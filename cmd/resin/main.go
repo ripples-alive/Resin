@@ -339,24 +339,20 @@ func newTopologyRuntime(
 	})
 	log.Println("ProbeManager initialized")
 
-	var coldNodeQueue *coldSubscriptionNodeCheckQueue
-	if envCfg.DBFirstRefresh {
-		coldChecker := newColdSubscriptionNodeChecker(engine, pool, subManager, singboxBuilder, func(hash node.Hash) error {
-			_, err := probeMgr.ProbeLatencySync(hash)
-			return err
-		})
-		coldNodeQueue = newColdSubscriptionNodeCheckQueue(
-			coldChecker,
-			coldSubscriptionNodeWorkerCount,
-			coldSubscriptionNodeQueueCapacity,
-		)
-	}
+	coldChecker := newColdSubscriptionNodeChecker(engine, pool, subManager, singboxBuilder, func(hash node.Hash) error {
+		_, err := probeMgr.ProbeLatencySync(hash)
+		return err
+	})
+	coldNodeQueue := newColdSubscriptionNodeCheckQueue(
+		coldChecker,
+		coldSubscriptionNodeWorkerCount,
+		coldSubscriptionNodeQueueCapacity,
+	)
 
 	scheduler := topology.NewSubscriptionScheduler(topology.SchedulerConfig{
 		SubManager:       subManager,
 		Pool:             pool,
 		Downloader:       downloader,
-		DBFirstRefresh:   envCfg.DBFirstRefresh,
 		Catalog:          engine,
 		ColdNodeQueue:    coldNodeQueue,
 		ColdQueueMaxSize: coldSubscriptionNodeQueueCapacity,
@@ -1169,7 +1165,7 @@ func activeOnlyBootstrapHashes(pool *topology.GlobalNodePool, subManager *topolo
 	return hashes
 }
 
-func pruneActiveOnlyBootstrap(pool *topology.GlobalNodePool, subManager *topology.SubscriptionManager) {
+func pruneColdBootstrapNodes(pool *topology.GlobalNodePool, subManager *topology.SubscriptionManager) {
 	if pool == nil || subManager == nil {
 		return
 	}
@@ -1241,12 +1237,8 @@ func bootstrapNodes(
 	); err != nil {
 		return err
 	}
-	if envCfg.ActiveOnlyBootstrap {
-		hashes = activeOnlyBootstrapHashes(pool, subManager)
-	}
+	hashes = activeOnlyBootstrapHashes(pool, subManager)
 	warmupBootstrapOutbounds(hashes, outboundMgr)
-	if envCfg.ActiveOnlyBootstrap {
-		pruneActiveOnlyBootstrap(pool, subManager)
-	}
+	pruneColdBootstrapNodes(pool, subManager)
 	return nil
 }

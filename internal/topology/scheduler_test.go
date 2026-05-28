@@ -424,7 +424,7 @@ func TestScheduler_UpdateSubscription_KeepEvictedDoesNotReAddToPool(t *testing.T
 	}
 }
 
-func TestScheduler_DBFirstRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueuesColdCheck(t *testing.T) {
+func TestScheduler_CatalogRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueuesColdCheck(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
 	subMgr.Register(sub)
@@ -448,7 +448,6 @@ func TestScheduler_DBFirstRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueues
 		SubManager:       subMgr,
 		Pool:             pool,
 		Fetcher:          makeMockFetcher(body, nil),
-		DBFirstRefresh:   true,
 		Catalog:          catalog,
 		ColdNodeQueue:    coldQueue,
 		ColdQueueMaxSize: 8,
@@ -497,7 +496,7 @@ func TestScheduler_DBFirstRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueues
 	}
 }
 
-func TestScheduler_DBFirstRefresh_OldViewMergesCatalogAndLiveWithLiveWinning(t *testing.T) {
+func TestScheduler_CatalogRefresh_OldViewMergesCatalogAndLiveWithLiveWinning(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
 	subMgr.Register(sub)
@@ -533,7 +532,6 @@ func TestScheduler_DBFirstRefresh_OldViewMergesCatalogAndLiveWithLiveWinning(t *
 		SubManager:       subMgr,
 		Pool:             pool,
 		Fetcher:          makeMockFetcher(makeSubscriptionJSON(rawLive, rawNewCold), nil),
-		DBFirstRefresh:   true,
 		Catalog:          catalog,
 		ColdNodeQueue:    coldQueue,
 		ColdQueueMaxSize: 8,
@@ -576,7 +574,7 @@ func TestScheduler_DBFirstRefresh_OldViewMergesCatalogAndLiveWithLiveWinning(t *
 	}
 }
 
-func TestScheduler_DBFirstRefresh_RetainsRemovedButLiveActiveRelation(t *testing.T) {
+func TestScheduler_CatalogRefresh_RetainsRemovedButLiveActiveRelation(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
 	subMgr.Register(sub)
@@ -598,11 +596,10 @@ func TestScheduler_DBFirstRefresh_RetainsRemovedButLiveActiveRelation(t *testing
 
 	catalog := &recordingSubscriptionCatalog{}
 	sched := NewSubscriptionScheduler(SchedulerConfig{
-		SubManager:     subMgr,
-		Pool:           pool,
-		Fetcher:        makeMockFetcher(makeSubscriptionJSON(), nil),
-		DBFirstRefresh: true,
-		Catalog:        catalog,
+		SubManager: subMgr,
+		Pool:       pool,
+		Fetcher:    makeMockFetcher(makeSubscriptionJSON(), nil),
+		Catalog:    catalog,
 	})
 
 	sched.UpdateSubscription(sub)
@@ -624,7 +621,7 @@ func TestScheduler_DBFirstRefresh_RetainsRemovedButLiveActiveRelation(t *testing
 	}
 }
 
-func TestScheduler_DBFirstRefresh_EvictedRelationNotRevived(t *testing.T) {
+func TestScheduler_CatalogRefresh_EvictedRelationNotRevived(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
 	subMgr.Register(sub)
@@ -642,7 +639,6 @@ func TestScheduler_DBFirstRefresh_EvictedRelationNotRevived(t *testing.T) {
 		SubManager:       subMgr,
 		Pool:             pool,
 		Fetcher:          makeMockFetcher(makeSubscriptionJSON(raw), nil),
-		DBFirstRefresh:   true,
 		Catalog:          catalog,
 		ColdNodeQueue:    coldQueue,
 		ColdQueueMaxSize: 8,

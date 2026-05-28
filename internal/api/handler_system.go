@@ -31,8 +31,6 @@ type systemEnvConfigResponse struct {
 	ProxyTransportMaxIdleConnsPerHost               int             `json:"proxy_transport_max_idle_conns_per_host"`
 	ProxyTransportIdleConnTimeout                   config.Duration `json:"proxy_transport_idle_conn_timeout"`
 	EnableEmbeddedSecureDNS                         bool            `json:"enable_embedded_secure_dns"`
-	ActiveOnlyBootstrap                             bool            `json:"active_only_bootstrap"`
-	DBFirstRefresh                                  bool            `json:"db_first_refresh"`
 	RequestLogQueueSize                             int             `json:"request_log_queue_size"`
 	RequestLogQueueFlushBatchSize                   int             `json:"request_log_queue_flush_batch_size"`
 	RequestLogQueueFlushInterval                    config.Duration `json:"request_log_queue_flush_interval"`
@@ -130,8 +128,6 @@ func systemEnvConfigSnapshot(envCfg *config.EnvConfig) *systemEnvConfigResponse 
 		ProxyTransportMaxIdleConnsPerHost:               envCfg.ProxyTransportMaxIdleConnsPerHost,
 		ProxyTransportIdleConnTimeout:                   config.Duration(envCfg.ProxyTransportIdleConnTimeout),
 		EnableEmbeddedSecureDNS:                         envCfg.EnableEmbeddedSecureDNS,
-		ActiveOnlyBootstrap:                             envCfg.ActiveOnlyBootstrap,
-		DBFirstRefresh:                                  envCfg.DBFirstRefresh,
 		RequestLogQueueSize:                             envCfg.RequestLogQueueSize,
 		RequestLogQueueFlushBatchSize:                   envCfg.RequestLogQueueFlushBatchSize,
 		RequestLogQueueFlushInterval:                    config.Duration(envCfg.RequestLogQueueFlushInterval),
