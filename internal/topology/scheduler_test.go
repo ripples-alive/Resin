@@ -1023,6 +1023,62 @@ func TestScheduler_StaleFailureDoesNotOverrideNewerSuccess(t *testing.T) {
 	}
 }
 
+func TestScheduler_StaleFailureDoesNotApplyAfterSubscriptionReplaced(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	oldSub := subscription.NewSubscription("s1", "OldSub", "http://example.com", true, false)
+	subMgr.Register(oldSub)
+
+	pool := newTestPool(subMgr)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	fetcher := func(url string) ([]byte, error) {
+		close(firstStarted)
+		<-releaseFirst
+		return nil, errors.New("stale failure")
+	}
+	var updatedCalls atomic.Int32
+	var refreshStateCalls atomic.Int32
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager: subMgr,
+		Pool:       pool,
+		Fetcher:    fetcher,
+		OnSubUpdated: func(sub *subscription.Subscription) {
+			updatedCalls.Add(1)
+		},
+		OnSubRefreshState: func(subID string, checkedNs int64, updatedNs *int64, lastError string) {
+			refreshStateCalls.Add(1)
+		},
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sched.UpdateSubscription(oldSub)
+	}()
+
+	<-firstStarted
+	replacement := subscription.NewSubscription("s1", "Replacement", "http://example.com/new", true, false)
+	subMgr.Register(replacement)
+	close(releaseFirst)
+	<-done
+
+	if oldSub.GetLastError() != "" {
+		t.Fatalf("stale failure should not mutate replaced subscription, got %q", oldSub.GetLastError())
+	}
+	if oldSub.LastCheckedNs.Load() != 0 {
+		t.Fatalf("stale failure should not update LastCheckedNs, got %d", oldSub.LastCheckedNs.Load())
+	}
+	if replacement.GetLastError() != "" {
+		t.Fatalf("stale failure should not affect replacement, got %q", replacement.GetLastError())
+	}
+	if updatedCalls.Load() != 0 {
+		t.Fatalf("stale failure should not fire OnSubUpdated, got %d", updatedCalls.Load())
+	}
+	if refreshStateCalls.Load() != 0 {
+		t.Fatalf("stale failure should not fire OnSubRefreshState, got %d", refreshStateCalls.Load())
+	}
+}
+
 func TestScheduler_StaleSuccessDoesNotOverrideNewerSuccess(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)

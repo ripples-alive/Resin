@@ -1278,6 +1278,87 @@ func TestColdSubscriptionNodeCheck_PromotesAllCandidateRelationsOnLatencySuccess
 	}
 }
 
+func TestColdSubscriptionNodeCheck_PublishesManagedRelationBeforeCallbacks(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-cold-callback"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             subID,
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	subManager := topology.NewSubscriptionManager()
+	sub := subscription.NewSubscription(subID, subID, "https://example.com/sub", true, false)
+	subManager.Register(sub)
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.97","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	var sawRealCallback atomic.Bool
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup:              subManager.Lookup,
+		GeoLookup:              func(netip.Addr) string { return "us" },
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return runtimeCfg.MaxConsecutiveFailures },
+		LatencyDecayWindow: func() time.Duration {
+			return time.Duration(runtimeCfg.LatencyDecayWindow)
+		},
+		OnSubNodeChanged: func(callbackSubID string, callbackHash node.Hash, added bool) {
+			if callbackSubID != subID || callbackHash != hash || !added {
+				return
+			}
+			sawRealCallback.Store(true)
+			managed, ok := sub.ManagedNodes().LoadNode(hash)
+			if !ok {
+				t.Fatalf("real subscription callback must see promoted managed relation already published")
+			}
+			if !reflect.DeepEqual(managed.Tags, []string{"callback-tag"}) {
+				t.Fatalf("callback saw tags %v, want [callback-tag]", managed.Tags)
+			}
+		},
+	})
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: subID,
+		NodeHash:       hash.Hex(),
+		Tags:           []string{"callback-tag"},
+	}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+	candidate := topology.ColdNodeCandidate{
+		SubscriptionID: subID,
+		Hash:           hash,
+		RawOptions:     raw,
+		Tags:           []string{"callback-tag"},
+		Relations: []topology.ColdNodeRelation{
+			{SubscriptionID: subID, Tags: []string{"callback-tag"}},
+		},
+	}
+
+	latency := 25 * time.Millisecond
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
+		pool.RecordResult(hash, true)
+		pool.RecordLatency(hash, "example.com", &latency)
+		return nil
+	})
+
+	checker.Check(candidate)
+
+	if !sawRealCallback.Load() {
+		t.Fatal("expected real subscription add callback during cold promotion")
+	}
+}
+
 func TestColdSubscriptionNodeCheck_PromotesRelationAddedDuringProbe(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {

@@ -692,8 +692,8 @@ func (c *coldSubscriptionNodeChecker) attachCurrentColdRelation(candidate topolo
 		if current == nil || current != sub || !current.Enabled() || !c.isCurrentColdRelation(relation.SubscriptionID, candidate.Hash) {
 			return
 		}
-		c.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, relation.SubscriptionID)
 		current.ManagedNodes().StoreNode(candidate.Hash, subscription.ManagedNode{Tags: append([]string(nil), relation.Tags...)})
+		c.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, relation.SubscriptionID)
 		c.engine.MarkSubscriptionNode(relation.SubscriptionID, candidate.Hash.Hex())
 		attached = true
 	})
