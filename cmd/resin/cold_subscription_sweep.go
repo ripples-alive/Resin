@@ -20,6 +20,10 @@ type coldNodeChecker interface {
 	Check(topology.ColdNodeCandidate)
 }
 
+type coldNodeBatchChecker interface {
+	CheckBatch(context.Context, []topology.ColdNodeCandidate) int
+}
+
 type coldSubscriptionNodeSweepRunnerConfig struct {
 	store         coldNodeCandidateStore
 	checker       coldNodeChecker
@@ -172,15 +176,30 @@ func (r *coldSubscriptionNodeSweepRunner) runSweep(ctx context.Context) {
 			continue
 		}
 
-		for _, candidate := range toCheck {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			r.checker.Check(candidate)
+		if checked := r.dispatchChecks(ctx, toCheck); checked < len(toCheck) {
+			return
 		}
 	}
+}
+
+func (r *coldSubscriptionNodeSweepRunner) dispatchChecks(ctx context.Context, candidates []topology.ColdNodeCandidate) int {
+	if len(candidates) == 0 || r == nil || r.checker == nil {
+		return 0
+	}
+	if batchChecker, ok := r.checker.(coldNodeBatchChecker); ok {
+		return batchChecker.CheckBatch(ctx, candidates)
+	}
+	checked := 0
+	for _, candidate := range candidates {
+		select {
+		case <-ctx.Done():
+			return checked
+		default:
+		}
+		r.checker.Check(candidate)
+		checked++
+	}
+	return checked
 }
 
 func (r *coldSubscriptionNodeSweepRunner) shouldSkipCandidate(candidate topology.ColdNodeCandidate) bool {

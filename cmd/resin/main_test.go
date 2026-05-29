@@ -1181,6 +1181,130 @@ func TestColdSubscriptionNodeCheck_PromotesOnLatencySuccessAndPersists(t *testin
 	}
 }
 
+func TestColdSubscriptionNodeCheckQueue_DefersPersistenceUntilBatchCompletes(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-cold-batch-flush"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "ColdBatchFlush",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	rawA := json.RawMessage(`{"type":"stub","server":"198.51.100.76","server_port":443}`)
+	rawB := json.RawMessage(`{"type":"stub","server":"198.51.100.77","server_port":443}`)
+	hashA := node.HashFromRawOptions(rawA)
+	hashB := node.HashFromRawOptions(rawB)
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{
+		{Hash: hashA.Hex(), RawOptions: rawA, CreatedAtNs: now},
+		{Hash: hashB.Hex(), RawOptions: rawB, CreatedAtNs: now},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{SubscriptionID: subID, NodeHash: hashA.Hex(), Tags: []string{"batch-a"}},
+		{SubscriptionID: subID, NodeHash: hashB.Hex(), Tags: []string{"batch-b"}},
+	}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	firstCompleted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	var firstOnce sync.Once
+	var secondOnce sync.Once
+	var releaseSecondOnce sync.Once
+	latency := 10 * time.Millisecond
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
+		switch hash {
+		case hashA:
+			pool.RecordResult(hash, true)
+			pool.RecordLatency(hash, "example.com", &latency)
+			firstOnce.Do(func() { close(firstCompleted) })
+		case hashB:
+			secondOnce.Do(func() { close(secondStarted) })
+			<-releaseSecond
+			pool.RecordResult(hash, true)
+			pool.RecordLatency(hash, "example.com", &latency)
+		}
+		return nil
+	})
+	queue := newColdSubscriptionNodeCheckQueue(checker, 2, 2)
+	queue.Start()
+	t.Cleanup(func() {
+		releaseSecondOnce.Do(func() { close(releaseSecond) })
+		queue.Stop()
+	})
+
+	batchDone := make(chan int, 1)
+	go func() {
+		batchDone <- queue.CheckBatch(context.Background(), []topology.ColdNodeCandidate{
+			{SubscriptionID: subID, Hash: hashA, RawOptions: rawA, Tags: []string{"batch-a"}},
+			{SubscriptionID: subID, Hash: hashB, RawOptions: rawB, Tags: []string{"batch-b"}},
+		})
+	}()
+
+	select {
+	case <-firstCompleted:
+	case <-time.After(time.Second):
+		t.Fatal("first cold check did not complete")
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second cold check did not start")
+	}
+	time.Sleep(50 * time.Millisecond)
+	dynamics, err := engine.LoadAllNodesDynamic()
+	if err != nil {
+		t.Fatalf("LoadAllNodesDynamic before batch completion: %v", err)
+	}
+	if len(dynamics) != 0 {
+		t.Fatalf("cold check persistence should be deferred until the whole batch completes, got dynamics %+v", dynamics)
+	}
+
+	releaseSecondOnce.Do(func() { close(releaseSecond) })
+	select {
+	case completed := <-batchDone:
+		if completed != 2 {
+			t.Fatalf("completed checks: got %d, want 2", completed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("batch did not complete")
+	}
+	dynamics, err = engine.LoadAllNodesDynamic()
+	if err != nil {
+		t.Fatalf("LoadAllNodesDynamic after batch completion: %v", err)
+	}
+	if len(dynamics) != 2 {
+		t.Fatalf("batch completion should persist both node dynamics, got %+v", dynamics)
+	}
+	latencies, err := engine.LoadAllNodeLatency()
+	if err != nil {
+		t.Fatalf("LoadAllNodeLatency after batch completion: %v", err)
+	}
+	if len(latencies) != 2 {
+		t.Fatalf("batch completion should persist both node latencies, got %+v", latencies)
+	}
+}
+
 func TestColdSubscriptionNodeCheck_FailurePersistsFailureAndDoesNotRetainMemory(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {

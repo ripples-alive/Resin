@@ -551,6 +551,14 @@ type coldSubscriptionNodeChecker struct {
 	probe      func(node.Hash) error
 }
 
+type coldNodeDirtyFlusher interface {
+	FlushColdNodeDirty() error
+}
+
+type coldNodeBatchWorkChecker interface {
+	CheckForBatch(topology.ColdNodeCandidate) func()
+}
+
 func newColdSubscriptionNodeChecker(
 	engine *state.StateEngine,
 	pool *topology.GlobalNodePool,
@@ -568,8 +576,47 @@ func newColdSubscriptionNodeChecker(
 }
 
 func (c *coldSubscriptionNodeChecker) Check(candidate topology.ColdNodeCandidate) {
+	cleanup := c.CheckForBatch(candidate)
+	if err := c.FlushColdNodeDirty(); err != nil {
+		log.Printf("cold subscription node check: flush state for %s: %v", candidate.Hash.Hex(), err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+}
+
+func (c *coldSubscriptionNodeChecker) CheckBatch(ctx context.Context, candidates []topology.ColdNodeCandidate) int {
+	completed := 0
+	cleanups := make([]func(), 0, len(candidates))
+	for _, candidate := range candidates {
+		select {
+		case <-ctx.Done():
+			if err := c.FlushColdNodeDirty(); err != nil {
+				log.Printf("cold subscription node check: flush partial batch state: %v", err)
+			}
+			for _, cleanup := range cleanups {
+				cleanup()
+			}
+			return completed
+		default:
+		}
+		if cleanup := c.CheckForBatch(candidate); cleanup != nil {
+			cleanups = append(cleanups, cleanup)
+		}
+		completed++
+	}
+	if err := c.FlushColdNodeDirty(); err != nil {
+		log.Printf("cold subscription node check: flush batch state: %v", err)
+	}
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
+	return completed
+}
+
+func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeCandidate) func() {
 	if c == nil || c.pool == nil || c.engine == nil {
-		return
+		return nil
 	}
 	createdAt := time.Now()
 	checkStartedNs := createdAt.UnixNano()
@@ -580,7 +627,6 @@ func (c *coldSubscriptionNodeChecker) Check(candidate topology.ColdNodeCandidate
 	entry.AddSubscriptionID(coldSubscriptionNodeTransientSubscriptionID)
 	entry.CircuitOpenSince.Store(createdAt.UnixNano())
 	c.pool.LoadNodeFromBootstrap(entry)
-	defer c.removeTransientColdCheckEntry(candidate.Hash)
 
 	if c.outbound != nil {
 		c.outbound.EnsureNodeOutbound(candidate.Hash)
@@ -599,21 +645,25 @@ func (c *coldSubscriptionNodeChecker) Check(candidate topology.ColdNodeCandidate
 		c.engine.MarkNodeStatic(candidate.Hash.Hex())
 		c.engine.MarkNodeDynamic(candidate.Hash.Hex())
 		c.engine.MarkSubscriptionNode(candidate.SubscriptionID, candidate.Hash.Hex())
-		if err := c.engine.FlushDirtySets(newFlushReaders(c.pool, c.subManager, nil)); err != nil {
-			log.Printf("cold subscription node check: flush success state for %s: %v", candidate.Hash.Hex(), err)
-		}
-		return
+		c.removeTransientColdCheckEntry(candidate.Hash)
+		return nil
 	}
 
 	if ok {
 		if entry.LastLatencyProbeAttempt.Load() < checkStartedNs {
 			entry.LastLatencyProbeAttempt.Store(time.Now().UnixNano())
-			c.engine.MarkNodeDynamic(candidate.Hash.Hex())
 		}
-		if err := c.engine.FlushDirtySets(newFlushReaders(c.pool, c.subManager, nil)); err != nil {
-			log.Printf("cold subscription node check: flush failure state for %s: %v", candidate.Hash.Hex(), err)
-		}
+		c.engine.MarkNodeDynamic(candidate.Hash.Hex())
+		return func() { c.removeTransientColdCheckEntry(candidate.Hash) }
 	}
+	return nil
+}
+
+func (c *coldSubscriptionNodeChecker) FlushColdNodeDirty() error {
+	if c == nil || c.engine == nil {
+		return nil
+	}
+	return c.engine.FlushDirtySets(newFlushReaders(c.pool, c.subManager, nil))
 }
 
 func (c *coldSubscriptionNodeChecker) removeTransientColdCheckEntry(hash node.Hash) {
@@ -648,7 +698,11 @@ type coldSubscriptionNodeCheckQueue struct {
 
 type coldSubscriptionNodeCheckWork struct {
 	candidate topology.ColdNodeCandidate
-	done      chan struct{}
+	done      chan coldSubscriptionNodeCheckResult
+}
+
+type coldSubscriptionNodeCheckResult struct {
+	cleanup func()
 }
 
 func newColdSubscriptionNodeCheckQueue(
@@ -683,9 +737,14 @@ func (q *coldSubscriptionNodeCheckQueue) Start() {
 				case <-q.stopCh:
 					return
 				case work := <-q.ch:
-					q.checker.Check(work.candidate)
+					var cleanup func()
+					if batchChecker, ok := q.checker.(coldNodeBatchWorkChecker); ok {
+						cleanup = batchChecker.CheckForBatch(work.candidate)
+					} else {
+						q.checker.Check(work.candidate)
+					}
 					if work.done != nil {
-						work.done <- struct{}{}
+						work.done <- coldSubscriptionNodeCheckResult{cleanup: cleanup}
 					}
 				}
 			}
@@ -709,8 +768,9 @@ func (q *coldSubscriptionNodeCheckQueue) CheckBatch(ctx context.Context, candida
 	if q == nil || q.checker == nil || q.stopped.Load() {
 		return 0
 	}
-	done := make(chan struct{}, len(candidates))
+	done := make(chan coldSubscriptionNodeCheckResult, len(candidates))
 	queued := 0
+candidateLoop:
 	for _, candidate := range candidates {
 		work := topology.ColdNodeCandidate{
 			SubscriptionID: candidate.SubscriptionID,
@@ -720,7 +780,7 @@ func (q *coldSubscriptionNodeCheckQueue) CheckBatch(ctx context.Context, candida
 		}
 		select {
 		case <-ctx.Done():
-			return queued
+			break candidateLoop
 		case <-q.stopCh:
 			return queued
 		case q.ch <- coldSubscriptionNodeCheckWork{candidate: work, done: done}:
@@ -729,17 +789,55 @@ func (q *coldSubscriptionNodeCheckQueue) CheckBatch(ctx context.Context, candida
 	}
 
 	completed := 0
+	cleanups := make([]func(), 0, queued)
 	for completed < queued {
 		select {
-		case <-ctx.Done():
-			return completed
 		case <-q.stopCh:
+			q.finishCompletedColdChecks(cleanups)
 			return completed
-		case <-done:
+		case result := <-done:
+			if result.cleanup != nil {
+				cleanups = append(cleanups, result.cleanup)
+			}
 			completed++
 		}
 	}
+	q.finishCompletedColdChecks(cleanups)
 	return completed
+}
+
+func (q *coldSubscriptionNodeCheckQueue) finishCompletedColdChecks(cleanups []func()) {
+	if q == nil {
+		return
+	}
+	if flusher, ok := q.checker.(coldNodeDirtyFlusher); ok {
+		if err := flusher.FlushColdNodeDirty(); err != nil {
+			log.Printf("cold subscription node check: flush batch state: %v", err)
+		}
+	}
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
+}
+
+func nodeDynamicModelFromEntry(hash string, entry *node.NodeEntry) model.NodeDynamic {
+	egressIP := entry.GetEgressIP()
+	egressStr := ""
+	if egressIP.IsValid() {
+		egressStr = egressIP.String()
+	}
+	return model.NodeDynamic{
+		Hash:                               hash,
+		FailureCount:                       int(entry.FailureCount.Load()),
+		CircuitOpenSince:                   entry.CircuitOpenSince.Load(),
+		EgressIP:                           egressStr,
+		EgressIPs:                          entry.GetObservedEgressIPStrings(),
+		EgressRegion:                       entry.GetEgressRegion(),
+		EgressUpdatedAtNs:                  entry.LastEgressUpdate.Load(),
+		LastLatencyProbeAttemptNs:          entry.LastLatencyProbeAttempt.Load(),
+		LastAuthorityLatencyProbeAttemptNs: entry.LastAuthorityLatencyProbeAttempt.Load(),
+		LastEgressUpdateAttemptNs:          entry.LastEgressUpdateAttempt.Load(),
+	}
 }
 
 func newFlushReaders(
@@ -772,23 +870,8 @@ func newFlushReaders(
 			if !ok {
 				return nil
 			}
-			egressIP := entry.GetEgressIP()
-			egressStr := ""
-			if egressIP.IsValid() {
-				egressStr = egressIP.String()
-			}
-			return &model.NodeDynamic{
-				Hash:                               hash,
-				FailureCount:                       int(entry.FailureCount.Load()),
-				CircuitOpenSince:                   entry.CircuitOpenSince.Load(),
-				EgressIP:                           egressStr,
-				EgressIPs:                          entry.GetObservedEgressIPStrings(),
-				EgressRegion:                       entry.GetEgressRegion(),
-				EgressUpdatedAtNs:                  entry.LastEgressUpdate.Load(),
-				LastLatencyProbeAttemptNs:          entry.LastLatencyProbeAttempt.Load(),
-				LastAuthorityLatencyProbeAttemptNs: entry.LastAuthorityLatencyProbeAttempt.Load(),
-				LastEgressUpdateAttemptNs:          entry.LastEgressUpdateAttempt.Load(),
-			}
+			dynamic := nodeDynamicModelFromEntry(hash, entry)
+			return &dynamic
 		},
 		ReadNodeLatency: func(key model.NodeLatencyKey) *model.NodeLatency {
 			h, err := node.ParseHex(key.NodeHash)
