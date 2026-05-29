@@ -638,8 +638,20 @@ func TestScheduler_InventoryRefresh_AttachesParsedRelationToExistingRealMemoryNo
 	if !ok {
 		t.Fatal("anchor node missing from setup")
 	}
-	if entry.HasOutbound() || !entry.IsCircuitOpen() {
-		t.Fatal("test setup expected a real but not currently healthy in-memory node")
+	entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma:        100 * time.Millisecond,
+		LastUpdated: time.Now(),
+	})
+	ob := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&ob)
+	entry.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	pool.RecordResult(hash, true)
+
+	plat := platform.NewPlatform("p-shared", "Shared", []*regexp.Regexp{regexp.MustCompile("shared-node")}, nil)
+	pool.RegisterPlatform(plat)
+	pool.RebuildAllPlatforms()
+	if plat.View().Contains(hash) {
+		t.Fatal("anchor-only relation should not match shared-node platform before refresh")
 	}
 
 	inventoryStore := &recordingSubscriptionInventoryStore{}
@@ -673,6 +685,9 @@ func TestScheduler_InventoryRefresh_AttachesParsedRelationToExistingRealMemoryNo
 	}
 	if _, ok := subscriptionNodeByHash(inventoryStore.replaceCalls[0].upserts, hash); !ok {
 		t.Fatalf("parsed relation missing from inventory upserts: %+v", inventoryStore.replaceCalls[0].upserts)
+	}
+	if !plat.View().Contains(hash) {
+		t.Fatal("platform view should include shared node immediately after inventory refresh attaches matching relation")
 	}
 }
 

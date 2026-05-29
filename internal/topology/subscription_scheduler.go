@@ -486,6 +486,7 @@ func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 
 		activeNext := s.inventoryActiveNextLocked(newManagedNodes)
 		oldActive := sub.ManagedNodes()
+		sub.SwapManagedNodes(activeNext)
 		oldActive.RangeNodes(func(h node.Hash, _ subscription.ManagedNode) bool {
 			if _, ok := activeNext.LoadNode(h); !ok {
 				s.pool.RemoveNodeFromSub(h, sub.ID)
@@ -502,7 +503,6 @@ func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 			return true
 		})
 
-		sub.SwapManagedNodes(activeNext)
 		now := time.Now().UnixNano()
 		sub.LastCheckedNs.Store(now)
 		sub.LastUpdatedNs.Store(now)
