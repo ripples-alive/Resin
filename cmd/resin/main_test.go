@@ -690,7 +690,7 @@ func TestBootstrapNodes_MissingDynamicStaysColdInInventory(t *testing.T) {
 	}
 }
 
-func TestBootstrapNodes_CircuitClosedWithoutLatencyStaysColdInInventory(t *testing.T) {
+func TestBootstrapNodes_CircuitClosedWithoutLatencyEntersActiveRuntime(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -750,8 +750,15 @@ func TestBootstrapNodes_CircuitClosedWithoutLatencyStaysColdInInventory(t *testi
 		t.Fatalf("bootstrapNodes: %v", err)
 	}
 
-	if _, ok := pool.GetEntry(hash); ok {
-		t.Fatalf("node %s without durable latency evidence should stay cold after bootstrapNodes", hash.Hex())
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatalf("node %s with circuit-closed dynamic state should enter active runtime even without latency", hash.Hex())
+	}
+	if !entry.HasOutbound() {
+		t.Fatalf("node %s with circuit-closed dynamic state should get outbound", hash.Hex())
+	}
+	if entry.IsCircuitOpen() {
+		t.Fatalf("node %s with circuit-closed dynamic state should not be circuit-open", hash.Hex())
 	}
 	rows, err := engine.LoadSubscriptionNodes(subID)
 	if err != nil {
@@ -957,16 +964,28 @@ func TestBootstrapNodes_ActiveOnlyRuntimeSelectsEnabledNonEvictedCircuitClosedWi
 		t.Fatal("active node should restore durable latency sample")
 	}
 
+	noLatencyHash := hashByRaw[string(rawAttemptOnly)]
+	noLatencyEntry, ok := pool.GetEntry(noLatencyHash)
+	if !ok {
+		t.Fatalf("circuit-closed node without latency %s should still enter active-only runtime", noLatencyHash.Hex())
+	}
+	if !noLatencyEntry.HasOutbound() {
+		t.Fatal("circuit-closed node without latency should get outbound during active-only bootstrap")
+	}
+	if noLatencyEntry.IsCircuitOpen() {
+		t.Fatal("circuit-closed node without latency should keep restored closed circuit state")
+	}
+
 	for rawString, hash := range hashByRaw {
-		if hash == activeHash {
+		if hash == activeHash || hash == noLatencyHash {
 			continue
 		}
 		if _, ok := pool.GetEntry(hash); ok {
 			t.Fatalf("node %s (%s) should not be active after active-only bootstrap", rawString, hash.Hex())
 		}
 	}
-	if got := builder.built; !sameStringSet(got, []string{string(rawActive), string(rawBuildFail)}) {
-		t.Fatalf("outbound build candidates: got %v, want active and build-fail only", got)
+	if got := builder.built; !sameStringSet(got, []string{string(rawActive), string(rawAttemptOnly), string(rawBuildFail)}) {
+		t.Fatalf("outbound build candidates: got %v, want active, no-latency, and build-fail only", got)
 	}
 
 	sub, ok := subManager.Get(enabledSubID)
@@ -976,7 +995,10 @@ func TestBootstrapNodes_ActiveOnlyRuntimeSelectsEnabledNonEvictedCircuitClosedWi
 	if _, ok := sub.ManagedNodes().LoadNode(activeHash); !ok {
 		t.Fatal("active node relation should be restored into subscription managed nodes")
 	}
-	for _, raw := range []json.RawMessage{rawEvicted, rawCircuitOpen, rawAttemptOnly, rawBuildFail} {
+	if _, ok := sub.ManagedNodes().LoadNode(noLatencyHash); !ok {
+		t.Fatal("no-latency circuit-closed node relation should be restored into subscription managed nodes")
+	}
+	for _, raw := range []json.RawMessage{rawEvicted, rawCircuitOpen, rawBuildFail} {
 		hash := hashByRaw[string(raw)]
 		if _, ok := sub.ManagedNodes().LoadNode(hash); ok {
 			t.Fatalf("inactive node %s should not be restored into active managed nodes", hash.Hex())
@@ -984,7 +1006,7 @@ func TestBootstrapNodes_ActiveOnlyRuntimeSelectsEnabledNonEvictedCircuitClosedWi
 	}
 }
 
-func TestBootstrapNodes_ActiveOnlyRuntimeExcludesAttemptOnlyWithoutLatencySample(t *testing.T) {
+func TestBootstrapNodes_ActiveOnlyRuntimeIncludesCircuitClosedNodeWithoutLatencySample(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -1042,11 +1064,18 @@ func TestBootstrapNodes_ActiveOnlyRuntimeExcludesAttemptOnlyWithoutLatencySample
 	if err := bootstrapNodes(engine, pool, subManager, outboundMgr, envCfg, runtimeCfg.LatencyAuthorities); err != nil {
 		t.Fatalf("bootstrapNodes: %v", err)
 	}
-	if _, ok := pool.GetEntry(hash); ok {
-		t.Fatal("attempt-only node should not enter active-only runtime memory")
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("circuit-closed node without latency should enter active-only runtime memory")
 	}
-	if len(builder.built) != 0 {
-		t.Fatalf("attempt-only node should not get outbound build, got builds=%v", builder.built)
+	if !entry.HasOutbound() {
+		t.Fatal("circuit-closed node without latency should get outbound build")
+	}
+	if entry.IsCircuitOpen() {
+		t.Fatal("circuit-closed node without latency should keep circuit closed")
+	}
+	if got := builder.built; !sameStringSet(got, []string{string(raw)}) {
+		t.Fatalf("outbound build candidates: got %v, want only no-latency node", got)
 	}
 }
 

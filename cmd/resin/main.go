@@ -1228,7 +1228,7 @@ func activeOnlyBootstrapHashes(pool *topology.GlobalNodePool, subManager *topolo
 	}
 	var hashes []node.Hash
 	pool.Range(func(hash node.Hash, entry *node.NodeEntry) bool {
-		if entry == nil || entry.IsCircuitOpen() || !entry.HasLatency() {
+		if entry == nil || entry.IsCircuitOpen() {
 			return true
 		}
 		for _, subID := range entry.SubscriptionIDs() {
@@ -1255,7 +1255,7 @@ func pruneColdBootstrapNodes(pool *topology.GlobalNodePool, subManager *topology
 	}
 	active := make(map[node.Hash]bool)
 	pool.Range(func(hash node.Hash, entry *node.NodeEntry) bool {
-		active[hash] = entry != nil && entry.HasOutbound() && !entry.IsCircuitOpen() && entry.HasLatency()
+		active[hash] = entry != nil && entry.HasOutbound() && !entry.IsCircuitOpen()
 		return true
 	})
 	subManager.Range(func(_ string, sub *subscription.Subscription) bool {
