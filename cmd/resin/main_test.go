@@ -7,7 +7,9 @@ import (
 	"net/netip"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1201,9 +1203,11 @@ func TestColdSubscriptionNodeCheck_FailurePersistsFailureAndDoesNotRetainMemory(
 		RawOptions:     raw,
 		Tags:           []string{"cold-failure"},
 	}
+	var transientEntry *node.NodeEntry
 	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
 		pool.RecordResult(hash, false)
 		pool.RecordLatency(hash, "example.com", nil)
+		transientEntry, _ = pool.GetEntry(hash)
 		return errors.New("cold latency failed")
 	})
 
@@ -1211,6 +1215,12 @@ func TestColdSubscriptionNodeCheck_FailurePersistsFailureAndDoesNotRetainMemory(
 
 	if _, ok := pool.GetEntry(hash); ok {
 		t.Fatal("failed cold check should not retain node in memory")
+	}
+	if transientEntry == nil {
+		t.Fatal("test setup expected a transient pool entry during cold check")
+	}
+	if transientEntry.Outbound.Load() != nil {
+		t.Fatal("failed cold check should close and clear transient outbound")
 	}
 	sub, ok := subManager.Get(subID)
 	if !ok {
@@ -1242,6 +1252,337 @@ func TestColdSubscriptionNodeCheck_FailurePersistsFailureAndDoesNotRetainMemory(
 	}
 	if len(subNodes) != 1 || subNodes[0].NodeHash != hash.Hex() || subNodes[0].Evicted {
 		t.Fatalf("failed cold check should keep non-evicted inventory relation, got %+v", subNodes)
+	}
+}
+
+type recordingColdSweepChecker struct {
+	mu        sync.Mutex
+	checked   []topology.ColdNodeCandidate
+	onCheck   func(topology.ColdNodeCandidate)
+	blockOnce chan struct{}
+}
+
+func (c *recordingColdSweepChecker) Check(candidate topology.ColdNodeCandidate) {
+	if c.blockOnce != nil {
+		<-c.blockOnce
+		c.blockOnce = nil
+	}
+	if c.onCheck != nil {
+		c.onCheck(candidate)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.checked = append(c.checked, candidate)
+}
+
+func (c *recordingColdSweepChecker) hashes() []node.Hash {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]node.Hash, 0, len(c.checked))
+	for _, candidate := range c.checked {
+		out = append(out, candidate.Hash)
+	}
+	return out
+}
+
+type scriptedColdCandidateStore struct {
+	mu          sync.Mutex
+	batches     [][]topology.ColdNodeCandidate
+	calls       int
+	inFlight    int
+	maxInFlight int
+	onCall      func(call int)
+}
+
+func (s *scriptedColdCandidateStore) LoadDueColdNodeCandidates(nowNs int64, interval time.Duration, limit int) ([]topology.ColdNodeCandidate, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.inFlight++
+	if s.inFlight > s.maxInFlight {
+		s.maxInFlight = s.inFlight
+	}
+	s.mu.Unlock()
+
+	if s.onCall != nil {
+		s.onCall(call)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inFlight--
+	if call-1 >= len(s.batches) {
+		return nil, nil
+	}
+	batch := s.batches[call-1]
+	if limit > 0 && len(batch) > limit {
+		batch = batch[:limit]
+	}
+	return append([]topology.ColdNodeCandidate(nil), batch...), nil
+}
+
+func (s *scriptedColdCandidateStore) stats() (calls int, maxInFlight int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, s.maxInFlight
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal(msg)
+}
+
+func TestColdSubscriptionNodeSweepRunner_SingleFlightCoalescesTriggers(t *testing.T) {
+	firstCallStarted := make(chan struct{})
+	releaseFirstCall := make(chan struct{})
+	var firstOnce sync.Once
+	store := &scriptedColdCandidateStore{
+		batches: [][]topology.ColdNodeCandidate{
+			nil,
+			nil,
+		},
+		onCall: func(call int) {
+			if call == 1 {
+				firstOnce.Do(func() { close(firstCallStarted) })
+				<-releaseFirstCall
+			}
+		},
+	}
+	checker := &recordingColdSweepChecker{}
+	runner := newColdSubscriptionNodeSweepRunner(coldSubscriptionNodeSweepRunnerConfig{
+		store:         store,
+		checker:       checker,
+		sweepInterval: time.Hour,
+		batchSize:     16,
+	})
+	runner.Start()
+	t.Cleanup(runner.Stop)
+
+	if !runner.TriggerColdNodeSweep("manual-1") {
+		t.Fatal("first trigger should be accepted")
+	}
+	select {
+	case <-firstCallStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first sweep did not start")
+	}
+	if !runner.TriggerColdNodeSweep("manual-2") {
+		t.Fatal("second trigger should coalesce while first run is active")
+	}
+	if !runner.TriggerColdNodeSweep("manual-3") {
+		t.Fatal("third trigger should coalesce into the existing pending run")
+	}
+	close(releaseFirstCall)
+
+	waitForCondition(t, time.Second, func() bool {
+		calls, _ := store.stats()
+		return calls == 2
+	}, "coalesced pending sweep did not run")
+	time.Sleep(30 * time.Millisecond)
+	calls, maxInFlight := store.stats()
+	if calls != 2 {
+		t.Fatalf("store calls after coalescing: got %d, want 2", calls)
+	}
+	if maxInFlight != 1 {
+		t.Fatalf("sweeps overlapped: max in-flight calls=%d", maxInFlight)
+	}
+
+	runner.Stop()
+	if runner.TriggerColdNodeSweep("after-stop") {
+		t.Fatal("trigger after stop should be rejected")
+	}
+}
+
+func TestColdSubscriptionNodeSweepRunner_DrainsDueDBBatchesUntilEmpty(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-cold-runner"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "ColdRunner",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	rawColdA := json.RawMessage(`{"type":"stub","server":"198.51.100.81","server_port":443}`)
+	rawColdB := json.RawMessage(`{"type":"stub","server":"198.51.100.82","server_port":443}`)
+	rawColdC := json.RawMessage(`{"type":"stub","server":"198.51.100.83","server_port":443}`)
+	coldAHash := node.HashFromRawOptions(rawColdA)
+	coldBHash := node.HashFromRawOptions(rawColdB)
+	coldCHash := node.HashFromRawOptions(rawColdC)
+
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{
+		{Hash: coldAHash.Hex(), RawOptions: rawColdA, CreatedAtNs: now},
+		{Hash: coldBHash.Hex(), RawOptions: rawColdB, CreatedAtNs: now},
+		{Hash: coldCHash.Hex(), RawOptions: rawColdC, CreatedAtNs: now},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{SubscriptionID: subID, NodeHash: coldAHash.Hex(), Tags: []string{"cold-a"}},
+		{SubscriptionID: subID, NodeHash: coldBHash.Hex(), Tags: []string{"cold-b"}},
+		{SubscriptionID: subID, NodeHash: coldCHash.Hex(), Tags: []string{"cold-c"}},
+	}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	checker := &recordingColdSweepChecker{
+		onCheck: func(candidate topology.ColdNodeCandidate) {
+			if err := engine.BulkUpsertNodesDynamic([]model.NodeDynamic{{
+				Hash:                      candidate.Hash.Hex(),
+				LastLatencyProbeAttemptNs: now,
+			}}); err != nil {
+				t.Errorf("BulkUpsertNodesDynamic %s: %v", candidate.Hash.Hex(), err)
+			}
+		},
+	}
+	runner := newColdSubscriptionNodeSweepRunner(coldSubscriptionNodeSweepRunnerConfig{
+		store:         engine,
+		checker:       checker,
+		pool:          pool,
+		subManager:    subManager,
+		sweepInterval: time.Minute,
+		batchSize:     2,
+		now:           func() time.Time { return time.Unix(0, now) },
+	})
+
+	runner.runSweep(context.Background())
+
+	wantHashes := []node.Hash{coldAHash, coldBHash, coldCHash}
+	sort.Slice(wantHashes, func(i, j int) bool {
+		return wantHashes[i].Hex() < wantHashes[j].Hex()
+	})
+	if got := checker.hashes(); !reflect.DeepEqual(got, wantHashes) {
+		t.Fatalf("checked hashes: got %v, want all due nodes across DB batches in DB order %v", got, wantHashes)
+	}
+	due, err := engine.LoadDueColdNodeCandidates(now, time.Minute, 10)
+	if err != nil {
+		t.Fatalf("LoadDueColdNodeCandidates: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("due candidates after sweep: got %+v, want none", due)
+	}
+}
+
+func TestColdSubscriptionNodeSweepRunner_AttachesAlreadyLiveDueRelationWithoutCheck(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	now := time.Now().UnixNano()
+	const (
+		subLive = "sub-live"
+		subDue  = "sub-due"
+	)
+	for _, subID := range []string{subLive, subDue} {
+		if err := engine.UpsertSubscription(model.Subscription{
+			ID:               subID,
+			Name:             subID,
+			URL:              "https://example.com/sub",
+			UpdateIntervalNs: int64(30 * time.Minute),
+			Enabled:          true,
+			CreatedAtNs:      now,
+			UpdatedAtNs:      now,
+		}); err != nil {
+			t.Fatalf("UpsertSubscription %s: %v", subID, err)
+		}
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.84","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{{
+		Hash:        hash.Hex(),
+		RawOptions:  raw,
+		CreatedAtNs: now,
+	}}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: subDue,
+		NodeHash:       hash.Hex(),
+		Tags:           []string{"due"},
+	}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	pool.AddNodeFromSub(hash, raw, subLive)
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("live node missing after AddNodeFromSub")
+	}
+	ob := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&ob)
+	pool.RecordResult(hash, true)
+	latency := 10 * time.Millisecond
+	pool.RecordLatency(hash, "example.com", &latency)
+	if sub := subManager.Lookup(subLive); sub != nil {
+		sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"live"}})
+	}
+
+	checker := &recordingColdSweepChecker{}
+	runner := newColdSubscriptionNodeSweepRunner(coldSubscriptionNodeSweepRunnerConfig{
+		store:         engine,
+		checker:       checker,
+		pool:          pool,
+		subManager:    subManager,
+		sweepInterval: time.Minute,
+		batchSize:     1,
+		now:           func() time.Time { return time.Unix(0, now) },
+	})
+
+	runner.runSweep(context.Background())
+
+	if got := checker.hashes(); len(got) != 0 {
+		t.Fatalf("already-live due relation should not be cold-checked, got %v", got)
+	}
+	dueSub := subManager.Lookup(subDue)
+	if dueSub == nil {
+		t.Fatalf("subscription %s missing", subDue)
+	}
+	managed, ok := dueSub.ManagedNodes().LoadNode(hash)
+	if !ok {
+		t.Fatal("already-live due relation should be attached to active managed memory")
+	}
+	if !reflect.DeepEqual(managed.Tags, []string{"due"}) {
+		t.Fatalf("attached tags: got %v, want [due]", managed.Tags)
+	}
+	entry, ok = pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("live node should stay in pool")
+	}
+	if got := entry.SubscriptionCount(); got != 2 {
+		t.Fatalf("subscription count: got %d, want 2", got)
 	}
 }
 
@@ -1475,7 +1816,7 @@ func TestMarkNodeRemovedDirty_DeletesStaticDynamicAndLatency(t *testing.T) {
 	}
 }
 
-func TestNewTopologyRuntime_WiresActiveOnlyRefreshAndColdQueue(t *testing.T) {
+func TestNewTopologyRuntime_WiresActiveOnlyRefreshAndColdSweepRunner(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -1521,8 +1862,8 @@ func TestNewTopologyRuntime_WiresActiveOnlyRefreshAndColdQueue(t *testing.T) {
 	if rt.scheduler == nil {
 		t.Fatal("runtime scheduler should be initialized")
 	}
-	if rt.coldNodeQueue == nil {
-		t.Fatal("runtime should wire a cold-node queue for inventory refresh")
+	if rt.coldSweepRunner == nil {
+		t.Fatal("runtime should wire a cold-node sweep runner for inventory refresh")
 	}
 
 	if err := bootstrapTopology(engine, rt.subManager, rt.pool, envCfg); err != nil {
@@ -1554,7 +1895,7 @@ func TestNewTopologyRuntime_WiresActiveOnlyRefreshAndColdQueue(t *testing.T) {
 	}
 }
 
-func TestNewTopologyRuntime_LegacyRuntimeDoesNotWireInventoryQueue(t *testing.T) {
+func TestNewTopologyRuntime_LegacyRuntimeDoesNotWireInventorySweepRunner(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -1580,7 +1921,7 @@ func TestNewTopologyRuntime_LegacyRuntimeDoesNotWireInventoryQueue(t *testing.T)
 	if err != nil {
 		t.Fatalf("newTopologyRuntime: %v", err)
 	}
-	if rt.coldNodeQueue != nil {
-		t.Fatal("legacy runtime should not allocate cold-node queue")
+	if rt.coldSweepRunner != nil {
+		t.Fatal("legacy runtime should not allocate cold-node sweep runner")
 	}
 }

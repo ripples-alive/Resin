@@ -355,6 +355,11 @@ func (a *resinApp) startBackgroundServices() {
 		log.Println("Cold subscription node check queue started (batch 2)")
 	}
 
+	if a.topoRuntime.coldSweepRunner != nil {
+		a.topoRuntime.coldSweepRunner.Start()
+		log.Println("Cold subscription node sweep runner started (batch 2)")
+	}
+
 	// --- Step 8 Batch 3: Subscription scheduler ---
 	a.topoRuntime.scheduler.Start()
 	log.Println("Subscription scheduler started (batch 3)")
@@ -554,13 +559,18 @@ func (a *resinApp) shutdown(ctx context.Context) {
 	a.topoRuntime.ephemeralCleaner.Stop()
 	log.Println("Ephemeral cleaner stopped")
 
+	a.topoRuntime.scheduler.Stop()
+	log.Println("Subscription scheduler stopped")
+
+	if a.topoRuntime.coldSweepRunner != nil {
+		a.topoRuntime.coldSweepRunner.Stop()
+		log.Println("Cold subscription node sweep runner stopped")
+	}
+
 	if a.topoRuntime.coldNodeQueue != nil {
 		a.topoRuntime.coldNodeQueue.Stop()
 		log.Println("Cold subscription node check queue stopped")
 	}
-
-	a.topoRuntime.scheduler.Stop()
-	log.Println("Subscription scheduler stopped")
 
 	a.topoRuntime.probeMgr.Stop()
 	log.Println("Probe manager stopped")

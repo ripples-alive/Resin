@@ -3,9 +3,12 @@ package state
 import (
 	"encoding/json"
 	"reflect"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/Resinat/Resin/internal/model"
+	"github.com/Resinat/Resin/internal/node"
 )
 
 func newTestCacheRepo(t *testing.T) *CacheRepo {
@@ -263,6 +266,106 @@ func TestCacheRepo_SubscriptionNodes_BulkDelete(t *testing.T) {
 	loaded, _ := repo.LoadAllSubscriptionNodes()
 	if len(loaded) != 1 || loaded[0].NodeHash != "n2" {
 		t.Fatalf("expected only n2, got %+v", loaded)
+	}
+}
+
+func TestCacheRepo_LoadDueColdNodeCandidates_FiltersOrdersAndLimits(t *testing.T) {
+	repo := newTestCacheRepo(t)
+
+	nowNs := int64(10_000)
+	interval := 100 * time.Nanosecond
+	type seedNode struct {
+		subID      string
+		raw        json.RawMessage
+		tags       []string
+		evicted    bool
+		hasDynamic bool
+		attemptNs  int64
+	}
+	seeds := []seedNode{
+		{subID: "sub-b", raw: json.RawMessage(`{"type":"stub","server":"198.51.100.1","server_port":443}`), tags: []string{"missing-dynamic"}},
+		{subID: "sub-a", raw: json.RawMessage(`{"type":"stub","server":"198.51.100.2","server_port":443}`), tags: []string{"zero-attempt"}, hasDynamic: true, attemptNs: 0},
+		{subID: "sub-a", raw: json.RawMessage(`{"type":"stub","server":"198.51.100.3","server_port":443}`), tags: []string{"old-attempt"}, hasDynamic: true, attemptNs: nowNs - int64(interval) - 1},
+		{subID: "sub-a", raw: json.RawMessage(`{"type":"stub","server":"198.51.100.4","server_port":443}`), tags: []string{"recent-attempt"}, hasDynamic: true, attemptNs: nowNs - int64(interval) + 1},
+		{subID: "sub-a", raw: json.RawMessage(`{"type":"stub","server":"198.51.100.5","server_port":443}`), tags: []string{"evicted"}, evicted: true},
+	}
+
+	var statics []model.NodeStatic
+	var subNodes []model.SubscriptionNode
+	var dynamics []model.NodeDynamic
+	dueByKey := make(map[string]seedNode)
+	for _, seed := range seeds {
+		hash := node.HashFromRawOptions(seed.raw)
+		statics = append(statics, model.NodeStatic{Hash: hash.Hex(), RawOptions: seed.raw, CreatedAtNs: nowNs - 1_000})
+		subNodes = append(subNodes, model.SubscriptionNode{
+			SubscriptionID: seed.subID,
+			NodeHash:       hash.Hex(),
+			Tags:           seed.tags,
+			Evicted:        seed.evicted,
+		})
+		if seed.hasDynamic {
+			dynamics = append(dynamics, model.NodeDynamic{Hash: hash.Hex(), LastLatencyProbeAttemptNs: seed.attemptNs})
+		}
+		if !seed.evicted && (!seed.hasDynamic || seed.attemptNs == 0 || seed.attemptNs <= nowNs-int64(interval)) {
+			dueByKey[seed.subID+"/"+hash.Hex()] = seed
+		}
+	}
+	if err := repo.BulkUpsertNodesStatic(statics); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := repo.BulkUpsertSubscriptionNodes(subNodes); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+	if err := repo.BulkUpsertNodesDynamic(dynamics); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
+	// Orphan subscription_nodes rows without nodes_static must not become candidates.
+	if err := repo.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: "sub-a",
+		NodeHash:       "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		Tags:           []string{"orphan"},
+	}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes orphan: %v", err)
+	}
+
+	got, err := repo.LoadDueColdNodeCandidates(nowNs, interval, 2)
+	if err != nil {
+		t.Fatalf("LoadDueColdNodeCandidates limited: %v", err)
+	}
+	wantKeys := make([]string, 0, len(dueByKey))
+	for key := range dueByKey {
+		wantKeys = append(wantKeys, key)
+	}
+	sort.Strings(wantKeys)
+	if len(got) != 2 {
+		t.Fatalf("limited candidates: got %d, want 2", len(got))
+	}
+	for i, candidate := range got {
+		key := candidate.SubscriptionID + "/" + candidate.Hash.Hex()
+		if key != wantKeys[i] {
+			t.Fatalf("candidate %d key: got %s, want %s", i, key, wantKeys[i])
+		}
+		seed := dueByKey[key]
+		if string(candidate.RawOptions) != string(seed.raw) {
+			t.Fatalf("candidate %d raw: got %s, want %s", i, candidate.RawOptions, seed.raw)
+		}
+		if !reflect.DeepEqual(candidate.Tags, seed.tags) {
+			t.Fatalf("candidate %d tags: got %v, want %v", i, candidate.Tags, seed.tags)
+		}
+	}
+
+	got, err = repo.LoadDueColdNodeCandidates(nowNs, interval, 20)
+	if err != nil {
+		t.Fatalf("LoadDueColdNodeCandidates full: %v", err)
+	}
+	if len(got) != len(wantKeys) {
+		t.Fatalf("full candidates: got %d, want %d (%v)", len(got), len(wantKeys), wantKeys)
+	}
+	for i, candidate := range got {
+		key := candidate.SubscriptionID + "/" + candidate.Hash.Hex()
+		if key != wantKeys[i] {
+			t.Fatalf("full candidate %d key: got %s, want %s", i, key, wantKeys[i])
+		}
 	}
 }
 

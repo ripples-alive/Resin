@@ -38,6 +38,7 @@ type topologyRuntime struct {
 	scheduler        *topology.SubscriptionScheduler
 	ephemeralCleaner *topology.EphemeralCleaner
 	coldNodeQueue    *coldSubscriptionNodeCheckQueue
+	coldSweepRunner  *coldSubscriptionNodeSweepRunner
 	router           *routing.Router
 	leaseCleaner     *routing.LeaseCleaner
 	outboundMgr      *outbound.OutboundManager
@@ -49,6 +50,11 @@ const downloadUserAgent = "clash.meta"
 const (
 	coldSubscriptionNodeQueueCapacity = 1024
 	coldSubscriptionNodeWorkerCount   = 4
+
+	coldSubscriptionNodeSweepInterval  = 5 * time.Minute
+	coldSubscriptionNodeSweepBatchSize = 256
+
+	coldSubscriptionNodeTransientSubscriptionID = "__cold_check_transient__"
 )
 
 func main() {
@@ -340,6 +346,7 @@ func newTopologyRuntime(
 	log.Println("ProbeManager initialized")
 
 	var coldNodeQueue *coldSubscriptionNodeCheckQueue
+	var coldSweepRunner *coldSubscriptionNodeSweepRunner
 	var inventoryStore topology.SubscriptionInventoryStore
 	if envCfg.ActiveOnlyRuntime {
 		coldChecker := newColdSubscriptionNodeChecker(engine, pool, subManager, singboxBuilder, func(hash node.Hash) error {
@@ -352,15 +359,22 @@ func newTopologyRuntime(
 			coldSubscriptionNodeQueueCapacity,
 		)
 		inventoryStore = engine
+		coldSweepRunner = newColdSubscriptionNodeSweepRunner(coldSubscriptionNodeSweepRunnerConfig{
+			store:         engine,
+			checker:       coldNodeQueue,
+			pool:          pool,
+			subManager:    subManager,
+			sweepInterval: coldSubscriptionNodeSweepInterval,
+			batchSize:     coldSubscriptionNodeSweepBatchSize,
+		})
 	}
 
 	scheduler := topology.NewSubscriptionScheduler(topology.SchedulerConfig{
-		SubManager:       subManager,
-		Pool:             pool,
-		Downloader:       downloader,
-		InventoryStore:   inventoryStore,
-		ColdNodeQueue:    coldNodeQueue,
-		ColdQueueMaxSize: coldSubscriptionNodeQueueCapacity,
+		SubManager:           subManager,
+		Pool:                 pool,
+		Downloader:           downloader,
+		InventoryStore:       inventoryStore,
+		ColdNodeSweepTrigger: coldSweepRunner,
 		OnSubRefreshState: func(subID string, checkedNs int64, updatedNs *int64, lastError string) {
 			if err := engine.UpdateSubscriptionRefreshState(subID, checkedNs, updatedNs, lastError); err != nil {
 				log.Printf("[scheduler] persist subscription refresh state %s: %v", subID, err)
@@ -387,6 +401,7 @@ func newTopologyRuntime(
 		scheduler:        scheduler,
 		ephemeralCleaner: ephemeralCleaner,
 		coldNodeQueue:    coldNodeQueue,
+		coldSweepRunner:  coldSweepRunner,
 		outboundMgr:      outboundMgr,
 		singboxBuilder:   singboxBuilder,
 	}, nil
@@ -557,10 +572,15 @@ func (c *coldSubscriptionNodeChecker) Check(candidate topology.ColdNodeCandidate
 		return
 	}
 	createdAt := time.Now()
+	checkStartedNs := createdAt.UnixNano()
 	entry := node.NewNodeEntry(candidate.Hash, append(json.RawMessage(nil), candidate.RawOptions...), createdAt, 16)
-	entry.AddSubscriptionID("__cold_check_transient__")
+	// The cold sweep needs a pool entry so existing outbound/probe plumbing can
+	// operate, but this is not yet an active subscription relation. Keep a
+	// probe-only sentinel reference and remove it before returning.
+	entry.AddSubscriptionID(coldSubscriptionNodeTransientSubscriptionID)
 	entry.CircuitOpenSince.Store(createdAt.UnixNano())
 	c.pool.LoadNodeFromBootstrap(entry)
+	defer c.removeTransientColdCheckEntry(candidate.Hash)
 
 	if c.outbound != nil {
 		c.outbound.EnsureNodeOutbound(candidate.Hash)
@@ -573,37 +593,66 @@ func (c *coldSubscriptionNodeChecker) Check(candidate topology.ColdNodeCandidate
 	success := probeErr == nil && ok && entry.HasOutbound() && !entry.IsCircuitOpen() && entry.HasLatency()
 	if success {
 		c.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, candidate.SubscriptionID)
-		c.pool.RemoveNodeFromSub(candidate.Hash, "__cold_check_transient__")
 		if sub := c.subManager.Lookup(candidate.SubscriptionID); sub != nil {
 			sub.ManagedNodes().StoreNode(candidate.Hash, subscription.ManagedNode{Tags: append([]string(nil), candidate.Tags...)})
 		}
 		c.engine.MarkNodeStatic(candidate.Hash.Hex())
 		c.engine.MarkNodeDynamic(candidate.Hash.Hex())
 		c.engine.MarkSubscriptionNode(candidate.SubscriptionID, candidate.Hash.Hex())
+		if err := c.engine.FlushDirtySets(newFlushReaders(c.pool, c.subManager, nil)); err != nil {
+			log.Printf("cold subscription node check: flush success state for %s: %v", candidate.Hash.Hex(), err)
+		}
 		return
 	}
 
 	if ok {
+		if entry.LastLatencyProbeAttempt.Load() < checkStartedNs {
+			entry.LastLatencyProbeAttempt.Store(time.Now().UnixNano())
+			c.engine.MarkNodeDynamic(candidate.Hash.Hex())
+		}
 		if err := c.engine.FlushDirtySets(newFlushReaders(c.pool, c.subManager, nil)); err != nil {
 			log.Printf("cold subscription node check: flush failure state for %s: %v", candidate.Hash.Hex(), err)
 		}
 	}
-	c.pool.RemoveNodeFromSub(candidate.Hash, "__cold_check_transient__")
+}
+
+func (c *coldSubscriptionNodeChecker) removeTransientColdCheckEntry(hash node.Hash) {
+	entry, ok := c.pool.GetEntry(hash)
+	if !ok || entry == nil {
+		return
+	}
+	if entry.SubscriptionCount() == 1 {
+		ids := entry.SubscriptionIDs()
+		if len(ids) == 1 && ids[0] == coldSubscriptionNodeTransientSubscriptionID {
+			c.pool.DeleteNodeFromBootstrap(hash)
+			if c.outbound != nil {
+				c.outbound.RemoveNodeOutbound(entry)
+			}
+			if entry.LatencyTable != nil {
+				entry.LatencyTable.Close()
+			}
+			return
+		}
+	}
+	c.pool.RemoveNodeFromSub(hash, coldSubscriptionNodeTransientSubscriptionID)
 }
 
 type coldSubscriptionNodeCheckQueue struct {
-	checker *coldSubscriptionNodeChecker
-	ch      chan topology.ColdNodeCandidate
+	checker coldNodeChecker
+	ch      chan coldSubscriptionNodeCheckWork
 	stopCh  chan struct{}
 	workers int
 	stopped atomic.Bool
 	wg      sync.WaitGroup
 }
 
-var _ topology.ColdNodeQueue = (*coldSubscriptionNodeCheckQueue)(nil)
+type coldSubscriptionNodeCheckWork struct {
+	candidate topology.ColdNodeCandidate
+	done      chan struct{}
+}
 
 func newColdSubscriptionNodeCheckQueue(
-	checker *coldSubscriptionNodeChecker,
+	checker coldNodeChecker,
 	workers int,
 	capacity int,
 ) *coldSubscriptionNodeCheckQueue {
@@ -615,7 +664,7 @@ func newColdSubscriptionNodeCheckQueue(
 	}
 	return &coldSubscriptionNodeCheckQueue{
 		checker: checker,
-		ch:      make(chan topology.ColdNodeCandidate, capacity),
+		ch:      make(chan coldSubscriptionNodeCheckWork, capacity),
 		stopCh:  make(chan struct{}),
 		workers: workers,
 	}
@@ -633,8 +682,11 @@ func (q *coldSubscriptionNodeCheckQueue) Start() {
 				select {
 				case <-q.stopCh:
 					return
-				case candidate := <-q.ch:
-					q.checker.Check(candidate)
+				case work := <-q.ch:
+					q.checker.Check(work.candidate)
+					if work.done != nil {
+						work.done <- struct{}{}
+					}
 				}
 			}
 		}()
@@ -649,18 +701,45 @@ func (q *coldSubscriptionNodeCheckQueue) Stop() {
 	q.wg.Wait()
 }
 
-func (q *coldSubscriptionNodeCheckQueue) EnqueueColdNodeCheck(candidate topology.ColdNodeCandidate) bool {
+func (q *coldSubscriptionNodeCheckQueue) Check(candidate topology.ColdNodeCandidate) {
+	_ = q.CheckBatch(context.Background(), []topology.ColdNodeCandidate{candidate})
+}
+
+func (q *coldSubscriptionNodeCheckQueue) CheckBatch(ctx context.Context, candidates []topology.ColdNodeCandidate) int {
 	if q == nil || q.checker == nil || q.stopped.Load() {
-		return false
+		return 0
 	}
-	select {
-	case <-q.stopCh:
-		return false
-	case q.ch <- candidate:
-		return true
-	default:
-		return false
+	done := make(chan struct{}, len(candidates))
+	queued := 0
+	for _, candidate := range candidates {
+		work := topology.ColdNodeCandidate{
+			SubscriptionID: candidate.SubscriptionID,
+			Hash:           candidate.Hash,
+			RawOptions:     append([]byte(nil), candidate.RawOptions...),
+			Tags:           append([]string(nil), candidate.Tags...),
+		}
+		select {
+		case <-ctx.Done():
+			return queued
+		case <-q.stopCh:
+			return queued
+		case q.ch <- coldSubscriptionNodeCheckWork{candidate: work, done: done}:
+			queued++
+		}
 	}
+
+	completed := 0
+	for completed < queued {
+		select {
+		case <-ctx.Done():
+			return completed
+		case <-q.stopCh:
+			return completed
+		case <-done:
+			completed++
+		}
+	}
+	return completed
 }
 
 func newFlushReaders(

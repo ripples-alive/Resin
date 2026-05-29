@@ -92,12 +92,12 @@ func (s *recordingSubscriptionInventoryStore) ReplaceSubscriptionRefresh(
 	return nil
 }
 
-type recordingColdNodeQueue struct {
-	candidates []ColdNodeCandidate
+type recordingColdNodeSweepTrigger struct {
+	reasons []string
 }
 
-func (q *recordingColdNodeQueue) EnqueueColdNodeCheck(candidate ColdNodeCandidate) bool {
-	q.candidates = append(q.candidates, candidate)
+func (t *recordingColdNodeSweepTrigger) TriggerColdNodeSweep(reason string) bool {
+	t.reasons = append(t.reasons, reason)
 	return true
 }
 
@@ -424,7 +424,7 @@ func TestScheduler_UpdateSubscription_KeepEvictedDoesNotReAddToPool(t *testing.T
 	}
 }
 
-func TestScheduler_InventoryRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueuesColdCheck(t *testing.T) {
+func TestScheduler_InventoryRefresh_PersistsNewNodesBeforeMemoryPromotionAndTriggersColdSweep(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
 	subMgr.Register(sub)
@@ -443,14 +443,13 @@ func TestScheduler_InventoryRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueu
 			}
 		},
 	}
-	coldQueue := &recordingColdNodeQueue{}
+	coldTrigger := &recordingColdNodeSweepTrigger{}
 	sched := NewSubscriptionScheduler(SchedulerConfig{
-		SubManager:       subMgr,
-		Pool:             pool,
-		Fetcher:          makeMockFetcher(body, nil),
-		InventoryStore:   inventoryStore,
-		ColdNodeQueue:    coldQueue,
-		ColdQueueMaxSize: 8,
+		SubManager:           subMgr,
+		Pool:                 pool,
+		Fetcher:              makeMockFetcher(body, nil),
+		InventoryStore:       inventoryStore,
+		ColdNodeSweepTrigger: coldTrigger,
 	})
 
 	sched.UpdateSubscription(sub)
@@ -484,15 +483,11 @@ func TestScheduler_InventoryRefresh_PersistsNewNodesBeforeMemoryPromotionAndQueu
 	if got := managedNodeCount(sub.ManagedNodes()); got != 0 {
 		t.Fatalf("new cold node must not be in active managed memory, got %d managed nodes", got)
 	}
-	if len(coldQueue.candidates) != 1 {
-		t.Fatalf("expected one queued cold check, got %d", len(coldQueue.candidates))
+	if len(coldTrigger.reasons) != 1 {
+		t.Fatalf("expected one cold sweep trigger, got %d", len(coldTrigger.reasons))
 	}
-	candidate := coldQueue.candidates[0]
-	if candidate.SubscriptionID != sub.ID || candidate.Hash != hash || string(candidate.RawOptions) != raw {
-		t.Fatalf("queued candidate: got %+v, want %s/%s", candidate, sub.ID, hash.Hex())
-	}
-	if !reflect.DeepEqual(candidate.Tags, []string{"cold-node"}) {
-		t.Fatalf("candidate tags: got %v, want [cold-node]", candidate.Tags)
+	if coldTrigger.reasons[0] != "subscription_refresh" {
+		t.Fatalf("cold sweep reason: got %q, want subscription_refresh", coldTrigger.reasons[0])
 	}
 }
 
@@ -527,14 +522,13 @@ func TestScheduler_InventoryRefresh_OldViewMergesInventoryAndLiveWithLiveWinning
 			{SubscriptionID: sub.ID, NodeHash: removedColdHash.Hex(), Tags: []string{"removed-cold"}, Evicted: false},
 		},
 	}
-	coldQueue := &recordingColdNodeQueue{}
+	coldTrigger := &recordingColdNodeSweepTrigger{}
 	sched := NewSubscriptionScheduler(SchedulerConfig{
-		SubManager:       subMgr,
-		Pool:             pool,
-		Fetcher:          makeMockFetcher(makeSubscriptionJSON(rawLive, rawNewCold), nil),
-		InventoryStore:   inventoryStore,
-		ColdNodeQueue:    coldQueue,
-		ColdQueueMaxSize: 8,
+		SubManager:           subMgr,
+		Pool:                 pool,
+		Fetcher:              makeMockFetcher(makeSubscriptionJSON(rawLive, rawNewCold), nil),
+		InventoryStore:       inventoryStore,
+		ColdNodeSweepTrigger: coldTrigger,
 	})
 
 	sched.UpdateSubscription(sub)
@@ -569,8 +563,8 @@ func TestScheduler_InventoryRefresh_OldViewMergesInventoryAndLiveWithLiveWinning
 	if _, ok := sub.ManagedNodes().LoadNode(newColdHash); ok {
 		t.Fatal("new cold relation should not enter active managed memory before cold check")
 	}
-	if len(coldQueue.candidates) != 1 || coldQueue.candidates[0].Hash != newColdHash {
-		t.Fatalf("cold queue: got %+v, want new cold %s only", coldQueue.candidates, newColdHash.Hex())
+	if len(coldTrigger.reasons) != 1 || coldTrigger.reasons[0] != "subscription_refresh" {
+		t.Fatalf("cold sweep trigger: got %+v, want one subscription_refresh trigger", coldTrigger.reasons)
 	}
 }
 
@@ -634,14 +628,13 @@ func TestScheduler_InventoryRefresh_EvictedRelationNotRevived(t *testing.T) {
 			{SubscriptionID: sub.ID, NodeHash: hash.Hex(), Tags: []string{"old-evicted"}, Evicted: true},
 		},
 	}
-	coldQueue := &recordingColdNodeQueue{}
+	coldTrigger := &recordingColdNodeSweepTrigger{}
 	sched := NewSubscriptionScheduler(SchedulerConfig{
-		SubManager:       subMgr,
-		Pool:             pool,
-		Fetcher:          makeMockFetcher(makeSubscriptionJSON(raw), nil),
-		InventoryStore:   inventoryStore,
-		ColdNodeQueue:    coldQueue,
-		ColdQueueMaxSize: 8,
+		SubManager:           subMgr,
+		Pool:                 pool,
+		Fetcher:              makeMockFetcher(makeSubscriptionJSON(raw), nil),
+		InventoryStore:       inventoryStore,
+		ColdNodeSweepTrigger: coldTrigger,
 	})
 
 	sched.UpdateSubscription(sub)
@@ -652,8 +645,8 @@ func TestScheduler_InventoryRefresh_EvictedRelationNotRevived(t *testing.T) {
 	if got := managedNodeCount(sub.ManagedNodes()); got != 0 {
 		t.Fatalf("evicted relation should not enter active memory, got %d managed nodes", got)
 	}
-	if len(coldQueue.candidates) != 0 {
-		t.Fatalf("evicted relation should not queue cold check: %+v", coldQueue.candidates)
+	if len(coldTrigger.reasons) != 1 || coldTrigger.reasons[0] != "subscription_refresh" {
+		t.Fatalf("cold sweep trigger: got %+v, want one subscription_refresh trigger", coldTrigger.reasons)
 	}
 	if len(inventoryStore.replaceCalls) != 1 {
 		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))

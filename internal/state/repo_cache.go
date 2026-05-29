@@ -4,8 +4,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/Resinat/Resin/internal/model"
+	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/topology"
 )
 
 // CacheRepo wraps cache.db and provides batch read/write for weak-persist data.
@@ -326,6 +329,60 @@ func (r *CacheRepo) LoadSubscriptionNodes(subID string) ([]model.SubscriptionNod
 		result = append(result, sn)
 	}
 	return result, rows.Err()
+}
+
+// LoadDueColdNodeCandidates reads non-evicted subscription inventory rows whose
+// latency probe attempt is missing, zero, or older than the supplied interval.
+func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duration, limit int) ([]topology.ColdNodeCandidate, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	intervalNs := interval.Nanoseconds()
+	if intervalNs < 0 {
+		intervalNs = 0
+	}
+	thresholdNs := nowNs - intervalNs
+
+	rows, err := r.db.Query(`
+		SELECT sn.subscription_id, sn.node_hash, ns.raw_options_json, sn.tags_json
+		FROM subscription_nodes AS sn
+		JOIN nodes_static AS ns ON ns.hash = sn.node_hash
+		LEFT JOIN nodes_dynamic AS nd ON nd.hash = sn.node_hash
+		WHERE sn.evicted = 0
+		  AND (
+			nd.hash IS NULL
+			OR nd.last_latency_probe_attempt_ns = 0
+			OR nd.last_latency_probe_attempt_ns <= ?
+		  )
+		ORDER BY sn.subscription_id ASC, sn.node_hash ASC
+		LIMIT ?`, thresholdNs, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	candidates := make([]topology.ColdNodeCandidate, 0)
+	for rows.Next() {
+		var subID, hashHex, rawOptionsJSON, tagsJSON string
+		if err := rows.Scan(&subID, &hashHex, &rawOptionsJSON, &tagsJSON); err != nil {
+			return nil, err
+		}
+		hash, err := node.ParseHex(hashHex)
+		if err != nil {
+			return nil, fmt.Errorf("parse cold candidate hash %s: %w", hashHex, err)
+		}
+		tags, err := decodeStringSliceJSON(tagsJSON)
+		if err != nil {
+			return nil, fmt.Errorf("decode cold candidate tags_json for %s/%s: %w", subID, hashHex, err)
+		}
+		candidates = append(candidates, topology.ColdNodeCandidate{
+			SubscriptionID: subID,
+			Hash:           hash,
+			RawOptions:     json.RawMessage(rawOptionsJSON),
+			Tags:           tags,
+		})
+	}
+	return candidates, rows.Err()
 }
 
 // ReplaceSubscriptionRefresh atomically applies a DB-first refresh inventory diff.

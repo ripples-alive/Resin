@@ -35,9 +35,8 @@ type SubscriptionScheduler struct {
 	// subscription transitions from disabled to enabled.
 	onSubReenabledNode func(hash node.Hash)
 
-	inventoryStore   SubscriptionInventoryStore
-	coldNodeQueue    ColdNodeQueue
-	coldQueueMaxSize int
+	inventoryStore       SubscriptionInventoryStore
+	coldNodeSweepTrigger ColdNodeSweepTrigger
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -52,10 +51,10 @@ type ColdNodeCandidate struct {
 	Tags           []string
 }
 
-// ColdNodeQueue accepts bounded cold-node check work. Returning false means the
-// candidate was dropped because the queue is full or disabled.
-type ColdNodeQueue interface {
-	EnqueueColdNodeCheck(ColdNodeCandidate) bool
+// ColdNodeSweepTrigger requests a DB-backed cold-node sweep. Returning false
+// means the trigger was not accepted, for example because the runner is stopped.
+type ColdNodeSweepTrigger interface {
+	TriggerColdNodeSweep(reason string) bool
 }
 
 // SubscriptionInventoryStore persists the full DB-backed subscription inventory during
@@ -76,27 +75,25 @@ type SchedulerConfig struct {
 	// OnSubReenabledNode is fired after false->true enabled transition.
 	OnSubReenabledNode func(hash node.Hash)
 
-	InventoryStore   SubscriptionInventoryStore
-	ColdNodeQueue    ColdNodeQueue
-	ColdQueueMaxSize int
+	InventoryStore       SubscriptionInventoryStore
+	ColdNodeSweepTrigger ColdNodeSweepTrigger
 }
 
 // NewSubscriptionScheduler creates a new scheduler.
 func NewSubscriptionScheduler(cfg SchedulerConfig) *SubscriptionScheduler {
 	downloadCtx, cancelDownload := context.WithCancel(context.Background())
 	sched := &SubscriptionScheduler{
-		subManager:         cfg.SubManager,
-		pool:               cfg.Pool,
-		downloader:         cfg.Downloader,
-		downloadCtx:        downloadCtx,
-		cancelDownload:     cancelDownload,
-		onSubUpdated:       cfg.OnSubUpdated,
-		onSubRefreshState:  cfg.OnSubRefreshState,
-		onSubReenabledNode: cfg.OnSubReenabledNode,
-		inventoryStore:     cfg.InventoryStore,
-		coldNodeQueue:      cfg.ColdNodeQueue,
-		coldQueueMaxSize:   cfg.ColdQueueMaxSize,
-		stopCh:             make(chan struct{}),
+		subManager:           cfg.SubManager,
+		pool:                 cfg.Pool,
+		downloader:           cfg.Downloader,
+		downloadCtx:          downloadCtx,
+		cancelDownload:       cancelDownload,
+		onSubUpdated:         cfg.OnSubUpdated,
+		onSubRefreshState:    cfg.OnSubRefreshState,
+		onSubReenabledNode:   cfg.OnSubReenabledNode,
+		inventoryStore:       cfg.InventoryStore,
+		coldNodeSweepTrigger: cfg.ColdNodeSweepTrigger,
+		stopCh:               make(chan struct{}),
 	}
 	if cfg.Fetcher != nil {
 		sched.Fetcher = cfg.Fetcher
@@ -390,7 +387,6 @@ func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 	statics := make([]model.NodeStatic, 0, len(rawByHash))
 	upsertsByHash := make(map[node.Hash]model.SubscriptionNode)
 	deletes := make([]model.SubscriptionNodeKey, 0)
-	queued := make([]ColdNodeCandidate, 0)
 	nowForRows := time.Now().UnixNano()
 
 	newManagedNodes.RangeNodes(func(h node.Hash, managed subscription.ManagedNode) bool {
@@ -404,9 +400,6 @@ func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainInventoryLiveRelation(entry) {
 			activeNext.StoreNode(h, managed)
 			return true
-		}
-		if s.coldNodeQueue != nil && (s.coldQueueMaxSize <= 0 || len(queued) < s.coldQueueMaxSize) {
-			queued = append(queued, ColdNodeCandidate{SubscriptionID: sub.ID, Hash: h, RawOptions: append([]byte(nil), raw...), Tags: append([]string(nil), managed.Tags...)})
 		}
 		return true
 	})
@@ -476,8 +469,8 @@ func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 		return
 	}
 
-	for _, candidate := range queued {
-		s.coldNodeQueue.EnqueueColdNodeCheck(candidate)
+	if s.coldNodeSweepTrigger != nil {
+		s.coldNodeSweepTrigger.TriggerColdNodeSweep("subscription_refresh")
 	}
 	if s.onSubUpdated != nil {
 		s.onSubUpdated(sub)
