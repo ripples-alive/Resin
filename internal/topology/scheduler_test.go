@@ -55,6 +55,7 @@ type recordingSubscriptionInventoryStore struct {
 	loadRows []model.SubscriptionNode
 
 	replaceCalls []inventoryReplaceCall
+	onLoad       func(subID string)
 	onReplace    func()
 }
 
@@ -66,6 +67,9 @@ type inventoryReplaceCall struct {
 }
 
 func (s *recordingSubscriptionInventoryStore) LoadSubscriptionNodes(subID string) ([]model.SubscriptionNode, error) {
+	if s.onLoad != nil {
+		s.onLoad(subID)
+	}
 	out := make([]model.SubscriptionNode, 0, len(s.loadRows))
 	for _, row := range s.loadRows {
 		if row.SubscriptionID == subID {
@@ -754,6 +758,95 @@ func TestScheduler_InventoryRefresh_EvictedRelationNotRevived(t *testing.T) {
 	}
 	if !row.Evicted {
 		t.Fatalf("evicted relation was revived: %+v", row)
+	}
+}
+
+func TestScheduler_InventoryRefresh_IgnoresApplyAfterSubscriptionUnregistered(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"shadowsocks","tag":"deleted-live","server":"1.1.1.1","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	managed := subscription.NewManagedNodes()
+	managed.StoreNode(hash, subscription.ManagedNode{Tags: []string{"deleted-live"}})
+	sub.SwapManagedNodes(managed)
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+
+	inventoryStore := &recordingSubscriptionInventoryStore{
+		onLoad: func(string) {
+			sub.WithOpLock(func() {
+				pool.RemoveNodeFromSub(hash, sub.ID)
+				subMgr.Unregister(sub.ID)
+			})
+		},
+	}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:     subMgr,
+		Pool:           pool,
+		Fetcher:        makeMockFetcher(makeSubscriptionJSON(string(raw)), nil),
+		InventoryStore: inventoryStore,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	if subMgr.Lookup(sub.ID) != nil {
+		t.Fatal("subscription should remain unregistered after stale refresh")
+	}
+	if len(inventoryStore.replaceCalls) != 0 {
+		t.Fatalf("stale refresh for unregistered subscription must not write inventory: %+v", inventoryStore.replaceCalls)
+	}
+	if entry, ok := pool.GetEntry(hash); ok {
+		ids := entry.SubscriptionIDs()
+		for _, id := range ids {
+			if id == sub.ID {
+				t.Fatalf("stale refresh must not restore deleted subscription pool relation: %v", ids)
+			}
+		}
+	}
+}
+
+func TestScheduler_InventoryRefresh_PreservesConcurrentColdPromotion(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"shadowsocks","tag":"promoted-cold","server":"1.1.1.1","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	inventoryStore := &recordingSubscriptionInventoryStore{
+		onReplace: func() {
+			// Simulate a cold check promotion that completed after activeNext was
+			// computed from the old pool snapshot but before refresh apply removes
+			// current active relations.
+			sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"promoted-cold"}})
+			pool.AddNodeFromSub(hash, raw, sub.ID)
+		},
+	}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:     subMgr,
+		Pool:           pool,
+		Fetcher:        makeMockFetcher(makeSubscriptionJSON(string(raw)), nil),
+		InventoryStore: inventoryStore,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	managed, ok := sub.ManagedNodes().LoadNode(hash)
+	if !ok {
+		t.Fatal("refresh must preserve a concurrently promoted cold relation")
+	}
+	if managed.Evicted {
+		t.Fatal("concurrently promoted relation should remain active, not evicted")
+	}
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("pool should retain concurrently promoted relation")
+	}
+	ids := entry.SubscriptionIDs()
+	if !reflect.DeepEqual(ids, []string{sub.ID}) {
+		t.Fatalf("pool subscription refs: got %v, want [%s]", ids, sub.ID)
 	}
 }
 

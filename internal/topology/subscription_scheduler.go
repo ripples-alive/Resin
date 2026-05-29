@@ -435,7 +435,6 @@ func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 		return true
 	})
 
-	activeNext := subscription.NewManagedNodes()
 	statics := make([]model.NodeStatic, 0, len(rawByHash))
 	upsertsByHash := make(map[node.Hash]model.SubscriptionNode)
 	deletes := make([]model.SubscriptionNodeKey, 0)
@@ -446,13 +445,6 @@ func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 		statics = append(statics, model.NodeStatic{Hash: h.Hex(), RawOptions: append([]byte(nil), raw...), CreatedAtNs: nowForRows})
 		row := model.SubscriptionNode{SubscriptionID: sub.ID, NodeHash: h.Hex(), Tags: append([]string(nil), managed.Tags...), Evicted: managed.Evicted}
 		upsertsByHash[h] = row
-		if managed.Evicted {
-			return true
-		}
-		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainInventoryLiveRelation(entry) {
-			activeNext.StoreNode(h, managed)
-			return true
-		}
 		return true
 	})
 
@@ -472,6 +464,9 @@ func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 	applied := false
 	var replaceErr error
 	sub.WithOpLock(func() {
+		if s.subManager.Lookup(sub.ID) != sub {
+			return
+		}
 		if sub.ConfigVersion() != attemptConfigVersion {
 			return
 		}
@@ -483,6 +478,7 @@ func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 			return
 		}
 
+		activeNext := s.inventoryActiveNextLocked(newManagedNodes)
 		oldActive := sub.ManagedNodes()
 		oldActive.RangeNodes(func(h node.Hash, _ subscription.ManagedNode) bool {
 			if _, ok := activeNext.LoadNode(h); !ok {
@@ -527,6 +523,20 @@ func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 		updatedNs := sub.LastUpdatedNs.Load()
 		s.onSubRefreshState(sub.ID, checkedNs, &updatedNs, "")
 	}
+}
+
+func (s *SubscriptionScheduler) inventoryActiveNextLocked(newManagedNodes *subscription.ManagedNodes) *subscription.ManagedNodes {
+	activeNext := subscription.NewManagedNodes()
+	newManagedNodes.RangeNodes(func(h node.Hash, managed subscription.ManagedNode) bool {
+		if managed.Evicted {
+			return true
+		}
+		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainInventoryLiveRelation(entry) {
+			activeNext.StoreNode(h, managed)
+		}
+		return true
+	})
+	return activeNext
 }
 
 func (s *SubscriptionScheduler) shouldRetainInventoryLiveRelation(entry *node.NodeEntry) bool {
