@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/Resinat/Resin/internal/model"
@@ -20,6 +22,8 @@ type CacheRepo struct {
 func newCacheRepo(db *sql.DB) *CacheRepo {
 	return &CacheRepo{db: db}
 }
+
+const sqliteQueryParamBatchSize = 900
 
 // --- nodes_static ---
 
@@ -199,9 +203,181 @@ func (r *CacheRepo) LoadAllNodeLatency() ([]model.NodeLatency, error) {
 	return result, rows.Err()
 }
 
-// --- leases ---
+// LoadBootstrapActiveNodes reads only persisted active runtime node candidates.
+// It filters at the DB layer so active-only bootstrap does not materialize the
+// full inventory before pruning it in memory. The active predicate intentionally
+// does not require latency samples: enabled subscription + non-evicted relation
+// + closed circuit dynamic state are enough to restore the node and let outbound
+// construction decide final runtime eligibility.
+func (r *CacheRepo) LoadBootstrapActiveNodes(enabledSubscriptionIDs []string) ([]topology.BootstrapActiveNode, error) {
+	ids := compactUniqueStrings(enabledSubscriptionIDs)
+	if len(ids) == 0 {
+		return nil, nil
+	}
 
-// BulkUpsertLeases batch-inserts or updates lease records.
+	byHash := make(map[string]*topology.BootstrapActiveNode)
+	for start := 0; start < len(ids); start += sqliteQueryParamBatchSize {
+		end := start + sqliteQueryParamBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		if err := r.loadBootstrapActiveNodesBatch(ids[start:end], byHash); err != nil {
+			return nil, err
+		}
+	}
+
+	result := make([]topology.BootstrapActiveNode, 0, len(byHash))
+	for _, record := range byHash {
+		sort.SliceStable(record.Relations, func(i, j int) bool {
+			return record.Relations[i].SubscriptionID < record.Relations[j].SubscriptionID
+		})
+		result = append(result, *record)
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		leftRaw := string(result[i].Static.RawOptions)
+		rightRaw := string(result[j].Static.RawOptions)
+		if leftRaw == rightRaw {
+			return result[i].Static.Hash < result[j].Static.Hash
+		}
+		return leftRaw < rightRaw
+	})
+	return result, nil
+}
+
+func (r *CacheRepo) loadBootstrapActiveNodesBatch(ids []string, byHash map[string]*topology.BootstrapActiveNode) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+
+	rows, err := r.db.Query(`
+		SELECT ns.hash, ns.raw_options_json, ns.created_at_ns,
+		       nd.failure_count, nd.circuit_open_since, nd.egress_ip, nd.egress_ips_json, nd.egress_region,
+		       nd.egress_updated_at_ns, nd.last_latency_probe_attempt_ns,
+		       nd.last_authority_latency_probe_attempt_ns, nd.last_egress_update_attempt_ns,
+		       sn.subscription_id, sn.tags_json
+		FROM nodes_static AS ns
+		JOIN nodes_dynamic AS nd ON nd.hash = ns.hash
+		JOIN subscription_nodes AS sn ON sn.node_hash = ns.hash
+		WHERE sn.evicted = 0
+		  AND nd.circuit_open_since = 0
+		  AND sn.subscription_id IN (`+placeholders+`)
+		ORDER BY ns.raw_options_json ASC, ns.hash ASC, sn.subscription_id ASC`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var record topology.BootstrapActiveNode
+		var rawOptionsJSON, egressIPsJSON, tagsJSON string
+		var relationSubID string
+		if err := rows.Scan(
+			&record.Static.Hash,
+			&rawOptionsJSON,
+			&record.Static.CreatedAtNs,
+			&record.Dynamic.FailureCount,
+			&record.Dynamic.CircuitOpenSince,
+			&record.Dynamic.EgressIP,
+			&egressIPsJSON,
+			&record.Dynamic.EgressRegion,
+			&record.Dynamic.EgressUpdatedAtNs,
+			&record.Dynamic.LastLatencyProbeAttemptNs,
+			&record.Dynamic.LastAuthorityLatencyProbeAttemptNs,
+			&record.Dynamic.LastEgressUpdateAttemptNs,
+			&relationSubID,
+			&tagsJSON,
+		); err != nil {
+			return err
+		}
+		record.Static.RawOptions = json.RawMessage(rawOptionsJSON)
+		record.Dynamic.Hash = record.Static.Hash
+		egressIPs, err := decodeStringSliceJSON(egressIPsJSON)
+		if err != nil {
+			return fmt.Errorf("decode node dynamic egress_ips for %s: %w", record.Static.Hash, err)
+		}
+		tags, err := decodeStringSliceJSON(tagsJSON)
+		if err != nil {
+			return fmt.Errorf("decode subscription node tags_json for %s/%s: %w", relationSubID, record.Static.Hash, err)
+		}
+
+		existing, ok := byHash[record.Static.Hash]
+		if !ok {
+			record.Dynamic.EgressIPs = egressIPs
+			record.Relations = []model.SubscriptionNode{{
+				SubscriptionID: relationSubID,
+				NodeHash:       record.Static.Hash,
+				Tags:           tags,
+			}}
+			byHash[record.Static.Hash] = &record
+			continue
+		}
+		existing.Relations = append(existing.Relations, model.SubscriptionNode{
+			SubscriptionID: relationSubID,
+			NodeHash:       record.Static.Hash,
+			Tags:           tags,
+		})
+	}
+	return rows.Err()
+}
+
+// LoadNodeLatencyForHashes reads persisted latency rows for a bounded set of node hashes.
+func (r *CacheRepo) LoadNodeLatencyForHashes(hashes []string) ([]model.NodeLatency, error) {
+	hashes = compactUniqueStrings(hashes)
+	if len(hashes) == 0 {
+		return []model.NodeLatency{}, nil
+	}
+
+	result := make([]model.NodeLatency, 0)
+	for start := 0; start < len(hashes); start += sqliteQueryParamBatchSize {
+		end := start + sqliteQueryParamBatchSize
+		if end > len(hashes) {
+			end = len(hashes)
+		}
+		rows, err := r.loadNodeLatencyForHashBatch(hashes[start:end])
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, rows...)
+	}
+	return result, nil
+}
+
+func (r *CacheRepo) loadNodeLatencyForHashBatch(hashes []string) ([]model.NodeLatency, error) {
+	if len(hashes) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(hashes)), ",")
+	args := make([]any, 0, len(hashes))
+	for _, hash := range hashes {
+		args = append(args, hash)
+	}
+	rows, err := r.db.Query(`
+		SELECT node_hash, domain, ewma_ns, last_updated_ns
+		FROM node_latency
+		WHERE node_hash IN (`+placeholders+`)
+		ORDER BY node_hash ASC, last_updated_ns DESC, domain ASC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []model.NodeLatency
+	for rows.Next() {
+		var e model.NodeLatency
+		if err := rows.Scan(&e.NodeHash, &e.Domain, &e.EwmaNs, &e.LastUpdatedNs); err != nil {
+			return nil, err
+		}
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
+// --- leases ---
 func (r *CacheRepo) BulkUpsertLeases(leases []model.Lease) error {
 	return bulkExecRows(
 		r,
@@ -487,6 +663,24 @@ func bulkExecRows[T any](
 	return r.bulkExec(query, len(rows), func(stmt *sql.Stmt, i int) error {
 		return execFn(stmt, rows[i])
 	})
+}
+
+func compactUniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // FlushOps holds all upsert/delete slices for a single-transaction cache flush.

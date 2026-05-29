@@ -1138,10 +1138,14 @@ func restoreBootstrapNodeLatencies(
 	pool *topology.GlobalNodePool,
 	maxRegularEntries int,
 	latencyAuthorities []string,
+	latencies []model.NodeLatency,
 ) error {
-	latencies, err := engine.LoadAllNodeLatency()
-	if err != nil {
-		return fmt.Errorf("load node_latency: %w", err)
+	if latencies == nil {
+		var err error
+		latencies, err = engine.LoadAllNodeLatency()
+		if err != nil {
+			return fmt.Errorf("load node_latency: %w", err)
+		}
 	}
 
 	if maxRegularEntries <= 0 {
@@ -1222,33 +1226,6 @@ func restoreBootstrapNodeLatencies(
 	return nil
 }
 
-func activeOnlyBootstrapHashes(pool *topology.GlobalNodePool, subManager *topology.SubscriptionManager) []node.Hash {
-	if pool == nil || subManager == nil {
-		return nil
-	}
-	var hashes []node.Hash
-	pool.Range(func(hash node.Hash, entry *node.NodeEntry) bool {
-		if entry == nil || entry.IsCircuitOpen() {
-			return true
-		}
-		for _, subID := range entry.SubscriptionIDs() {
-			if sub := subManager.Lookup(subID); sub != nil && sub.Enabled() {
-				if mn, ok := sub.ManagedNodes().LoadNode(hash); ok && !mn.Evicted {
-					hashes = append(hashes, hash)
-					return true
-				}
-			}
-		}
-		return true
-	})
-	sort.Slice(hashes, func(i, j int) bool {
-		left, _ := pool.GetEntry(hashes[i])
-		right, _ := pool.GetEntry(hashes[j])
-		return string(left.RawOptions) < string(right.RawOptions)
-	})
-	return hashes
-}
-
 func pruneColdBootstrapNodes(pool *topology.GlobalNodePool, subManager *topology.SubscriptionManager) {
 	if pool == nil || subManager == nil {
 		return
@@ -1292,8 +1269,103 @@ func pruneColdBootstrapNodes(pool *topology.GlobalNodePool, subManager *topology
 	})
 }
 
+func enabledSubscriptionIDs(subManager *topology.SubscriptionManager) []string {
+	if subManager == nil {
+		return nil
+	}
+	ids := make([]string, 0)
+	subManager.Range(func(id string, sub *subscription.Subscription) bool {
+		if sub != nil && sub.Enabled() {
+			ids = append(ids, id)
+		}
+		return true
+	})
+	sort.Strings(ids)
+	return ids
+}
+
+func loadActiveOnlyBootstrapNodes(
+	engine *state.StateEngine,
+	pool *topology.GlobalNodePool,
+	subManager *topology.SubscriptionManager,
+	envCfg *config.EnvConfig,
+	latencyAuthorities []string,
+) ([]node.Hash, error) {
+	records, err := engine.LoadBootstrapActiveNodes(enabledSubscriptionIDs(subManager))
+	if err != nil {
+		return nil, fmt.Errorf("load active bootstrap nodes: %w", err)
+	}
+
+	hashes := make([]node.Hash, 0, len(records))
+	hashHexes := make([]string, 0, len(records))
+	for _, record := range records {
+		hash, err := node.ParseHex(record.Static.Hash)
+		if err != nil {
+			log.Printf("[bootstrap] skip active node %s: %v", record.Static.Hash, err)
+			continue
+		}
+		entry := &node.NodeEntry{
+			Hash:       hash,
+			RawOptions: append(json.RawMessage(nil), record.Static.RawOptions...),
+			CreatedAt:  time.Unix(0, record.Static.CreatedAtNs),
+		}
+		entry.LatencyTable = node.NewLatencyTable(envCfg.MaxLatencyTableEntries)
+		entry.FailureCount.Store(int32(record.Dynamic.FailureCount))
+		entry.CircuitOpenSince.Store(record.Dynamic.CircuitOpenSince)
+		entry.LastLatencyProbeAttempt.Store(record.Dynamic.LastLatencyProbeAttemptNs)
+		entry.LastAuthorityLatencyProbeAttempt.Store(record.Dynamic.LastAuthorityLatencyProbeAttemptNs)
+		entry.LastEgressUpdateAttempt.Store(record.Dynamic.LastEgressUpdateAttemptNs)
+		if record.Dynamic.EgressIP != "" {
+			if ip, err := netip.ParseAddr(record.Dynamic.EgressIP); err == nil {
+				entry.SetEgressIP(ip)
+			}
+		}
+		if len(record.Dynamic.EgressIPs) > 0 {
+			entry.SetObservedEgressIPStrings(record.Dynamic.EgressIPs)
+		}
+		entry.SetEgressRegion(record.Dynamic.EgressRegion)
+		entry.LastEgressUpdate.Store(record.Dynamic.EgressUpdatedAtNs)
+
+		managedBySub := make(map[string]subscription.ManagedNode, len(record.Relations))
+		for _, relation := range record.Relations {
+			if relation.Evicted {
+				continue
+			}
+			if sub := subManager.Lookup(relation.SubscriptionID); sub != nil && sub.Enabled() {
+				entry.AddSubscriptionID(relation.SubscriptionID)
+				managedBySub[relation.SubscriptionID] = subscription.ManagedNode{
+					Tags: append([]string(nil), relation.Tags...),
+				}
+			}
+		}
+		if entry.SubscriptionCount() == 0 {
+			continue
+		}
+
+		pool.LoadNodeFromBootstrap(entry)
+		for subID, managed := range managedBySub {
+			if sub := subManager.Lookup(subID); sub != nil {
+				sub.ManagedNodes().StoreNode(hash, managed)
+			}
+		}
+		hashes = append(hashes, hash)
+		hashHexes = append(hashHexes, record.Static.Hash)
+	}
+
+	latencies, err := engine.LoadNodeLatencyForHashes(hashHexes)
+	if err != nil {
+		return nil, fmt.Errorf("load active bootstrap latencies: %w", err)
+	}
+	if err := restoreBootstrapNodeLatencies(engine, pool, envCfg.MaxLatencyTableEntries, latencyAuthorities, latencies); err != nil {
+		return nil, err
+	}
+	log.Printf("Loaded %d active bootstrap nodes from cache.db", len(hashes))
+	return hashes, nil
+}
+
 // bootstrapNodes loads cached node data from persistence for bootstrap recovery.
-// Steps: static nodes → subscription bindings → dynamic state → latency tables.
+// In active-only mode, DB filtering restores only persisted active candidates;
+// legacy mode restores the full cache inventory before outbound warmup.
 func bootstrapNodes(
 	engine *state.StateEngine,
 	pool *topology.GlobalNodePool,
@@ -1302,6 +1374,16 @@ func bootstrapNodes(
 	envCfg *config.EnvConfig,
 	latencyAuthorities []string,
 ) error {
+	if envCfg.ActiveOnlyRuntime {
+		hashes, err := loadActiveOnlyBootstrapNodes(engine, pool, subManager, envCfg, latencyAuthorities)
+		if err != nil {
+			return err
+		}
+		warmupBootstrapOutbounds(hashes, outboundMgr)
+		pruneColdBootstrapNodes(pool, subManager)
+		return nil
+	}
+
 	hashes, err := loadBootstrapNodeStatics(engine, pool, envCfg)
 	if err != nil {
 		return err
@@ -1318,15 +1400,10 @@ func bootstrapNodes(
 		pool,
 		envCfg.MaxLatencyTableEntries,
 		latencyAuthorities,
+		nil,
 	); err != nil {
 		return err
 	}
-	if envCfg.ActiveOnlyRuntime {
-		hashes = activeOnlyBootstrapHashes(pool, subManager)
-	}
 	warmupBootstrapOutbounds(hashes, outboundMgr)
-	if envCfg.ActiveOnlyRuntime {
-		pruneColdBootstrapNodes(pool, subManager)
-	}
 	return nil
 }

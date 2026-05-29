@@ -51,6 +51,14 @@ type ColdNodeCandidate struct {
 	Tags           []string
 }
 
+// BootstrapActiveNode is a DB-filtered active runtime node restored at active-only
+// bootstrap without loading the full cold inventory into memory.
+type BootstrapActiveNode struct {
+	Static    model.NodeStatic
+	Dynamic   model.NodeDynamic
+	Relations []model.SubscriptionNode
+}
+
 // ColdNodeSweepTrigger requests a DB-backed cold-node sweep. Returning false
 // means the trigger was not accepted, for example because the runner is stopped.
 type ColdNodeSweepTrigger interface {

@@ -369,6 +369,69 @@ func TestCacheRepo_LoadDueColdNodeCandidates_FiltersOrdersAndLimits(t *testing.T
 	}
 }
 
+func TestCacheRepo_LoadBootstrapActiveNodes_FiltersAtDBAndGroupsRelations(t *testing.T) {
+	repo := newTestCacheRepo(t)
+	nowNs := int64(20_000)
+
+	rawActive := json.RawMessage(`{"type":"stub","server":"198.51.100.20","server_port":443}`)
+	rawNoLatency := json.RawMessage(`{"type":"stub","server":"198.51.100.21","server_port":443}`)
+	rawDisabled := json.RawMessage(`{"type":"stub","server":"198.51.100.22","server_port":443}`)
+	rawEvicted := json.RawMessage(`{"type":"stub","server":"198.51.100.23","server_port":443}`)
+	rawCircuitOpen := json.RawMessage(`{"type":"stub","server":"198.51.100.24","server_port":443}`)
+	rawMissingDynamic := json.RawMessage(`{"type":"stub","server":"198.51.100.25","server_port":443}`)
+	raws := []json.RawMessage{rawActive, rawNoLatency, rawDisabled, rawEvicted, rawCircuitOpen, rawMissingDynamic}
+	hashes := make(map[string]string, len(raws))
+	var statics []model.NodeStatic
+	for _, raw := range raws {
+		hashHex := node.HashFromRawOptions(raw).Hex()
+		hashes[string(raw)] = hashHex
+		statics = append(statics, model.NodeStatic{Hash: hashHex, RawOptions: raw, CreatedAtNs: nowNs})
+	}
+	if err := repo.BulkUpsertNodesStatic(statics); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := repo.BulkUpsertNodesDynamic([]model.NodeDynamic{
+		{Hash: hashes[string(rawActive)], CircuitOpenSince: 0, EgressIP: "203.0.113.10", EgressIPs: []string{"203.0.113.10"}, EgressRegion: "sg", LastLatencyProbeAttemptNs: nowNs - 100},
+		{Hash: hashes[string(rawNoLatency)], CircuitOpenSince: 0},
+		{Hash: hashes[string(rawDisabled)], CircuitOpenSince: 0},
+		{Hash: hashes[string(rawEvicted)], CircuitOpenSince: 0},
+		{Hash: hashes[string(rawCircuitOpen)], CircuitOpenSince: nowNs - 1},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
+	if err := repo.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{SubscriptionID: "sub-a", NodeHash: hashes[string(rawActive)], Tags: []string{"a"}},
+		{SubscriptionID: "sub-b", NodeHash: hashes[string(rawActive)], Tags: []string{"b"}},
+		{SubscriptionID: "sub-a", NodeHash: hashes[string(rawNoLatency)], Tags: []string{"no-latency"}},
+		{SubscriptionID: "sub-disabled", NodeHash: hashes[string(rawDisabled)], Tags: []string{"disabled"}},
+		{SubscriptionID: "sub-a", NodeHash: hashes[string(rawEvicted)], Tags: []string{"evicted"}, Evicted: true},
+		{SubscriptionID: "sub-a", NodeHash: hashes[string(rawCircuitOpen)], Tags: []string{"open"}},
+		{SubscriptionID: "sub-a", NodeHash: hashes[string(rawMissingDynamic)], Tags: []string{"missing-dynamic"}},
+	}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	got, err := repo.LoadBootstrapActiveNodes([]string{"sub-b", "sub-a", "sub-a", ""})
+	if err != nil {
+		t.Fatalf("LoadBootstrapActiveNodes: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("active bootstrap nodes: got %d, want 2: %+v", len(got), got)
+	}
+	if got[0].Static.Hash != hashes[string(rawActive)] {
+		t.Fatalf("first active hash: got %s, want %s", got[0].Static.Hash, hashes[string(rawActive)])
+	}
+	if got[0].Dynamic.EgressRegion != "sg" || !reflect.DeepEqual(got[0].Dynamic.EgressIPs, []string{"203.0.113.10"}) {
+		t.Fatalf("active dynamic state not decoded: %+v", got[0].Dynamic)
+	}
+	if len(got[0].Relations) != 2 || got[0].Relations[0].SubscriptionID != "sub-a" || got[0].Relations[1].SubscriptionID != "sub-b" {
+		t.Fatalf("active relations not grouped/sorted: %+v", got[0].Relations)
+	}
+	if got[1].Static.Hash != hashes[string(rawNoLatency)] {
+		t.Fatalf("second active hash: got %s, want no-latency %s", got[1].Static.Hash, hashes[string(rawNoLatency)])
+	}
+}
+
 // --- empty bulk operations ---
 
 func TestCacheRepo_BulkEmpty(t *testing.T) {
