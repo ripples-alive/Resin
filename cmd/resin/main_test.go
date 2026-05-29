@@ -1357,6 +1357,84 @@ func TestColdSubscriptionNodeCheckQueue_PreservesCandidateRelations(t *testing.T
 	}
 }
 
+func TestColdSubscriptionNodeCheck_DoesNotOverwriteExistingRealEntry(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const (
+		subLive = "sub-cold-existing-live"
+		subCold = "sub-cold-existing-promote"
+	)
+	now := time.Now().UnixNano()
+	for _, subID := range []string{subLive, subCold} {
+		if err := engine.UpsertSubscription(model.Subscription{
+			ID:               subID,
+			Name:             subID,
+			URL:              "https://example.com/" + subID,
+			UpdateIntervalNs: int64(30 * time.Minute),
+			Enabled:          true,
+			CreatedAtNs:      now,
+			UpdatedAtNs:      now,
+		}); err != nil {
+			t.Fatalf("UpsertSubscription(%s): %v", subID, err)
+		}
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.93","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	pool.AddNodeFromSub(hash, raw, subLive)
+	if sub := subManager.Lookup(subLive); sub != nil {
+		sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"live"}})
+	}
+	before, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("test setup expected existing live entry")
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: subCold,
+		NodeHash:       hash.Hex(),
+		Tags:           []string{"cold"},
+	}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	latency := 25 * time.Millisecond
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
+		pool.RecordResult(hash, true)
+		pool.RecordLatency(hash, "example.com", &latency)
+		return nil
+	})
+	checker.Check(topology.ColdNodeCandidate{
+		SubscriptionID: subCold,
+		Hash:           hash,
+		RawOptions:     raw,
+		Tags:           []string{"cold"},
+	})
+
+	after, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("cold check should preserve existing live entry")
+	}
+	if after != before {
+		t.Fatal("cold check should attach transient to existing entry instead of replacing it")
+	}
+	ids := after.SubscriptionIDs()
+	sort.Strings(ids)
+	want := []string{subLive, subCold}
+	if !reflect.DeepEqual(ids, want) {
+		t.Fatalf("subscriptions after cold check: got %v, want %v", ids, want)
+	}
+}
+
 func TestColdSubscriptionNodeCheck_DoesNotRestoreStaleDeletedRelation(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {

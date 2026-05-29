@@ -620,13 +620,12 @@ func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeC
 	}
 	createdAt := time.Now()
 	checkStartedNs := createdAt.UnixNano()
-	entry := node.NewNodeEntry(candidate.Hash, append(json.RawMessage(nil), candidate.RawOptions...), createdAt, 16)
 	// The cold sweep needs a pool entry so existing outbound/probe plumbing can
 	// operate, but this is not yet an active subscription relation. Keep a
-	// probe-only sentinel reference and remove it before returning.
-	entry.AddSubscriptionID(topology.ColdCheckTransientSubscriptionID)
-	entry.CircuitOpenSince.Store(createdAt.UnixNano())
-	c.pool.LoadNodeFromBootstrap(entry)
+	// probe-only sentinel reference and remove it before returning. If another
+	// real relation already owns the hash, attach the sentinel without replacing
+	// its runtime state/outbound/latency table.
+	c.pool.LoadOrAttachColdCheckTransientNode(candidate.Hash, append(json.RawMessage(nil), candidate.RawOptions...))
 
 	if c.outbound != nil {
 		c.outbound.EnsureNodeOutbound(candidate.Hash)

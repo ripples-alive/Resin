@@ -184,6 +184,28 @@ func (p *GlobalNodePool) LoadNodeFromBootstrap(entry *node.NodeEntry) {
 	p.nodes.Store(entry.Hash, entry)
 }
 
+// LoadOrAttachColdCheckTransientNode creates a probe-only cold-check entry when
+// absent, or attaches the transient relation to the existing entry without
+// replacing its runtime state. No dirty-marks or platform notifications are
+// emitted for the private transient relation.
+func (p *GlobalNodePool) LoadOrAttachColdCheckTransientNode(hash node.Hash, rawOpts json.RawMessage) *node.NodeEntry {
+	if p == nil {
+		return nil
+	}
+	createdAt := time.Now()
+	var current *node.NodeEntry
+	p.nodes.Compute(hash, func(entry *node.NodeEntry, loaded bool) (*node.NodeEntry, xsync.ComputeOp) {
+		if !loaded || entry == nil {
+			entry = node.NewNodeEntry(hash, rawOpts, createdAt, p.maxLatencyTableEntries)
+			entry.CircuitOpenSince.Store(createdAt.UnixNano())
+		}
+		entry.AddSubscriptionID(ColdCheckTransientSubscriptionID)
+		current = entry
+		return entry, xsync.UpdateOp
+	})
+	return current
+}
+
 // RegisterPlatform adds a platform to receive dirty notifications.
 func (p *GlobalNodePool) RegisterPlatform(plat *platform.Platform) {
 	p.platMu.Lock()
