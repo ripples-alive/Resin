@@ -507,6 +507,18 @@ func (r *CacheRepo) LoadSubscriptionNodes(subID string) ([]model.SubscriptionNod
 	return result, rows.Err()
 }
 
+// IsColdNodeRelationCurrent reports whether the non-evicted subscription-node
+// relation is still present in the authoritative inventory.
+func (r *CacheRepo) IsColdNodeRelationCurrent(subID string, hash node.Hash) bool {
+	var exists int
+	err := r.db.QueryRow(
+		"SELECT 1 FROM subscription_nodes WHERE subscription_id = ? AND node_hash = ? AND evicted = 0 LIMIT 1",
+		subID,
+		hash.Hex(),
+	).Scan(&exists)
+	return err == nil
+}
+
 // LoadDueColdNodeCandidates reads node-scoped cold-check candidates whose
 // latency probe attempt is missing, zero, or older than the supplied interval.
 // Each candidate carries all non-evicted inventory relations for that node so a

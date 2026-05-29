@@ -1114,6 +1114,13 @@ func TestColdSubscriptionNodeCheck_PromotesOnLatencySuccessAndPersists(t *testin
 		RawOptions:     raw,
 		Tags:           []string{"cold-success"},
 	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: subID,
+		NodeHash:       hash.Hex(),
+		Tags:           []string{"cold-success"},
+	}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
 	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
 		pool.RecordResult(hash, true)
 		latency := 25 * time.Millisecond
@@ -1221,6 +1228,12 @@ func TestColdSubscriptionNodeCheck_PromotesAllCandidateRelationsOnLatencySuccess
 			{SubscriptionID: "sub-cold-b", Tags: []string{"b"}},
 		},
 	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{SubscriptionID: "sub-cold-a", NodeHash: hash.Hex(), Tags: []string{"a"}},
+		{SubscriptionID: "sub-cold-b", NodeHash: hash.Hex(), Tags: []string{"b"}},
+	}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
 	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
 		pool.RecordResult(hash, true)
 		latency := 25 * time.Millisecond
@@ -1262,6 +1275,147 @@ func TestColdSubscriptionNodeCheck_PromotesAllCandidateRelationsOnLatencySuccess
 	}
 	if len(subNodes) != 2 {
 		t.Fatalf("persisted relations: got %+v, want two", subNodes)
+	}
+}
+
+func TestColdSubscriptionNodeCheckQueue_PreservesCandidateRelations(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const (
+		subA = "sub-cold-queue-a"
+		subB = "sub-cold-queue-b"
+	)
+	now := time.Now().UnixNano()
+	for _, subID := range []string{subA, subB} {
+		if err := engine.UpsertSubscription(model.Subscription{
+			ID:               subID,
+			Name:             subID,
+			URL:              "https://example.com/" + subID,
+			UpdateIntervalNs: int64(30 * time.Minute),
+			Enabled:          true,
+			CreatedAtNs:      now,
+			UpdatedAtNs:      now,
+		}); err != nil {
+			t.Fatalf("UpsertSubscription(%s): %v", subID, err)
+		}
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.91","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{SubscriptionID: subA, NodeHash: hash.Hex(), Tags: []string{"a"}},
+		{SubscriptionID: subB, NodeHash: hash.Hex(), Tags: []string{"b"}},
+	}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+	latency := 25 * time.Millisecond
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
+		pool.RecordResult(hash, true)
+		pool.RecordLatency(hash, "example.com", &latency)
+		return nil
+	})
+	queue := newColdSubscriptionNodeCheckQueue(checker, 1, 1)
+	queue.Start()
+	t.Cleanup(queue.Stop)
+
+	completed := queue.CheckBatch(context.Background(), []topology.ColdNodeCandidate{{
+		SubscriptionID: subA,
+		Hash:           hash,
+		RawOptions:     raw,
+		Tags:           []string{"a"},
+		Relations: []topology.ColdNodeRelation{
+			{SubscriptionID: subA, Tags: []string{"a"}},
+			{SubscriptionID: subB, Tags: []string{"b"}},
+		},
+	}})
+	if completed != 1 {
+		t.Fatalf("completed checks: got %d, want 1", completed)
+	}
+
+	for subID, wantTags := range map[string][]string{subA: {"a"}, subB: {"b"}} {
+		sub := subManager.Lookup(subID)
+		if sub == nil {
+			t.Fatalf("subscription %s missing", subID)
+		}
+		managed, ok := sub.ManagedNodes().LoadNode(hash)
+		if !ok {
+			t.Fatalf("queued cold check should restore relation %s", subID)
+		}
+		if !reflect.DeepEqual(managed.Tags, wantTags) {
+			t.Fatalf("tags for %s: got %v, want %v", subID, managed.Tags, wantTags)
+		}
+	}
+}
+
+func TestColdSubscriptionNodeCheck_DoesNotRestoreStaleDeletedRelation(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-cold-stale-success"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "ColdStaleSuccess",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.92","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{{Hash: hash.Hex(), RawOptions: raw, CreatedAtNs: now}}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{SubscriptionID: subID, NodeHash: hash.Hex(), Tags: []string{"stale"}}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+	candidate := topology.ColdNodeCandidate{SubscriptionID: subID, Hash: hash, RawOptions: raw, Tags: []string{"stale"}}
+	if err := engine.ReplaceSubscriptionRefresh(subID, nil, nil, []model.SubscriptionNodeKey{{SubscriptionID: subID, NodeHash: hash.Hex()}}); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh delete: %v", err)
+	}
+
+	latency := 25 * time.Millisecond
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
+		pool.RecordResult(hash, true)
+		pool.RecordLatency(hash, "example.com", &latency)
+		return nil
+	})
+	checker.Check(candidate)
+
+	if sub := subManager.Lookup(subID); sub != nil {
+		if _, ok := sub.ManagedNodes().LoadNode(hash); ok {
+			t.Fatal("stale cold candidate should not restore deleted managed relation")
+		}
+	}
+	rows, err := engine.LoadSubscriptionNodes(subID)
+	if err != nil {
+		t.Fatalf("LoadSubscriptionNodes: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("stale cold candidate should not repersist deleted relation, got %+v", rows)
 	}
 }
 
@@ -1311,6 +1465,13 @@ func TestColdSubscriptionNodeCheck_LeavesLeaseDirtyForRegularFlush(t *testing.T)
 
 	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.78","server_port":443}`)
 	hash := node.HashFromRawOptions(raw)
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: subID,
+		NodeHash:       hash.Hex(),
+		Tags:           []string{"cold-leave-lease"},
+	}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
 	latency := 20 * time.Millisecond
 	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
 		pool.RecordResult(hash, true)

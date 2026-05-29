@@ -60,6 +60,25 @@ type ColdNodeRelation struct {
 	Tags           []string
 }
 
+func (c ColdNodeCandidate) Clone() ColdNodeCandidate {
+	clone := ColdNodeCandidate{
+		SubscriptionID: c.SubscriptionID,
+		Hash:           c.Hash,
+		RawOptions:     append([]byte(nil), c.RawOptions...),
+		Tags:           append([]string(nil), c.Tags...),
+	}
+	if len(c.Relations) > 0 {
+		clone.Relations = make([]ColdNodeRelation, 0, len(c.Relations))
+		for _, relation := range c.Relations {
+			clone.Relations = append(clone.Relations, ColdNodeRelation{
+				SubscriptionID: relation.SubscriptionID,
+				Tags:           append([]string(nil), relation.Tags...),
+			})
+		}
+	}
+	return clone
+}
+
 func (c ColdNodeCandidate) EffectiveRelations() []ColdNodeRelation {
 	if len(c.Relations) > 0 {
 		return c.Relations
@@ -89,6 +108,12 @@ type ColdNodeSweepTrigger interface {
 type SubscriptionInventoryStore interface {
 	LoadSubscriptionNodes(subID string) ([]model.SubscriptionNode, error)
 	ReplaceSubscriptionRefresh(subID string, statics []model.NodeStatic, upserts []model.SubscriptionNode, deletes []model.SubscriptionNodeKey) error
+}
+
+// ColdNodeRelationValidator checks whether a cold-check relation is still part
+// of the current authoritative subscription inventory just before promotion.
+type ColdNodeRelationValidator interface {
+	IsColdNodeRelationCurrent(subID string, hash node.Hash) bool
 }
 
 // SchedulerConfig configures the SubscriptionScheduler.

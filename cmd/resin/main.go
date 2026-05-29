@@ -542,11 +542,12 @@ func ensureDefaultAccountHeaderRule(engine *state.StateEngine) error {
 }
 
 type coldSubscriptionNodeChecker struct {
-	engine     *state.StateEngine
-	pool       *topology.GlobalNodePool
-	subManager *topology.SubscriptionManager
-	outbound   *outbound.OutboundManager
-	probe      func(node.Hash) error
+	engine            *state.StateEngine
+	pool              *topology.GlobalNodePool
+	subManager        *topology.SubscriptionManager
+	relationValidator topology.ColdNodeRelationValidator
+	outbound          *outbound.OutboundManager
+	probe             func(node.Hash) error
 }
 
 type coldNodeDirtyFlusher interface {
@@ -565,11 +566,12 @@ func newColdSubscriptionNodeChecker(
 	probe func(node.Hash) error,
 ) *coldSubscriptionNodeChecker {
 	return &coldSubscriptionNodeChecker{
-		engine:     engine,
-		pool:       pool,
-		subManager: subManager,
-		outbound:   outbound.NewOutboundManager(pool, builder),
-		probe:      probe,
+		engine:            engine,
+		pool:              pool,
+		subManager:        subManager,
+		relationValidator: engine,
+		outbound:          outbound.NewOutboundManager(pool, builder),
+		probe:             probe,
 	}
 }
 
@@ -636,14 +638,15 @@ func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeC
 	entry, ok := c.pool.GetEntry(candidate.Hash)
 	success := probeErr == nil && ok && entry.HasOutbound() && !entry.IsCircuitOpen() && entry.HasLatency()
 	if success {
+		restored := false
 		for _, relation := range candidate.EffectiveRelations() {
-			sub := c.subManager.Lookup(relation.SubscriptionID)
-			if sub == nil || !sub.Enabled() {
-				continue
+			if c.attachCurrentColdRelation(candidate, relation) {
+				restored = true
 			}
-			c.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, relation.SubscriptionID)
-			sub.ManagedNodes().StoreNode(candidate.Hash, subscription.ManagedNode{Tags: append([]string(nil), relation.Tags...)})
-			c.engine.MarkSubscriptionNode(relation.SubscriptionID, candidate.Hash.Hex())
+		}
+		if !restored {
+			c.removeTransientColdCheckEntry(candidate.Hash)
+			return nil
 		}
 		c.engine.MarkNodeStatic(candidate.Hash.Hex())
 		c.engine.MarkNodeDynamic(candidate.Hash.Hex())
@@ -659,6 +662,35 @@ func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeC
 		return func() { c.removeTransientColdCheckEntry(candidate.Hash) }
 	}
 	return nil
+}
+
+func (c *coldSubscriptionNodeChecker) attachCurrentColdRelation(candidate topology.ColdNodeCandidate, relation topology.ColdNodeRelation) bool {
+	if c == nil || c.subManager == nil || c.pool == nil || c.engine == nil {
+		return false
+	}
+	sub := c.subManager.Lookup(relation.SubscriptionID)
+	if sub == nil {
+		return false
+	}
+	attached := false
+	sub.WithOpLock(func() {
+		current := c.subManager.Lookup(relation.SubscriptionID)
+		if current == nil || current != sub || !current.Enabled() || !c.isCurrentColdRelation(relation.SubscriptionID, candidate.Hash) {
+			return
+		}
+		c.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, relation.SubscriptionID)
+		current.ManagedNodes().StoreNode(candidate.Hash, subscription.ManagedNode{Tags: append([]string(nil), relation.Tags...)})
+		c.engine.MarkSubscriptionNode(relation.SubscriptionID, candidate.Hash.Hex())
+		attached = true
+	})
+	return attached
+}
+
+func (c *coldSubscriptionNodeChecker) isCurrentColdRelation(subID string, hash node.Hash) bool {
+	if c == nil || c.relationValidator == nil {
+		return true
+	}
+	return c.relationValidator.IsColdNodeRelationCurrent(subID, hash)
 }
 
 func (c *coldSubscriptionNodeChecker) FlushColdNodeDirty() error {
@@ -774,12 +806,7 @@ func (q *coldSubscriptionNodeCheckQueue) CheckBatch(ctx context.Context, candida
 	queued := 0
 candidateLoop:
 	for _, candidate := range candidates {
-		work := topology.ColdNodeCandidate{
-			SubscriptionID: candidate.SubscriptionID,
-			Hash:           candidate.Hash,
-			RawOptions:     append([]byte(nil), candidate.RawOptions...),
-			Tags:           append([]string(nil), candidate.Tags...),
-		}
+		work := candidate.Clone()
 		select {
 		case <-ctx.Done():
 			break candidateLoop

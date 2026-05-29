@@ -25,23 +25,25 @@ type coldNodeBatchChecker interface {
 }
 
 type coldSubscriptionNodeSweepRunnerConfig struct {
-	store         coldNodeCandidateStore
-	checker       coldNodeChecker
-	pool          *topology.GlobalNodePool
-	subManager    *topology.SubscriptionManager
-	sweepInterval time.Duration
-	batchSize     int
-	now           func() time.Time
+	store             coldNodeCandidateStore
+	checker           coldNodeChecker
+	pool              *topology.GlobalNodePool
+	subManager        *topology.SubscriptionManager
+	relationValidator topology.ColdNodeRelationValidator
+	sweepInterval     time.Duration
+	batchSize         int
+	now               func() time.Time
 }
 
 type coldSubscriptionNodeSweepRunner struct {
-	store         coldNodeCandidateStore
-	checker       coldNodeChecker
-	pool          *topology.GlobalNodePool
-	subManager    *topology.SubscriptionManager
-	sweepInterval time.Duration
-	batchSize     int
-	now           func() time.Time
+	store             coldNodeCandidateStore
+	checker           coldNodeChecker
+	pool              *topology.GlobalNodePool
+	subManager        *topology.SubscriptionManager
+	relationValidator topology.ColdNodeRelationValidator
+	sweepInterval     time.Duration
+	batchSize         int
+	now               func() time.Time
 
 	triggerCh chan struct{}
 	stopCh    chan struct{}
@@ -64,16 +66,23 @@ func newColdSubscriptionNodeSweepRunner(cfg coldSubscriptionNodeSweepRunnerConfi
 	if now == nil {
 		now = time.Now
 	}
+	relationValidator := cfg.relationValidator
+	if relationValidator == nil {
+		if validator, ok := cfg.store.(topology.ColdNodeRelationValidator); ok {
+			relationValidator = validator
+		}
+	}
 	return &coldSubscriptionNodeSweepRunner{
-		store:         cfg.store,
-		checker:       cfg.checker,
-		pool:          cfg.pool,
-		subManager:    cfg.subManager,
-		sweepInterval: sweepInterval,
-		batchSize:     batchSize,
-		now:           now,
-		triggerCh:     make(chan struct{}, 1),
-		stopCh:        make(chan struct{}),
+		store:             cfg.store,
+		checker:           cfg.checker,
+		pool:              cfg.pool,
+		subManager:        cfg.subManager,
+		relationValidator: relationValidator,
+		sweepInterval:     sweepInterval,
+		batchSize:         batchSize,
+		now:               now,
+		triggerCh:         make(chan struct{}, 1),
+		stopCh:            make(chan struct{}),
 	}
 }
 
@@ -210,11 +219,15 @@ func (r *coldSubscriptionNodeSweepRunner) shouldSkipCandidate(candidate topology
 	if len(relations) == 0 {
 		return true
 	}
-	activeRelations := make([]topology.ColdNodeRelation, 0, len(relations))
+	type activeColdNodeRelation struct {
+		relation topology.ColdNodeRelation
+		sub      *subscription.Subscription
+	}
+	activeRelations := make([]activeColdNodeRelation, 0, len(relations))
 	for _, relation := range relations {
 		sub := r.subManager.Lookup(relation.SubscriptionID)
-		if sub != nil && sub.Enabled() {
-			activeRelations = append(activeRelations, relation)
+		if sub != nil && sub.Enabled() && r.isCurrentColdRelation(relation.SubscriptionID, candidate.Hash) {
+			activeRelations = append(activeRelations, activeColdNodeRelation{relation: relation, sub: sub})
 		}
 	}
 	if len(activeRelations) == 0 {
@@ -228,9 +241,8 @@ func (r *coldSubscriptionNodeSweepRunner) shouldSkipCandidate(candidate topology
 		return false
 	}
 	allRestored := true
-	for _, relation := range activeRelations {
-		sub := r.subManager.Lookup(relation.SubscriptionID)
-		if managed, ok := sub.ManagedNodes().LoadNode(candidate.Hash); !ok || managed.Evicted {
+	for _, active := range activeRelations {
+		if !r.currentColdRelationRestored(candidate, active.relation, active.sub) {
 			allRestored = false
 			break
 		}
@@ -238,12 +250,50 @@ func (r *coldSubscriptionNodeSweepRunner) shouldSkipCandidate(candidate topology
 	if allRestored {
 		return true
 	}
-	for _, relation := range activeRelations {
-		sub := r.subManager.Lookup(relation.SubscriptionID)
-		sub.ManagedNodes().StoreNode(candidate.Hash, subscription.ManagedNode{Tags: append([]string(nil), relation.Tags...)})
-		r.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, relation.SubscriptionID)
+	for _, active := range activeRelations {
+		r.attachCurrentColdRelation(candidate, active.relation, active.sub)
 	}
 	return true
+}
+
+func (r *coldSubscriptionNodeSweepRunner) currentColdRelationRestored(candidate topology.ColdNodeCandidate, relation topology.ColdNodeRelation, sub *subscription.Subscription) bool {
+	if sub == nil {
+		return false
+	}
+	restored := false
+	sub.WithOpLock(func() {
+		current := r.subManager.Lookup(relation.SubscriptionID)
+		if current == nil || current != sub || !current.Enabled() || !r.isCurrentColdRelation(relation.SubscriptionID, candidate.Hash) {
+			return
+		}
+		managed, ok := current.ManagedNodes().LoadNode(candidate.Hash)
+		restored = ok && !managed.Evicted
+	})
+	return restored
+}
+
+func (r *coldSubscriptionNodeSweepRunner) attachCurrentColdRelation(candidate topology.ColdNodeCandidate, relation topology.ColdNodeRelation, sub *subscription.Subscription) bool {
+	if sub == nil || r.pool == nil {
+		return false
+	}
+	attached := false
+	sub.WithOpLock(func() {
+		current := r.subManager.Lookup(relation.SubscriptionID)
+		if current == nil || current != sub || !current.Enabled() || !r.isCurrentColdRelation(relation.SubscriptionID, candidate.Hash) {
+			return
+		}
+		current.ManagedNodes().StoreNode(candidate.Hash, subscription.ManagedNode{Tags: append([]string(nil), relation.Tags...)})
+		r.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, relation.SubscriptionID)
+		attached = true
+	})
+	return attached
+}
+
+func (r *coldSubscriptionNodeSweepRunner) isCurrentColdRelation(subID string, hash node.Hash) bool {
+	if r == nil || r.relationValidator == nil {
+		return true
+	}
+	return r.relationValidator.IsColdNodeRelationCurrent(subID, hash)
 }
 
 type coldNodeCandidateKey struct {
