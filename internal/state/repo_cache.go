@@ -519,6 +519,38 @@ func (r *CacheRepo) IsColdNodeRelationCurrent(subID string, hash node.Hash) bool
 	return err == nil
 }
 
+// LoadCurrentColdNodeRelations returns all current non-evicted inventory
+// relations for a cold-check node. Promotion uses this fresh view instead of a
+// potentially stale sweep snapshot so in-flight subscription refreshes are not
+// left cold after the node proves healthy.
+func (r *CacheRepo) LoadCurrentColdNodeRelations(hash node.Hash) ([]topology.ColdNodeRelation, error) {
+	rows, err := r.db.Query(
+		"SELECT subscription_id, tags_json FROM subscription_nodes WHERE node_hash = ? AND evicted = 0 ORDER BY subscription_id ASC",
+		hash.Hex(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	relations := make([]topology.ColdNodeRelation, 0)
+	for rows.Next() {
+		var subID, tagsJSON string
+		if err := rows.Scan(&subID, &tagsJSON); err != nil {
+			return nil, err
+		}
+		tags, err := decodeStringSliceJSON(tagsJSON)
+		if err != nil {
+			return nil, fmt.Errorf("decode cold relation tags_json for %s/%s: %w", subID, hash.Hex(), err)
+		}
+		relations = append(relations, topology.ColdNodeRelation{
+			SubscriptionID: subID,
+			Tags:           append([]string(nil), tags...),
+		})
+	}
+	return relations, rows.Err()
+}
+
 // LoadDueColdNodeCandidates reads node-scoped cold-check candidates whose
 // latency probe attempt is missing, zero, or older than the supplied interval.
 // Each candidate carries all non-evicted inventory relations for that node so a

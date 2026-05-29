@@ -546,6 +546,7 @@ type coldSubscriptionNodeChecker struct {
 	pool              *topology.GlobalNodePool
 	subManager        *topology.SubscriptionManager
 	relationValidator topology.ColdNodeRelationValidator
+	relationStore     topology.ColdNodeRelationStore
 	outbound          *outbound.OutboundManager
 	probe             func(node.Hash) error
 }
@@ -570,6 +571,7 @@ func newColdSubscriptionNodeChecker(
 		pool:              pool,
 		subManager:        subManager,
 		relationValidator: engine,
+		relationStore:     engine,
 		outbound:          outbound.NewOutboundManager(pool, builder),
 		probe:             probe,
 	}
@@ -638,7 +640,7 @@ func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeC
 	success := probeErr == nil && ok && entry.HasOutbound() && !entry.IsCircuitOpen() && entry.HasLatency()
 	if success {
 		restored := false
-		for _, relation := range candidate.EffectiveRelations() {
+		for _, relation := range c.currentColdRelations(candidate) {
 			if c.attachCurrentColdRelation(candidate, relation) {
 				restored = true
 			}
@@ -661,6 +663,19 @@ func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeC
 		return func() { c.removeTransientColdCheckEntry(candidate.Hash) }
 	}
 	return nil
+}
+
+func (c *coldSubscriptionNodeChecker) currentColdRelations(candidate topology.ColdNodeCandidate) []topology.ColdNodeRelation {
+	relations := candidate.EffectiveRelations()
+	if c == nil || c.relationStore == nil {
+		return relations
+	}
+	current, err := c.relationStore.LoadCurrentColdNodeRelations(candidate.Hash)
+	if err != nil {
+		log.Printf("cold subscription node check: load current relations for %s: %v", candidate.Hash.Hex(), err)
+		return nil
+	}
+	return current
 }
 
 func (c *coldSubscriptionNodeChecker) attachCurrentColdRelation(candidate topology.ColdNodeCandidate, relation topology.ColdNodeRelation) bool {

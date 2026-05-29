@@ -116,6 +116,12 @@ type ColdNodeRelationValidator interface {
 	IsColdNodeRelationCurrent(subID string, hash node.Hash) bool
 }
 
+// ColdNodeRelationStore loads the current authoritative relation set for a
+// cold-check node immediately before promotion.
+type ColdNodeRelationStore interface {
+	LoadCurrentColdNodeRelations(hash node.Hash) ([]ColdNodeRelation, error)
+}
+
 // SchedulerConfig configures the SubscriptionScheduler.
 type SchedulerConfig struct {
 	SubManager        *SubscriptionManager
