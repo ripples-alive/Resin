@@ -155,7 +155,7 @@ func (r *coldSubscriptionNodeSweepRunner) runSweep(ctx context.Context) {
 
 		toCheck := make([]topology.ColdNodeCandidate, 0, r.batchSize)
 		for _, candidate := range candidates {
-			key := coldNodeCandidateKey{subscriptionID: candidate.SubscriptionID, hash: candidate.Hash}
+			key := coldNodeCandidateKey{hash: candidate.Hash}
 			if _, ok := skippedCandidates[key]; ok {
 				continue
 			}
@@ -206,8 +206,18 @@ func (r *coldSubscriptionNodeSweepRunner) shouldSkipCandidate(candidate topology
 	if r == nil || r.subManager == nil {
 		return false
 	}
-	sub := r.subManager.Lookup(candidate.SubscriptionID)
-	if sub == nil || !sub.Enabled() {
+	relations := candidate.EffectiveRelations()
+	if len(relations) == 0 {
+		return true
+	}
+	activeRelations := make([]topology.ColdNodeRelation, 0, len(relations))
+	for _, relation := range relations {
+		sub := r.subManager.Lookup(relation.SubscriptionID)
+		if sub != nil && sub.Enabled() {
+			activeRelations = append(activeRelations, relation)
+		}
+	}
+	if len(activeRelations) == 0 {
 		return true
 	}
 	if r.pool == nil {
@@ -217,17 +227,27 @@ func (r *coldSubscriptionNodeSweepRunner) shouldSkipCandidate(candidate topology
 	if !ok || entry == nil || entry.IsCircuitOpen() || !entry.HasOutbound() || !entry.HasLatency() {
 		return false
 	}
-	if managed, ok := sub.ManagedNodes().LoadNode(candidate.Hash); ok && !managed.Evicted {
+	allRestored := true
+	for _, relation := range activeRelations {
+		sub := r.subManager.Lookup(relation.SubscriptionID)
+		if managed, ok := sub.ManagedNodes().LoadNode(candidate.Hash); !ok || managed.Evicted {
+			allRestored = false
+			break
+		}
+	}
+	if allRestored {
 		return true
 	}
-	sub.ManagedNodes().StoreNode(candidate.Hash, subscription.ManagedNode{Tags: append([]string(nil), candidate.Tags...)})
-	r.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, candidate.SubscriptionID)
+	for _, relation := range activeRelations {
+		sub := r.subManager.Lookup(relation.SubscriptionID)
+		sub.ManagedNodes().StoreNode(candidate.Hash, subscription.ManagedNode{Tags: append([]string(nil), relation.Tags...)})
+		r.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, relation.SubscriptionID)
+	}
 	return true
 }
 
 type coldNodeCandidateKey struct {
-	subscriptionID string
-	hash           node.Hash
+	hash node.Hash
 }
 
 var _ topology.ColdNodeSweepTrigger = (*coldSubscriptionNodeSweepRunner)(nil)

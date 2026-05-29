@@ -53,8 +53,6 @@ const (
 
 	coldSubscriptionNodeSweepInterval  = 5 * time.Minute
 	coldSubscriptionNodeSweepBatchSize = 256
-
-	coldSubscriptionNodeTransientSubscriptionID = "__cold_check_transient__"
 )
 
 func main() {
@@ -624,7 +622,7 @@ func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeC
 	// The cold sweep needs a pool entry so existing outbound/probe plumbing can
 	// operate, but this is not yet an active subscription relation. Keep a
 	// probe-only sentinel reference and remove it before returning.
-	entry.AddSubscriptionID(coldSubscriptionNodeTransientSubscriptionID)
+	entry.AddSubscriptionID(topology.ColdCheckTransientSubscriptionID)
 	entry.CircuitOpenSince.Store(createdAt.UnixNano())
 	c.pool.LoadNodeFromBootstrap(entry)
 
@@ -638,13 +636,17 @@ func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeC
 	entry, ok := c.pool.GetEntry(candidate.Hash)
 	success := probeErr == nil && ok && entry.HasOutbound() && !entry.IsCircuitOpen() && entry.HasLatency()
 	if success {
-		c.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, candidate.SubscriptionID)
-		if sub := c.subManager.Lookup(candidate.SubscriptionID); sub != nil {
-			sub.ManagedNodes().StoreNode(candidate.Hash, subscription.ManagedNode{Tags: append([]string(nil), candidate.Tags...)})
+		for _, relation := range candidate.EffectiveRelations() {
+			sub := c.subManager.Lookup(relation.SubscriptionID)
+			if sub == nil || !sub.Enabled() {
+				continue
+			}
+			c.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, relation.SubscriptionID)
+			sub.ManagedNodes().StoreNode(candidate.Hash, subscription.ManagedNode{Tags: append([]string(nil), relation.Tags...)})
+			c.engine.MarkSubscriptionNode(relation.SubscriptionID, candidate.Hash.Hex())
 		}
 		c.engine.MarkNodeStatic(candidate.Hash.Hex())
 		c.engine.MarkNodeDynamic(candidate.Hash.Hex())
-		c.engine.MarkSubscriptionNode(candidate.SubscriptionID, candidate.Hash.Hex())
 		c.removeTransientColdCheckEntry(candidate.Hash)
 		return nil
 	}
@@ -673,7 +675,7 @@ func (c *coldSubscriptionNodeChecker) removeTransientColdCheckEntry(hash node.Ha
 	}
 	if entry.SubscriptionCount() == 1 {
 		ids := entry.SubscriptionIDs()
-		if len(ids) == 1 && ids[0] == coldSubscriptionNodeTransientSubscriptionID {
+		if len(ids) == 1 && ids[0] == topology.ColdCheckTransientSubscriptionID {
 			c.pool.DeleteNodeFromBootstrap(hash)
 			if c.outbound != nil {
 				c.outbound.RemoveNodeOutbound(entry)
@@ -684,7 +686,7 @@ func (c *coldSubscriptionNodeChecker) removeTransientColdCheckEntry(hash node.Ha
 			return
 		}
 	}
-	c.pool.RemoveNodeFromSub(hash, coldSubscriptionNodeTransientSubscriptionID)
+	c.pool.RemoveNodeFromSub(hash, topology.ColdCheckTransientSubscriptionID)
 }
 
 type coldSubscriptionNodeCheckQueue struct {

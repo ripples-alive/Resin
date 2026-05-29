@@ -49,6 +49,25 @@ type ColdNodeCandidate struct {
 	Hash           node.Hash
 	RawOptions     []byte
 	Tags           []string
+	Relations      []ColdNodeRelation
+}
+
+// ColdNodeRelation describes one real subscription relation for a cold-check
+// candidate. A node-scoped candidate can carry multiple enabled, non-evicted
+// relations for the same hash.
+type ColdNodeRelation struct {
+	SubscriptionID string
+	Tags           []string
+}
+
+func (c ColdNodeCandidate) EffectiveRelations() []ColdNodeRelation {
+	if len(c.Relations) > 0 {
+		return c.Relations
+	}
+	if c.SubscriptionID == "" {
+		return nil
+	}
+	return []ColdNodeRelation{{SubscriptionID: c.SubscriptionID, Tags: append([]string(nil), c.Tags...)}}
 }
 
 // BootstrapActiveNode is a DB-filtered active runtime node restored at active-only
@@ -416,11 +435,6 @@ func (s *SubscriptionScheduler) updateSubscriptionInventoryFirst(
 		if _, ok := upsertsByHash[h]; ok {
 			return true
 		}
-		if entry, ok := s.pool.GetEntry(h); ok && s.shouldRetainInventoryLiveRelation(entry) && !oldNode.Evicted {
-			activeNext.StoreNode(h, oldNode)
-			upsertsByHash[h] = model.SubscriptionNode{SubscriptionID: sub.ID, NodeHash: h.Hex(), Tags: append([]string(nil), oldNode.Tags...), Evicted: false}
-			return true
-		}
 		deletes = append(deletes, model.SubscriptionNodeKey{SubscriptionID: sub.ID, NodeHash: h.Hex()})
 		return true
 	})
@@ -494,8 +508,15 @@ func (s *SubscriptionScheduler) shouldRetainInventoryLiveRelation(entry *node.No
 	if entry == nil {
 		return false
 	}
-	return !entry.IsCircuitOpen() && entry.HasOutbound()
+	for _, subID := range entry.SubscriptionIDs() {
+		if subID != ColdCheckTransientSubscriptionID {
+			return true
+		}
+	}
+	return false
 }
+
+const ColdCheckTransientSubscriptionID = "__cold_check_transient__"
 
 // handleUpdateFailure applies a fetch/parse failure to subscription state.
 // It ignores stale failures from an outdated attempt (config-version guard +

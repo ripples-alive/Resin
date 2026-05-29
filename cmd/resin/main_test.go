@@ -1181,6 +1181,90 @@ func TestColdSubscriptionNodeCheck_PromotesOnLatencySuccessAndPersists(t *testin
 	}
 }
 
+func TestColdSubscriptionNodeCheck_PromotesAllCandidateRelationsOnLatencySuccess(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	now := time.Now().UnixNano()
+	for _, subID := range []string{"sub-cold-a", "sub-cold-b"} {
+		if err := engine.UpsertSubscription(model.Subscription{
+			ID:               subID,
+			Name:             subID,
+			URL:              "https://example.com/sub",
+			UpdateIntervalNs: int64(30 * time.Minute),
+			Enabled:          true,
+			CreatedAtNs:      now,
+			UpdatedAtNs:      now,
+		}); err != nil {
+			t.Fatalf("UpsertSubscription %s: %v", subID, err)
+		}
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.79","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	candidate := topology.ColdNodeCandidate{
+		SubscriptionID: "sub-cold-a",
+		Hash:           hash,
+		RawOptions:     raw,
+		Tags:           []string{"a"},
+		Relations: []topology.ColdNodeRelation{
+			{SubscriptionID: "sub-cold-a", Tags: []string{"a"}},
+			{SubscriptionID: "sub-cold-b", Tags: []string{"b"}},
+		},
+	}
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
+		pool.RecordResult(hash, true)
+		latency := 25 * time.Millisecond
+		pool.RecordLatency(hash, "example.com", &latency)
+		return nil
+	})
+
+	checker.Check(candidate)
+
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("successful cold check should promote node into memory")
+	}
+	ids := entry.SubscriptionIDs()
+	sort.Strings(ids)
+	if !reflect.DeepEqual(ids, []string{"sub-cold-a", "sub-cold-b"}) {
+		t.Fatalf("promoted subscription refs: got %v, want both real relations", ids)
+	}
+	for subID, wantTags := range map[string][]string{
+		"sub-cold-a": {"a"},
+		"sub-cold-b": {"b"},
+	} {
+		sub := subManager.Lookup(subID)
+		if sub == nil {
+			t.Fatalf("subscription %s missing", subID)
+		}
+		managed, ok := sub.ManagedNodes().LoadNode(hash)
+		if !ok {
+			t.Fatalf("successful cold check should add active relation for %s", subID)
+		}
+		if !reflect.DeepEqual(managed.Tags, wantTags) {
+			t.Fatalf("managed tags for %s: got %v, want %v", subID, managed.Tags, wantTags)
+		}
+	}
+
+	subNodes, err := engine.LoadAllSubscriptionNodes()
+	if err != nil {
+		t.Fatalf("LoadAllSubscriptionNodes: %v", err)
+	}
+	if len(subNodes) != 2 {
+		t.Fatalf("persisted relations: got %+v, want two", subNodes)
+	}
+}
+
 func TestColdSubscriptionNodeCheck_LeavesLeaseDirtyForRegularFlush(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
@@ -1726,7 +1810,7 @@ func TestColdSubscriptionNodeSweepRunner_DrainsDueDBBatchesUntilEmpty(t *testing
 	}
 }
 
-func TestColdSubscriptionNodeSweepRunner_AttachesAlreadyLiveDueRelationWithoutCheck(t *testing.T) {
+func TestColdSubscriptionNodeSweepRunner_AttachesAllAlreadyLiveDueRelationsWithoutCheck(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -1737,8 +1821,9 @@ func TestColdSubscriptionNodeSweepRunner_AttachesAlreadyLiveDueRelationWithoutCh
 	const (
 		subLive = "sub-live"
 		subDue  = "sub-due"
+		subPeer = "sub-peer"
 	)
-	for _, subID := range []string{subLive, subDue} {
+	for _, subID := range []string{subLive, subDue, subPeer} {
 		if err := engine.UpsertSubscription(model.Subscription{
 			ID:               subID,
 			Name:             subID,
@@ -1767,11 +1852,18 @@ func TestColdSubscriptionNodeSweepRunner_AttachesAlreadyLiveDueRelationWithoutCh
 	}}); err != nil {
 		t.Fatalf("BulkUpsertNodesStatic: %v", err)
 	}
-	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
-		SubscriptionID: subDue,
-		NodeHash:       hash.Hex(),
-		Tags:           []string{"due"},
-	}}); err != nil {
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{
+			SubscriptionID: subDue,
+			NodeHash:       hash.Hex(),
+			Tags:           []string{"due"},
+		},
+		{
+			SubscriptionID: subPeer,
+			NodeHash:       hash.Hex(),
+			Tags:           []string{"peer"},
+		},
+	}); err != nil {
 		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
 	}
 
@@ -1803,25 +1895,30 @@ func TestColdSubscriptionNodeSweepRunner_AttachesAlreadyLiveDueRelationWithoutCh
 	runner.runSweep(context.Background())
 
 	if got := checker.hashes(); len(got) != 0 {
-		t.Fatalf("already-live due relation should not be cold-checked, got %v", got)
+		t.Fatalf("already-live due relations should not be cold-checked, got %v", got)
 	}
-	dueSub := subManager.Lookup(subDue)
-	if dueSub == nil {
-		t.Fatalf("subscription %s missing", subDue)
-	}
-	managed, ok := dueSub.ManagedNodes().LoadNode(hash)
-	if !ok {
-		t.Fatal("already-live due relation should be attached to active managed memory")
-	}
-	if !reflect.DeepEqual(managed.Tags, []string{"due"}) {
-		t.Fatalf("attached tags: got %v, want [due]", managed.Tags)
+	for subID, wantTags := range map[string][]string{
+		subDue:  {"due"},
+		subPeer: {"peer"},
+	} {
+		dueSub := subManager.Lookup(subID)
+		if dueSub == nil {
+			t.Fatalf("subscription %s missing", subID)
+		}
+		managed, ok := dueSub.ManagedNodes().LoadNode(hash)
+		if !ok {
+			t.Fatalf("already-live due relation %s should be attached to active managed memory", subID)
+		}
+		if !reflect.DeepEqual(managed.Tags, wantTags) {
+			t.Fatalf("attached tags for %s: got %v, want %v", subID, managed.Tags, wantTags)
+		}
 	}
 	entry, ok = pool.GetEntry(hash)
 	if !ok {
 		t.Fatal("live node should stay in pool")
 	}
-	if got := entry.SubscriptionCount(); got != 2 {
-		t.Fatalf("subscription count: got %d, want 2", got)
+	if got := entry.SubscriptionCount(); got != 3 {
+		t.Fatalf("subscription count: got %d, want 3", got)
 	}
 }
 

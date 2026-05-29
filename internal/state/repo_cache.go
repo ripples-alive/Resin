@@ -507,8 +507,10 @@ func (r *CacheRepo) LoadSubscriptionNodes(subID string) ([]model.SubscriptionNod
 	return result, rows.Err()
 }
 
-// LoadDueColdNodeCandidates reads non-evicted subscription inventory rows whose
+// LoadDueColdNodeCandidates reads node-scoped cold-check candidates whose
 // latency probe attempt is missing, zero, or older than the supplied interval.
+// Each candidate carries all non-evicted inventory relations for that node so a
+// successful cold check can restore the full node relationship set atomically.
 func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duration, limit int) ([]topology.ColdNodeCandidate, error) {
 	if limit <= 0 {
 		return nil, nil
@@ -520,42 +522,59 @@ func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duratio
 	thresholdNs := nowNs - intervalNs
 
 	rows, err := r.db.Query(`
-		SELECT sn.subscription_id, sn.node_hash, ns.raw_options_json, sn.tags_json
-		FROM subscription_nodes AS sn
-		JOIN nodes_static AS ns ON ns.hash = sn.node_hash
-		LEFT JOIN nodes_dynamic AS nd ON nd.hash = sn.node_hash
-		WHERE sn.evicted = 0
-		  AND (
-			nd.hash IS NULL
-			OR nd.last_latency_probe_attempt_ns = 0
-			OR nd.last_latency_probe_attempt_ns <= ?
-		  )
-		ORDER BY sn.subscription_id ASC, sn.node_hash ASC
-		LIMIT ?`, thresholdNs, limit)
+		SELECT due.node_hash, ns.raw_options_json, rel.subscription_id, rel.tags_json
+		FROM (
+			SELECT sn.node_hash, MIN(sn.subscription_id) AS first_subscription_id
+			FROM subscription_nodes AS sn
+			JOIN nodes_static AS ns ON ns.hash = sn.node_hash
+			LEFT JOIN nodes_dynamic AS nd ON nd.hash = sn.node_hash
+			WHERE sn.evicted = 0
+			  AND (
+				nd.hash IS NULL
+				OR nd.last_latency_probe_attempt_ns = 0
+				OR nd.last_latency_probe_attempt_ns <= ?
+			  )
+			GROUP BY sn.node_hash
+			ORDER BY first_subscription_id ASC, sn.node_hash ASC
+			LIMIT ?
+		) AS due
+		JOIN nodes_static AS ns ON ns.hash = due.node_hash
+		JOIN subscription_nodes AS rel ON rel.node_hash = due.node_hash AND rel.evicted = 0
+		ORDER BY due.first_subscription_id ASC, due.node_hash ASC, rel.subscription_id ASC`, thresholdNs, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
 	candidates := make([]topology.ColdNodeCandidate, 0)
+	indexByHash := make(map[string]int)
 	for rows.Next() {
-		var subID, hashHex, rawOptionsJSON, tagsJSON string
-		if err := rows.Scan(&subID, &hashHex, &rawOptionsJSON, &tagsJSON); err != nil {
+		var hashHex, rawOptionsJSON, subID, tagsJSON string
+		if err := rows.Scan(&hashHex, &rawOptionsJSON, &subID, &tagsJSON); err != nil {
 			return nil, err
-		}
-		hash, err := node.ParseHex(hashHex)
-		if err != nil {
-			return nil, fmt.Errorf("parse cold candidate hash %s: %w", hashHex, err)
 		}
 		tags, err := decodeStringSliceJSON(tagsJSON)
 		if err != nil {
 			return nil, fmt.Errorf("decode cold candidate tags_json for %s/%s: %w", subID, hashHex, err)
 		}
-		candidates = append(candidates, topology.ColdNodeCandidate{
+		idx, ok := indexByHash[hashHex]
+		if !ok {
+			hash, err := node.ParseHex(hashHex)
+			if err != nil {
+				return nil, fmt.Errorf("parse cold candidate hash %s: %w", hashHex, err)
+			}
+			idx = len(candidates)
+			indexByHash[hashHex] = idx
+			candidates = append(candidates, topology.ColdNodeCandidate{
+				SubscriptionID: subID,
+				Hash:           hash,
+				RawOptions:     json.RawMessage(rawOptionsJSON),
+				Tags:           append([]string(nil), tags...),
+			})
+		}
+		candidates[idx].Relations = append(candidates[idx].Relations, topology.ColdNodeRelation{
 			SubscriptionID: subID,
-			Hash:           hash,
-			RawOptions:     json.RawMessage(rawOptionsJSON),
-			Tags:           tags,
+			Tags:           append([]string(nil), tags...),
 		})
 	}
 	return candidates, rows.Err()

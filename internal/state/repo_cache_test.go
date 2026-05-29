@@ -9,6 +9,7 @@ import (
 
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/topology"
 )
 
 func newTestCacheRepo(t *testing.T) *CacheRepo {
@@ -294,8 +295,12 @@ func TestCacheRepo_LoadDueColdNodeCandidates_FiltersOrdersAndLimits(t *testing.T
 	var subNodes []model.SubscriptionNode
 	var dynamics []model.NodeDynamic
 	dueByKey := make(map[string]seedNode)
+	var sharedDueHash node.Hash
 	for _, seed := range seeds {
 		hash := node.HashFromRawOptions(seed.raw)
+		if seed.subID == "sub-b" {
+			sharedDueHash = hash
+		}
 		statics = append(statics, model.NodeStatic{Hash: hash.Hex(), RawOptions: seed.raw, CreatedAtNs: nowNs - 1_000})
 		subNodes = append(subNodes, model.SubscriptionNode{
 			SubscriptionID: seed.subID,
@@ -310,6 +315,11 @@ func TestCacheRepo_LoadDueColdNodeCandidates_FiltersOrdersAndLimits(t *testing.T
 			dueByKey[seed.subID+"/"+hash.Hex()] = seed
 		}
 	}
+	subNodes = append(subNodes, model.SubscriptionNode{
+		SubscriptionID: "sub-c",
+		NodeHash:       sharedDueHash.Hex(),
+		Tags:           []string{"shared-due"},
+	})
 	if err := repo.BulkUpsertNodesStatic(statics); err != nil {
 		t.Fatalf("BulkUpsertNodesStatic: %v", err)
 	}
@@ -366,6 +376,19 @@ func TestCacheRepo_LoadDueColdNodeCandidates_FiltersOrdersAndLimits(t *testing.T
 		if key != wantKeys[i] {
 			t.Fatalf("full candidate %d key: got %s, want %s", i, key, wantKeys[i])
 		}
+	}
+	var sharedCandidate *topology.ColdNodeCandidate
+	for i := range got {
+		if got[i].Hash == sharedDueHash {
+			sharedCandidate = &got[i]
+			break
+		}
+	}
+	if sharedCandidate == nil {
+		t.Fatalf("shared due candidate %s missing from %+v", sharedDueHash.Hex(), got)
+	}
+	if len(sharedCandidate.Relations) != 2 || sharedCandidate.Relations[0].SubscriptionID != "sub-b" || sharedCandidate.Relations[1].SubscriptionID != "sub-c" {
+		t.Fatalf("shared due relations: got %+v, want sub-b and sub-c", sharedCandidate.Relations)
 	}
 }
 

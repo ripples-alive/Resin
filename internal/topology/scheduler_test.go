@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -568,7 +569,7 @@ func TestScheduler_InventoryRefresh_OldViewMergesInventoryAndLiveWithLiveWinning
 	}
 }
 
-func TestScheduler_InventoryRefresh_RetainsRemovedButLiveActiveRelation(t *testing.T) {
+func TestScheduler_InventoryRefresh_RemovedLiveRelationIsAuthoritativelyDeleted(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
 	subMgr.Register(sub)
@@ -598,20 +599,116 @@ func TestScheduler_InventoryRefresh_RetainsRemovedButLiveActiveRelation(t *testi
 
 	sched.UpdateSubscription(sub)
 
-	if _, ok := pool.GetEntry(liveHash); !ok {
-		t.Fatal("removed-but-live active node should stay in pool")
+	if _, ok := pool.GetEntry(liveHash); ok {
+		t.Fatal("refresh result missing this node should remove the subscription relation from pool")
 	}
-	if _, ok := sub.ManagedNodes().LoadNode(liveHash); !ok {
-		t.Fatal("removed-but-live active relation should stay in managed memory")
+	if _, ok := sub.ManagedNodes().LoadNode(liveHash); ok {
+		t.Fatal("refresh result missing this node should remove it from managed memory")
 	}
 	if len(inventoryStore.replaceCalls) != 1 {
 		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
 	}
-	if _, ok := subscriptionNodeByHash(inventoryStore.replaceCalls[0].upserts, liveHash); !ok {
-		t.Fatalf("removed-but-live active relation should be retained in inventory upserts: %+v", inventoryStore.replaceCalls[0].upserts)
+	if _, ok := subscriptionNodeByHash(inventoryStore.replaceCalls[0].upserts, liveHash); ok {
+		t.Fatalf("removed live relation should not be retained in inventory upserts: %+v", inventoryStore.replaceCalls[0].upserts)
 	}
-	if len(inventoryStore.replaceCalls[0].deletes) != 0 {
-		t.Fatalf("removed-but-live active relation should not be deleted: %+v", inventoryStore.replaceCalls[0].deletes)
+	if len(inventoryStore.replaceCalls[0].deletes) != 1 || inventoryStore.replaceCalls[0].deletes[0].SubscriptionID != sub.ID || inventoryStore.replaceCalls[0].deletes[0].NodeHash != liveHash.Hex() {
+		t.Fatalf("removed live relation should be deleted from inventory: %+v", inventoryStore.replaceCalls[0].deletes)
+	}
+}
+
+func TestScheduler_InventoryRefresh_AttachesParsedRelationToExistingRealMemoryNode(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	anchorSub := subscription.NewSubscription("s2", "AnchorSub", "http://example.com/anchor", true, false)
+	subMgr.Register(sub)
+	subMgr.Register(anchorSub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"shadowsocks","tag":"shared-node","server":"1.1.1.1","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	anchorManaged := subscription.NewManagedNodes()
+	anchorManaged.StoreNode(hash, subscription.ManagedNode{Tags: []string{"anchor"}})
+	anchorSub.SwapManagedNodes(anchorManaged)
+	pool.AddNodeFromSub(hash, raw, anchorSub.ID)
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("anchor node missing from setup")
+	}
+	if entry.HasOutbound() || !entry.IsCircuitOpen() {
+		t.Fatal("test setup expected a real but not currently healthy in-memory node")
+	}
+
+	inventoryStore := &recordingSubscriptionInventoryStore{}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:     subMgr,
+		Pool:           pool,
+		Fetcher:        makeMockFetcher(makeSubscriptionJSON(string(raw)), nil),
+		InventoryStore: inventoryStore,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	managed, ok := sub.ManagedNodes().LoadNode(hash)
+	if !ok {
+		t.Fatal("parsed relation should attach to existing real in-memory node even when it is not healthy yet")
+	}
+	if !reflect.DeepEqual(managed.Tags, []string{"shared-node"}) {
+		t.Fatalf("managed tags: got %v, want [shared-node]", managed.Tags)
+	}
+	entry, ok = pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("shared node should remain in pool")
+	}
+	ids := entry.SubscriptionIDs()
+	sort.Strings(ids)
+	if !reflect.DeepEqual(ids, []string{"s1", "s2"}) {
+		t.Fatalf("subscription refs: got %v, want [s1 s2]", ids)
+	}
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
+	}
+	if _, ok := subscriptionNodeByHash(inventoryStore.replaceCalls[0].upserts, hash); !ok {
+		t.Fatalf("parsed relation missing from inventory upserts: %+v", inventoryStore.replaceCalls[0].upserts)
+	}
+}
+
+func TestScheduler_InventoryRefresh_DoesNotAttachParsedRelationToTransientColdCheckNode(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"shadowsocks","tag":"transient-node","server":"1.1.1.1","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	entry := node.NewNodeEntry(hash, raw, time.Now(), 16)
+	entry.AddSubscriptionID(ColdCheckTransientSubscriptionID)
+	pool.LoadNodeFromBootstrap(entry)
+
+	inventoryStore := &recordingSubscriptionInventoryStore{}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:     subMgr,
+		Pool:           pool,
+		Fetcher:        makeMockFetcher(makeSubscriptionJSON(string(raw)), nil),
+		InventoryStore: inventoryStore,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	if _, ok := sub.ManagedNodes().LoadNode(hash); ok {
+		t.Fatal("parsed relation must not attach to a probe-only transient cold-check node")
+	}
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("test setup transient entry should remain until cold checker cleanup")
+	}
+	if ids := entry.SubscriptionIDs(); !reflect.DeepEqual(ids, []string{ColdCheckTransientSubscriptionID}) {
+		t.Fatalf("transient entry subscriptions: got %v, want only transient sentinel", ids)
+	}
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
+	}
+	if _, ok := subscriptionNodeByHash(inventoryStore.replaceCalls[0].upserts, hash); !ok {
+		t.Fatalf("transient relation should still be persisted to cold inventory: %+v", inventoryStore.replaceCalls[0].upserts)
 	}
 }
 
