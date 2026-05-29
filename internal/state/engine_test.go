@@ -251,6 +251,70 @@ func TestEngine_WeakPersist_FlushAndLoad(t *testing.T) {
 	}
 }
 
+func TestEngine_WeakPersist_FlushNodeDirtySetsLeavesLeasesDirty(t *testing.T) {
+	engine, _, _ := newTestEngine(t)
+
+	nodeStore := map[string]*model.NodeStatic{
+		"hash-a": {Hash: "hash-a", RawOptions: json.RawMessage(`{"type":"ss"}`), CreatedAtNs: 100},
+	}
+	leaseStore := map[model.LeaseKey]*model.Lease{
+		{PlatformID: "p1", Account: "user1"}: {
+			PlatformID:     "p1",
+			Account:        "user1",
+			NodeHash:       "hash-a",
+			CreatedAtNs:    777,
+			ExpiryNs:       99999,
+			LastAccessedNs: 888,
+		},
+	}
+	readers := CacheReaders{
+		ReadNodeStatic:  func(h string) *model.NodeStatic { return nodeStore[h] },
+		ReadNodeDynamic: func(h string) *model.NodeDynamic { return nil },
+		ReadNodeLatency: func(k NodeLatencyDirtyKey) *model.NodeLatency { return nil },
+		ReadLease: func(k LeaseDirtyKey) *model.Lease {
+			t.Fatalf("FlushNodeDirtySets should not read leases")
+			return nil
+		},
+		ReadSubscriptionNode: func(k SubscriptionNodeDirtyKey) *model.SubscriptionNode { return nil },
+	}
+
+	engine.MarkNodeStatic("hash-a")
+	engine.MarkLease("p1", "user1")
+	if err := engine.FlushNodeDirtySets(readers); err != nil {
+		t.Fatalf("FlushNodeDirtySets: %v", err)
+	}
+
+	nodes, err := engine.LoadAllNodesStatic()
+	if err != nil {
+		t.Fatalf("LoadAllNodesStatic: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].Hash != "hash-a" {
+		t.Fatalf("node flush should persist node static only, got %+v", nodes)
+	}
+	leases, err := engine.LoadAllLeases()
+	if err != nil {
+		t.Fatalf("LoadAllLeases: %v", err)
+	}
+	if len(leases) != 0 {
+		t.Fatalf("node-only flush should leave lease out of DB, got %+v", leases)
+	}
+	if dirty := engine.DirtyCount(); dirty != 1 {
+		t.Fatalf("lease dirty mark should remain after node-only flush, got dirty=%d", dirty)
+	}
+
+	readers.ReadLease = func(k LeaseDirtyKey) *model.Lease { return leaseStore[k] }
+	if err := engine.FlushDirtySets(readers); err != nil {
+		t.Fatalf("FlushDirtySets: %v", err)
+	}
+	leases, err = engine.LoadAllLeases()
+	if err != nil {
+		t.Fatalf("LoadAllLeases after full flush: %v", err)
+	}
+	if len(leases) != 1 || leases[0].PlatformID != "p1" || leases[0].Account != "user1" {
+		t.Fatalf("full flush should persist remaining lease dirty mark, got %+v", leases)
+	}
+}
+
 func TestEngine_WeakPersist_DeleteFlush(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 

@@ -1181,6 +1181,92 @@ func TestColdSubscriptionNodeCheck_PromotesOnLatencySuccessAndPersists(t *testin
 	}
 }
 
+func TestColdSubscriptionNodeCheck_LeavesLeaseDirtyForRegularFlush(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-cold-leave-lease"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "ColdLeaveLease",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	const (
+		platformID = "platform-lease"
+		account    = "account-lease"
+	)
+	leaseKey := model.LeaseKey{PlatformID: platformID, Account: account}
+	leaseStore := map[model.LeaseKey]*model.Lease{
+		leaseKey: {
+			PlatformID:     platformID,
+			Account:        account,
+			NodeHash:       "existing-node",
+			CreatedAtNs:    now,
+			ExpiryNs:       now + int64(time.Hour),
+			LastAccessedNs: now,
+		},
+	}
+	engine.MarkLease(platformID, account)
+
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.78","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	latency := 20 * time.Millisecond
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
+		pool.RecordResult(hash, true)
+		pool.RecordLatency(hash, "example.com", &latency)
+		return nil
+	})
+
+	checker.Check(topology.ColdNodeCandidate{
+		SubscriptionID: subID,
+		Hash:           hash,
+		RawOptions:     raw,
+		Tags:           []string{"cold-leave-lease"},
+	})
+
+	leases, err := engine.LoadAllLeases()
+	if err != nil {
+		t.Fatalf("LoadAllLeases: %v", err)
+	}
+	if len(leases) != 0 {
+		t.Fatalf("cold checker flush should not persist or delete lease dirty marks, got %+v", leases)
+	}
+	if dirty := engine.DirtyCount(); dirty != 1 {
+		t.Fatalf("cold checker should leave only the pre-existing lease dirty mark, got dirty=%d", dirty)
+	}
+
+	readers := state.CacheReaders{
+		ReadLease: func(k state.LeaseDirtyKey) *model.Lease { return leaseStore[k] },
+	}
+	if err := engine.FlushDirtySets(readers); err != nil {
+		t.Fatalf("regular FlushDirtySets: %v", err)
+	}
+	leases, err = engine.LoadAllLeases()
+	if err != nil {
+		t.Fatalf("LoadAllLeases after regular flush: %v", err)
+	}
+	if len(leases) != 1 || leases[0].PlatformID != platformID || leases[0].Account != account {
+		t.Fatalf("regular flush should persist the retained lease dirty mark, got %+v", leases)
+	}
+}
+
 func TestColdSubscriptionNodeCheckQueue_DefersPersistenceUntilBatchCompletes(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {

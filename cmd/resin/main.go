@@ -663,7 +663,7 @@ func (c *coldSubscriptionNodeChecker) FlushColdNodeDirty() error {
 	if c == nil || c.engine == nil {
 		return nil
 	}
-	return c.engine.FlushDirtySets(newFlushReaders(c.pool, c.subManager, nil))
+	return c.engine.FlushNodeDirtySets(newFlushReaders(c.pool, c.subManager, nil))
 }
 
 func (c *coldSubscriptionNodeChecker) removeTransientColdCheckEntry(hash node.Hash) {
