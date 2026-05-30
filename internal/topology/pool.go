@@ -554,14 +554,45 @@ func (p *GlobalNodePool) RangeNodes(fn func(node.Hash, *node.NodeEntry) bool) {
 // Notifies platforms only when circuit state changes (open/recover).
 // Fires OnNodeDynamicChanged only when dynamic fields actually change.
 func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
+	p.recordResult(hash, success, true)
+}
+
+func (p *GlobalNodePool) RecordLatencyResult(hash node.Hash, rawTarget string, latency *time.Duration, success bool) {
 	entry, ok := p.nodes.Load(hash)
 	if !ok {
 		return
 	}
 
-	dynamicChanged := false
-	circuitStateChanged := false
+	resultChanged, circuitStateChanged := p.applyResult(entry, success)
+	latencyChanged := p.recordLatencyOnEntry(entry, rawTarget, latency)
 
+	if circuitStateChanged {
+		p.notifyAllPlatformsDirty(hash)
+	}
+	if (resultChanged || latencyChanged) && p.onNodeDynamicChanged != nil {
+		p.onNodeDynamicChanged(hash)
+	}
+}
+
+func (p *GlobalNodePool) recordResult(hash node.Hash, success bool, notifyDynamic bool) {
+	entry, ok := p.nodes.Load(hash)
+	if !ok {
+		return
+	}
+
+	dynamicChanged, circuitStateChanged := p.applyResult(entry, success)
+	if circuitStateChanged {
+		p.notifyAllPlatformsDirty(hash)
+	}
+	if notifyDynamic && dynamicChanged && p.onNodeDynamicChanged != nil {
+		p.onNodeDynamicChanged(hash)
+	}
+}
+
+func (p *GlobalNodePool) applyResult(entry *node.NodeEntry, success bool) (dynamicChanged bool, circuitStateChanged bool) {
+	if entry == nil {
+		return false, false
+	}
 	if success {
 		if entry.FailureCount.Swap(0) != 0 {
 			dynamicChanged = true
@@ -570,24 +601,19 @@ func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 			dynamicChanged = true
 			circuitStateChanged = true
 		}
-	} else {
-		newCount := entry.FailureCount.Add(1)
-		dynamicChanged = true
-		maxConsecutiveFailures := p.currentMaxConsecutiveFailures()
-		if maxConsecutiveFailures > 0 && int(newCount) >= maxConsecutiveFailures {
-			// Open circuit if not already open.
-			if entry.CircuitOpenSince.CompareAndSwap(0, time.Now().UnixNano()) {
-				circuitStateChanged = true
-			}
-		}
+		return dynamicChanged, circuitStateChanged
 	}
 
-	if circuitStateChanged {
-		p.notifyAllPlatformsDirty(hash)
+	newCount := entry.FailureCount.Add(1)
+	dynamicChanged = true
+	maxConsecutiveFailures := p.currentMaxConsecutiveFailures()
+	if maxConsecutiveFailures > 0 && int(newCount) >= maxConsecutiveFailures {
+		// Open circuit if not already open.
+		if entry.CircuitOpenSince.CompareAndSwap(0, time.Now().UnixNano()) {
+			circuitStateChanged = true
+		}
 	}
-	if dynamicChanged && p.onNodeDynamicChanged != nil {
-		p.onNodeDynamicChanged(hash)
-	}
+	return dynamicChanged, circuitStateChanged
 }
 
 func (p *GlobalNodePool) currentMaxConsecutiveFailures() int {
@@ -602,7 +628,16 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 	if !ok {
 		return
 	}
+	p.recordLatencyOnEntry(entry, rawTarget, latency)
+	if p.onNodeDynamicChanged != nil {
+		p.onNodeDynamicChanged(hash)
+	}
+}
 
+func (p *GlobalNodePool) recordLatencyOnEntry(entry *node.NodeEntry, rawTarget string, latency *time.Duration) bool {
+	if entry == nil {
+		return false
+	}
 	domain := netutil.ExtractDomain(rawTarget)
 	isAuthority := p.isAuthorityDomain(domain)
 	nowNs := time.Now().UnixNano()
@@ -619,12 +654,9 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 	}
 	nextDueNs := nowNs + int64(ProbeFailureBackoffInterval(interval, entry.FailureCount.Load()))
 	entry.NextLatencyProbeDue.Store(nextDueNs)
-	if p.onNodeDynamicChanged != nil {
-		p.onNodeDynamicChanged(hash)
-	}
 
 	if latency == nil || *latency <= 0 || entry.LatencyTable == nil {
-		return
+		return true
 	}
 
 	var decayWindow time.Duration
@@ -640,15 +672,16 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 	// If the table transitioned from empty to non-empty, the node might
 	// now satisfy the HasLatency filter — notify platforms.
 	if wasEmpty {
-		p.notifyAllPlatformsDirty(hash)
+		p.notifyAllPlatformsDirty(entry.Hash)
 	}
 
 	if p.onNodeLatencyChanged != nil {
-		p.onNodeLatencyChanged(hash, domain)
+		p.onNodeLatencyChanged(entry.Hash, domain)
 		if evicted {
-			p.onNodeLatencyChanged(hash, evictedDomain)
+			p.onNodeLatencyChanged(entry.Hash, evictedDomain)
 		}
 	}
+	return true
 }
 
 // UpdateNodeEgressIP records an egress probe attempt and optionally updates

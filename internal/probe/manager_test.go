@@ -210,6 +210,94 @@ func TestProbeLatency_Failure(t *testing.T) {
 	}
 }
 
+func TestProbeLatency_FailureDirtyCallbackSeesNextDue(t *testing.T) {
+	hash := node.HashFromRawOptions([]byte(`{"type":"latency-fail-dirty-order"}`))
+	var entry *node.NodeEntry
+	var callbacks []int64
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+		MaxLatencyTestInterval: func() time.Duration { return 10 * time.Second },
+		OnNodeDynamicChanged: func(got node.Hash) {
+			if got != hash || entry == nil {
+				return
+			}
+			callbacks = append(callbacks, entry.NextLatencyProbeDue.Load())
+		},
+	})
+	pool.AddNodeFromSub(hash, []byte(`{"type":"latency-fail-dirty-order"}`), "sub1")
+	var ok bool
+	entry, ok = pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	storeOutbound(entry)
+
+	mgr := NewProbeManager(ProbeConfig{
+		Pool: pool,
+		Fetcher: func(_ node.Hash, url string) ([]byte, time.Duration, error) {
+			return nil, 0, errors.New("tls handshake failed")
+		},
+	})
+
+	mgr.probeLatency(hash, entry, "https://www.gstatic.com/generate_204")
+
+	if len(callbacks) == 0 {
+		t.Fatal("expected at least one dynamic dirty callback")
+	}
+	if callbacks[0] <= 0 {
+		t.Fatalf("first dynamic dirty callback saw next due %d, want populated future due; callbacks=%v", callbacks[0], callbacks)
+	}
+}
+
+func TestProbeLatency_SuccessDirtyCallbackSeesNextDueAfterClearingFailure(t *testing.T) {
+	hash := node.HashFromRawOptions([]byte(`{"type":"latency-success-dirty-order"}`))
+	var entry *node.NodeEntry
+	var callbacks []struct {
+		failureCount int32
+		nextDue      int64
+	}
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+		MaxLatencyTestInterval: func() time.Duration { return 10 * time.Second },
+		OnNodeDynamicChanged: func(got node.Hash) {
+			if got != hash || entry == nil {
+				return
+			}
+			callbacks = append(callbacks, struct {
+				failureCount int32
+				nextDue      int64
+			}{entry.FailureCount.Load(), entry.NextLatencyProbeDue.Load()})
+		},
+	})
+	pool.AddNodeFromSub(hash, []byte(`{"type":"latency-success-dirty-order"}`), "sub1")
+	var ok bool
+	entry, ok = pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	storeOutbound(entry)
+	entry.FailureCount.Store(2)
+	entry.CircuitOpenSince.Store(time.Now().Add(-time.Minute).UnixNano())
+
+	mgr := NewProbeManager(ProbeConfig{
+		Pool: pool,
+		Fetcher: func(_ node.Hash, url string) ([]byte, time.Duration, error) {
+			return []byte("OK"), 50 * time.Millisecond, nil
+		},
+	})
+
+	mgr.probeLatency(hash, entry, "https://www.gstatic.com/generate_204")
+
+	if len(callbacks) == 0 {
+		t.Fatal("expected at least one dynamic dirty callback")
+	}
+	if callbacks[0].failureCount != 0 || callbacks[0].nextDue <= 0 {
+		t.Fatalf("first dynamic dirty callback saw %+v, want cleared failure count and populated next due; callbacks=%+v", callbacks[0], callbacks)
+	}
+}
+
 // TestProbeEgress_ZeroLatencyIgnored verifies that a successful probe with a
 // non-positive latency sample does not write latency stats.
 func TestProbeEgress_ZeroLatencyIgnored(t *testing.T) {

@@ -822,9 +822,10 @@ func (m *ProbeManager) performEgressProbe(hash node.Hash) (netip.Addr, egressPro
 		return netip.Addr{}, egressProbeFetchError, err
 	}
 
-	m.pool.RecordResult(hash, true)
 	if latency > 0 {
-		m.pool.RecordLatency(hash, egressTraceDomain, &latency)
+		m.pool.RecordLatencyResult(hash, egressTraceDomain, &latency, true)
+	} else {
+		m.pool.RecordResult(hash, true)
 	}
 
 	ip, loc, err := ParseCloudflareTrace(body)
@@ -878,13 +879,11 @@ func (m *ProbeManager) performLatencyProbe(hash node.Hash, testURL string) error
 	domain := netutil.ExtractDomain(testURL)
 	_, latency, err := m.fetcher(hash, testURL)
 	if err != nil {
-		m.pool.RecordResult(hash, false)
-		m.pool.RecordLatency(hash, domain, nil)
+		m.pool.RecordLatencyResult(hash, domain, nil, false)
 		return err
 	}
 
-	m.pool.RecordResult(hash, true)
-	m.pool.RecordLatency(hash, domain, &latency)
+	m.pool.RecordLatencyResult(hash, domain, &latency, true)
 	return nil
 }
 

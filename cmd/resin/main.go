@@ -709,9 +709,6 @@ func (c *coldSubscriptionNodeChecker) recordColdCheckFailureAttempt(entry *node.
 	if lastAttemptNs <= 0 {
 		return
 	}
-	if nextDueNs := entry.NextLatencyProbeDue.Load(); nextDueNs > lastAttemptNs {
-		return
-	}
 	entry.NextLatencyProbeDue.Store(coldLatencyProbeDueNs(
 		lastAttemptNs,
 		int(entry.FailureCount.Load()),

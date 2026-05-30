@@ -1933,8 +1933,10 @@ func TestColdSubscriptionNodeCheck_FailureIncrementsPersistedFailureCount(t *tes
 	if len(dynamics) != 1 || dynamics[0].Hash != hash.Hex() || dynamics[0].FailureCount != 4 {
 		t.Fatalf("failed cold check should increment persisted failure count, got %+v", dynamics)
 	}
-	if dynamics[0].NextLatencyProbeDueNs <= dynamics[0].LastLatencyProbeAttemptNs {
-		t.Fatalf("failed cold check should persist future next due, got %+v", dynamics[0])
+	wantDelay := coldSubscriptionNodeSweepInterval * 16
+	gotDelay := time.Duration(dynamics[0].NextLatencyProbeDueNs - dynamics[0].LastLatencyProbeAttemptNs)
+	if gotDelay < wantDelay || gotDelay > wantDelay+time.Second {
+		t.Fatalf("failed cold check should persist cold-sweep next due delay %s, got %s (%+v)", wantDelay, gotDelay, dynamics[0])
 	}
 }
 
