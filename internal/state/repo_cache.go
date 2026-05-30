@@ -305,7 +305,7 @@ func (r *CacheRepo) loadBootstrapActiveNodesBatch(ids []string, byHash map[strin
 		SELECT ns.hash, ns.raw_options_json, ns.created_at_ns,
 		       nd.failure_count, nd.circuit_open_since, nd.egress_ip, nd.egress_ips_json, nd.egress_region,
 		       nd.egress_updated_at_ns, nd.last_latency_probe_attempt_ns,
-		       nd.last_authority_latency_probe_attempt_ns, nd.last_egress_update_attempt_ns,
+		       nd.next_latency_probe_due_ns, nd.last_authority_latency_probe_attempt_ns, nd.last_egress_update_attempt_ns,
 		       sn.subscription_id, sn.tags_json
 		FROM nodes_static AS ns
 		JOIN nodes_dynamic AS nd ON nd.hash = ns.hash
@@ -334,6 +334,7 @@ func (r *CacheRepo) loadBootstrapActiveNodesBatch(ids []string, byHash map[strin
 			&record.Dynamic.EgressRegion,
 			&record.Dynamic.EgressUpdatedAtNs,
 			&record.Dynamic.LastLatencyProbeAttemptNs,
+			&record.Dynamic.NextLatencyProbeDueNs,
 			&record.Dynamic.LastAuthorityLatencyProbeAttemptNs,
 			&record.Dynamic.LastEgressUpdateAttemptNs,
 			&relationSubID,
@@ -606,28 +607,19 @@ func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duratio
 	if limit <= 0 {
 		return nil, nil
 	}
-	intervalNs := interval.Nanoseconds()
-	if intervalNs < 0 {
-		intervalNs = 0
-	}
+	_ = interval
 
 	rows, err := r.db.Query(`
 		WITH candidate_hashes(node_hash) AS (
 			SELECT nd.hash
 			FROM nodes_dynamic AS nd
-			WHERE nd.next_latency_probe_due_ns > 0
-			  AND nd.next_latency_probe_due_ns <= ?
+			WHERE nd.next_latency_probe_due_ns = 0
+			   OR nd.next_latency_probe_due_ns <= ?
 			UNION
 			SELECT ns.hash
 			FROM nodes_static AS ns
 			LEFT JOIN nodes_dynamic AS nd ON nd.hash = ns.hash
 			WHERE nd.hash IS NULL
-			   OR nd.last_latency_probe_attempt_ns = 0
-			   OR (nd.next_latency_probe_due_ns = 0 AND nd.last_latency_probe_attempt_ns <= (? - (? * CASE
-					WHEN nd.failure_count IS NULL OR nd.failure_count <= 0 THEN 1
-					WHEN nd.failure_count > 5 THEN 32
-					ELSE (1 << nd.failure_count)
-				END)))
 		),
 		due AS (
 			SELECT ch.node_hash, MIN(sn.subscription_id) AS first_subscription_id
@@ -642,7 +634,7 @@ func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duratio
 		FROM due
 		JOIN nodes_static AS ns ON ns.hash = due.node_hash
 		JOIN subscription_nodes AS rel ON rel.node_hash = due.node_hash AND rel.evicted = 0
-		ORDER BY due.first_subscription_id ASC, due.node_hash ASC, rel.subscription_id ASC`, nowNs, nowNs, intervalNs, limit)
+		ORDER BY due.first_subscription_id ASC, due.node_hash ASC, rel.subscription_id ASC`, nowNs, limit)
 	if err != nil {
 		return nil, err
 	}

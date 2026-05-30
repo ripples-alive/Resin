@@ -50,6 +50,7 @@ type GlobalNodePool struct {
 	maxConsecutiveFailures func() int
 	latencyDecayWindow     func() time.Duration
 	latencyAuthorities     func() []string
+	maxLatencyTestInterval func() time.Duration
 }
 
 // PoolConfig configures the GlobalNodePool.
@@ -65,6 +66,7 @@ type PoolConfig struct {
 	MaxConsecutiveFailures func() int
 	LatencyDecayWindow     func() time.Duration
 	LatencyAuthorities     func() []string
+	MaxLatencyTestInterval func() time.Duration
 }
 
 var (
@@ -94,6 +96,7 @@ func NewGlobalNodePool(cfg PoolConfig) *GlobalNodePool {
 		maxConsecutiveFailures: maxConsecutiveFailuresFn,
 		latencyDecayWindow:     cfg.LatencyDecayWindow,
 		latencyAuthorities:     cfg.LatencyAuthorities,
+		maxLatencyTestInterval: cfg.MaxLatencyTestInterval,
 		platformByID:           make(map[string]*platform.Platform),
 		platformByName:         make(map[string]*platform.Platform),
 	}
@@ -610,6 +613,15 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 	if p.onNodeDynamicChanged != nil {
 		p.onNodeDynamicChanged(hash)
 	}
+
+	interval := time.Hour
+	if p.maxLatencyTestInterval != nil {
+		if configured := p.maxLatencyTestInterval(); configured > 0 {
+			interval = configured
+		}
+	}
+	nextDueNs := nowNs + int64(ProbeFailureBackoffInterval(interval, entry.FailureCount.Load()))
+	entry.NextLatencyProbeDue.Store(nextDueNs)
 
 	if latency == nil || *latency <= 0 || entry.LatencyTable == nil {
 		return

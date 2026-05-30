@@ -1044,29 +1044,34 @@ func TestProbeSync_EmitsProbeEvents(t *testing.T) {
 	}
 }
 
-func TestIsLatencyProbeDue_UsesAttemptTimestamps(t *testing.T) {
+func TestIsLatencyProbeDue_UsesStoredNextDue(t *testing.T) {
 	mgr := NewProbeManager(ProbeConfig{})
-	hash := node.HashFromRawOptions([]byte(`{"type":"due-check"}`))
-	entry := node.NewNodeEntry(hash, []byte(`{"type":"due-check"}`), time.Now(), 16)
+	hash := node.HashFromRawOptions([]byte(`{"type":"next-due-check"}`))
+	entry := node.NewNodeEntry(hash, []byte(`{"type":"next-due-check"}`), time.Now(), 16)
 	now := time.Now()
 
-	// Seed a very recent latency-table sample; due-check should ignore this and
-	// rely on attempt timestamps.
-	entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
-		Ewma:        20 * time.Millisecond,
-		LastUpdated: now,
-	})
-
-	entry.LastLatencyProbeAttempt.Store(now.Add(-10 * time.Minute).UnixNano())
-	entry.LastAuthorityLatencyProbeAttempt.Store(now.Add(-10 * time.Minute).UnixNano())
-	if !mgr.isLatencyProbeDue(entry, now, 5*time.Minute, 1*time.Hour, []string{"example.com"}, 15*time.Second) {
-		t.Fatal("expected due=true when last latency attempt is stale")
+	entry.FailureCount.Store(5)
+	entry.LastLatencyProbeAttempt.Store(now.Add(-24 * time.Hour).UnixNano())
+	entry.NextLatencyProbeDue.Store(now.Add(10 * time.Minute).UnixNano())
+	if mgr.isLatencyProbeDue(entry, now, time.Minute, time.Minute, nil, 0) {
+		t.Fatal("expected not due while stored next latency probe due is in the future")
 	}
 
-	entry.LastLatencyProbeAttempt.Store(now.Add(-1 * time.Minute).UnixNano())
+	entry.NextLatencyProbeDue.Store(now.Add(-time.Nanosecond).UnixNano())
+	if !mgr.isLatencyProbeDue(entry, now, time.Hour, time.Hour, nil, 0) {
+		t.Fatal("expected due when stored next latency probe due has passed")
+	}
+
+	entry.NextLatencyProbeDue.Store(now.Add(10 * time.Minute).UnixNano())
+	entry.FailureCount.Store(0)
 	entry.LastAuthorityLatencyProbeAttempt.Store(now.Add(-2 * time.Hour).UnixNano())
-	if !mgr.isLatencyProbeDue(entry, now, 5*time.Minute, 1*time.Hour, []string{"example.com"}, 15*time.Second) {
-		t.Fatal("expected due=true when authority attempt is stale")
+	if !mgr.isLatencyProbeDue(entry, now, time.Hour, time.Hour, []string{"example.com"}, 0) {
+		t.Fatal("expected due when authority attempt is stale even if ordinary next due is in the future")
+	}
+
+	entry.NextLatencyProbeDue.Store(0)
+	if !mgr.isLatencyProbeDue(entry, now, time.Hour, time.Hour, nil, 0) {
+		t.Fatal("expected due when stored next latency probe due is zero")
 	}
 }
 
@@ -1091,19 +1096,20 @@ func TestProbeFailureBackoffInterval_CapsAt32x(t *testing.T) {
 	}
 }
 
-func TestIsLatencyProbeDue_AppliesFailureBackoff(t *testing.T) {
+func TestIsLatencyProbeDue_IgnoresAttemptBackoffWhenStoredNextDueIsSet(t *testing.T) {
 	mgr := NewProbeManager(ProbeConfig{})
 	hash := node.HashFromRawOptions([]byte(`{"type":"latency-backoff"}`))
 	entry := node.NewNodeEntry(hash, []byte(`{"type":"latency-backoff"}`), time.Now(), 16)
 	now := time.Now()
-	entry.FailureCount.Store(2) // 4x backoff
+	entry.FailureCount.Store(2) // old logic would use 4x backoff
 	entry.LastLatencyProbeAttempt.Store(now.Add(-2 * time.Hour).UnixNano())
-	if mgr.isLatencyProbeDue(entry, now, time.Hour, 3*time.Hour, nil, 0) {
-		t.Fatal("expected not due before 4x backoff interval")
+	entry.NextLatencyProbeDue.Store(now.Add(4 * time.Hour).UnixNano())
+	if mgr.isLatencyProbeDue(entry, now, time.Hour, time.Hour, nil, 3*time.Hour) {
+		t.Fatal("expected not due while stored next due is outside lookahead")
 	}
-	entry.LastLatencyProbeAttempt.Store(now.Add(-4 * time.Hour).UnixNano())
-	if !mgr.isLatencyProbeDue(entry, now, time.Hour, 3*time.Hour, nil, 0) {
-		t.Fatal("expected due after 4x backoff interval")
+	entry.NextLatencyProbeDue.Store(now.Add(3*time.Hour - time.Nanosecond).UnixNano())
+	if !mgr.isLatencyProbeDue(entry, now, time.Hour, time.Hour, nil, 3*time.Hour) {
+		t.Fatal("expected due when stored next due is inside lookahead")
 	}
 }
 

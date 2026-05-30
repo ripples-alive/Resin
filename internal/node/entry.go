@@ -40,6 +40,7 @@ type NodeEntry struct {
 	// Probe-attempt timestamps (unix-nano). These are updated regardless of
 	// probe success/failure, and are used by probe schedulers.
 	LastLatencyProbeAttempt          atomic.Int64
+	NextLatencyProbeDue              atomic.Int64 // unix-nano; 0 = due/unprobed
 	LastAuthorityLatencyProbeAttempt atomic.Int64
 	LastEgressUpdateAttempt          atomic.Int64
 	LatencyTable                     *LatencyTable // per-domain latency stats; nil if not initialized

@@ -731,19 +731,14 @@ func (m *ProbeManager) tryDeleteTaskState(key probeTaskKey, state *probeTaskStat
 	})
 }
 
-// isLatencyProbeDue checks whether a node needs a latency probe, based on
-// last probe-attempt timestamps (not latency-table timestamps).
+// isLatencyProbeDue checks whether a node needs a latency probe, using the
+// persisted ordinary latency due timestamp plus independent authority probe state.
 
+// probeFailureBackoffInterval returns the probe interval after applying capped
+// failure backoff. Kept as a package-local wrapper for existing probe tests;
+// topology owns the shared implementation used by runtime persistence.
 func probeFailureBackoffInterval(base time.Duration, failureCount int32) time.Duration {
-	if base <= 0 || failureCount <= 0 {
-		return base
-	}
-	exponent := failureCount
-	if exponent > 5 {
-		exponent = 5
-	}
-	multiplier := int64(1) << exponent
-	return base * time.Duration(multiplier)
+	return topology.ProbeFailureBackoffInterval(base, failureCount)
 }
 
 func (m *ProbeManager) isLatencyProbeDue(
@@ -753,20 +748,14 @@ func (m *ProbeManager) isLatencyProbeDue(
 	authorities []string,
 	lookahead time.Duration,
 ) bool {
-	lastAny := entry.LastLatencyProbeAttempt.Load()
-	if lastAny == 0 {
-		return true
-	}
-	latencyInterval := probeFailureBackoffInterval(maxLatencyInterval, entry.FailureCount.Load())
-	anyDeadline := time.Unix(0, lastAny).Add(latencyInterval).Add(-lookahead)
-	if !now.Before(anyDeadline) {
+	nextDue := entry.NextLatencyProbeDue.Load()
+	if nextDue <= 0 || !now.Before(time.Unix(0, nextDue).Add(-lookahead)) {
 		return true
 	}
 
 	if len(authorities) == 0 {
 		return false
 	}
-
 	lastAuthority := entry.LastAuthorityLatencyProbeAttempt.Load()
 	if lastAuthority == 0 {
 		return true

@@ -287,6 +287,9 @@ func newTopologyRuntime(
 		LatencyAuthorities: func() []string {
 			return runtimeConfigSnapshot(runtimeCfg).LatencyAuthorities
 		},
+		MaxLatencyTestInterval: func() time.Duration {
+			return time.Duration(runtimeConfigSnapshot(runtimeCfg).MaxLatencyTestInterval)
+		},
 	})
 	log.Println("Topology: GlobalNodePool initialized")
 
@@ -734,6 +737,9 @@ func (c *coldSubscriptionNodeChecker) restoreColdCheckDynamic(hash node.Hash) {
 	if dynamic.LastLatencyProbeAttemptNs > 0 {
 		entry.LastLatencyProbeAttempt.Store(dynamic.LastLatencyProbeAttemptNs)
 	}
+	if dynamic.NextLatencyProbeDueNs > 0 {
+		entry.NextLatencyProbeDue.Store(dynamic.NextLatencyProbeDueNs)
+	}
 	if dynamic.LastAuthorityLatencyProbeAttemptNs > 0 {
 		entry.LastAuthorityLatencyProbeAttempt.Store(dynamic.LastAuthorityLatencyProbeAttemptNs)
 	}
@@ -994,7 +1000,7 @@ func nodeDynamicModelFromEntry(hash string, entry *node.NodeEntry, maxLatencyTes
 		EgressRegion:                       entry.GetEgressRegion(),
 		EgressUpdatedAtNs:                  entry.LastEgressUpdate.Load(),
 		LastLatencyProbeAttemptNs:          entry.LastLatencyProbeAttempt.Load(),
-		NextLatencyProbeDueNs:              coldLatencyProbeDueNs(entry.LastLatencyProbeAttempt.Load(), int(entry.FailureCount.Load()), maxLatencyTestInterval),
+		NextLatencyProbeDueNs:              entry.NextLatencyProbeDue.Load(),
 		LastAuthorityLatencyProbeAttemptNs: entry.LastAuthorityLatencyProbeAttempt.Load(),
 		LastEgressUpdateAttemptNs:          entry.LastEgressUpdateAttempt.Load(),
 	}
@@ -1364,6 +1370,7 @@ func restoreBootstrapNodeDynamics(
 		entry.FailureCount.Store(int32(nd.FailureCount))
 		entry.CircuitOpenSince.Store(nd.CircuitOpenSince)
 		entry.LastLatencyProbeAttempt.Store(nd.LastLatencyProbeAttemptNs)
+		entry.NextLatencyProbeDue.Store(nd.NextLatencyProbeDueNs)
 		entry.LastAuthorityLatencyProbeAttempt.Store(nd.LastAuthorityLatencyProbeAttemptNs)
 		entry.LastEgressUpdateAttempt.Store(nd.LastEgressUpdateAttemptNs)
 		if nd.EgressIP != "" {
@@ -1561,6 +1568,7 @@ func loadActiveOnlyBootstrapNodes(
 		entry.FailureCount.Store(int32(record.Dynamic.FailureCount))
 		entry.CircuitOpenSince.Store(record.Dynamic.CircuitOpenSince)
 		entry.LastLatencyProbeAttempt.Store(record.Dynamic.LastLatencyProbeAttemptNs)
+		entry.NextLatencyProbeDue.Store(record.Dynamic.NextLatencyProbeDueNs)
 		entry.LastAuthorityLatencyProbeAttempt.Store(record.Dynamic.LastAuthorityLatencyProbeAttemptNs)
 		entry.LastEgressUpdateAttempt.Store(record.Dynamic.LastEgressUpdateAttemptNs)
 		if record.Dynamic.EgressIP != "" {

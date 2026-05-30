@@ -39,6 +39,9 @@ func newBootstrapTestRuntime(runtimeCfg *config.RuntimeConfig) (*topology.Subscr
 		LatencyDecayWindow: func() time.Duration {
 			return time.Duration(runtimeCfg.LatencyDecayWindow)
 		},
+		MaxLatencyTestInterval: func() time.Duration {
+			return time.Duration(runtimeCfg.MaxLatencyTestInterval)
+		},
 	})
 	return subManager, pool
 }
@@ -1531,17 +1534,17 @@ func TestColdSubscriptionNodeCheckQueue_PreservesCandidateRelations(t *testing.T
 	}
 }
 
-func TestNodeDynamicModelFromEntry_ComputesNextLatencyProbeDue(t *testing.T) {
+func TestNodeDynamicModelFromEntry_UsesRuntimeNextLatencyProbeDue(t *testing.T) {
 	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.70","server_port":443}`)
 	hash := node.HashFromRawOptions(raw)
 	entry := node.NewNodeEntry(hash, raw, time.Now(), 16)
 	entry.LastLatencyProbeAttempt.Store(1_000)
 	entry.FailureCount.Store(3)
+	entry.NextLatencyProbeDue.Store(42_000)
 
 	dynamic := nodeDynamicModelFromEntry(hash.Hex(), entry, 10*time.Second)
-	want := int64(1_000 + 80*time.Second)
-	if dynamic.NextLatencyProbeDueNs != want {
-		t.Fatalf("NextLatencyProbeDueNs: got %d, want %d", dynamic.NextLatencyProbeDueNs, want)
+	if dynamic.NextLatencyProbeDueNs != 42_000 {
+		t.Fatalf("NextLatencyProbeDueNs: got %d, want %d", dynamic.NextLatencyProbeDueNs, int64(42_000))
 	}
 }
 
