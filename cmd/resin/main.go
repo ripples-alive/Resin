@@ -48,12 +48,23 @@ type topologyRuntime struct {
 const downloadUserAgent = "clash.meta"
 
 const (
-	coldSubscriptionNodeQueueCapacity = 1024
-	coldSubscriptionNodeWorkerCount   = 4
+	coldSubscriptionNodeMinQueueCapacity = 1024
 
 	coldSubscriptionNodeSweepInterval  = 5 * time.Minute
 	coldSubscriptionNodeSweepBatchSize = 256
 )
+
+func coldSubscriptionNodeQueueSizing(probeConcurrency int) (int, int) {
+	workers := probeConcurrency
+	if workers <= 0 {
+		workers = 1
+	}
+	capacity := workers * 10
+	if capacity < coldSubscriptionNodeMinQueueCapacity {
+		capacity = coldSubscriptionNodeMinQueueCapacity
+	}
+	return workers, capacity
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -351,10 +362,11 @@ func newTopologyRuntime(
 			_, err := probeMgr.ProbeLatencySync(hash)
 			return err
 		})
+		workers, queueCapacity := coldSubscriptionNodeQueueSizing(envCfg.ProbeConcurrency)
 		coldNodeQueue = newColdSubscriptionNodeCheckQueue(
 			coldChecker,
-			coldSubscriptionNodeWorkerCount,
-			coldSubscriptionNodeQueueCapacity,
+			workers,
+			queueCapacity,
 		)
 		inventoryStore = engine
 		coldSweepRunner = newColdSubscriptionNodeSweepRunner(coldSubscriptionNodeSweepRunnerConfig{

@@ -2152,6 +2152,24 @@ func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool
 	t.Fatal(msg)
 }
 
+func TestColdSubscriptionNodeQueueConfig_UsesProbeConcurrencyAndExpandedCapacity(t *testing.T) {
+	workers, capacity := coldSubscriptionNodeQueueSizing(64)
+	if workers != 64 {
+		t.Fatalf("workers: got %d, want 64", workers)
+	}
+	if capacity != 1024 {
+		t.Fatalf("capacity for small concurrency: got %d, want 1024", capacity)
+	}
+
+	workers, capacity = coldSubscriptionNodeQueueSizing(250)
+	if workers != 250 {
+		t.Fatalf("workers: got %d, want 250", workers)
+	}
+	if capacity != 2500 {
+		t.Fatalf("capacity for large concurrency: got %d, want 2500", capacity)
+	}
+}
+
 func TestColdSubscriptionNodeSweepRunner_SingleFlightCoalescesTriggers(t *testing.T) {
 	firstCallStarted := make(chan struct{})
 	releaseFirstCall := make(chan struct{})
