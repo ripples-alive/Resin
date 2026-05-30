@@ -263,7 +263,9 @@ func (a *resinApp) bootstrapFromPersistence(engine *state.StateEngine) error {
 		log.Printf("Restored %d leases from cache.db", len(leases))
 	}
 
-	flushReaders := newFlushReaders(a.topoRuntime.pool, a.topoRuntime.subManager, a.topoRuntime.router)
+	flushReaders := newFlushReaders(a.topoRuntime.pool, a.topoRuntime.subManager, a.topoRuntime.router, func() time.Duration {
+		return time.Duration(runtimeConfigSnapshot(a.runtimeCfg).MaxLatencyTestInterval)
+	})
 	a.flushWorker = state.NewCacheFlushWorker(
 		engine,
 		flushReaders,

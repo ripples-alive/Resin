@@ -775,7 +775,9 @@ func (c *coldSubscriptionNodeChecker) FlushColdNodeDirty() error {
 	if c == nil || c.engine == nil {
 		return nil
 	}
-	return c.engine.FlushNodeDirtySets(newFlushReaders(c.pool, c.subManager, nil))
+	return c.engine.FlushNodeDirtySets(newFlushReaders(c.pool, c.subManager, nil, func() time.Duration {
+		return coldSubscriptionNodeSweepInterval
+	}))
 }
 
 func (c *coldSubscriptionNodeChecker) removeTransientColdCheckEntry(hash node.Hash) {
@@ -957,7 +959,27 @@ func logColdNodeCheckBatchProgress(queued, completed int, outcomes []coldNodeChe
 	log.Printf("cold subscription node check: batch progress queued=%d completed=%d promoted=%d failed=%d skipped=%d elapsed=%s", queued, completed, promoted, failed, skipped, elapsed.Truncate(time.Millisecond))
 }
 
-func nodeDynamicModelFromEntry(hash string, entry *node.NodeEntry) model.NodeDynamic {
+func coldLatencyProbeBackoffMultiplier(failureCount int) int64 {
+	if failureCount <= 0 {
+		return 1
+	}
+	if failureCount > 5 {
+		failureCount = 5
+	}
+	return int64(1) << failureCount
+}
+
+func coldLatencyProbeDueNs(lastAttemptNs int64, failureCount int, baseInterval time.Duration) int64 {
+	if lastAttemptNs <= 0 {
+		return 0
+	}
+	if baseInterval <= 0 {
+		baseInterval = time.Hour
+	}
+	return lastAttemptNs + int64(baseInterval)*coldLatencyProbeBackoffMultiplier(failureCount)
+}
+
+func nodeDynamicModelFromEntry(hash string, entry *node.NodeEntry, maxLatencyTestInterval time.Duration) model.NodeDynamic {
 	egressIP := entry.GetEgressIP()
 	egressStr := ""
 	if egressIP.IsValid() {
@@ -972,6 +994,7 @@ func nodeDynamicModelFromEntry(hash string, entry *node.NodeEntry) model.NodeDyn
 		EgressRegion:                       entry.GetEgressRegion(),
 		EgressUpdatedAtNs:                  entry.LastEgressUpdate.Load(),
 		LastLatencyProbeAttemptNs:          entry.LastLatencyProbeAttempt.Load(),
+		NextLatencyProbeDueNs:              coldLatencyProbeDueNs(entry.LastLatencyProbeAttempt.Load(), int(entry.FailureCount.Load()), maxLatencyTestInterval),
 		LastAuthorityLatencyProbeAttemptNs: entry.LastAuthorityLatencyProbeAttempt.Load(),
 		LastEgressUpdateAttemptNs:          entry.LastEgressUpdateAttempt.Load(),
 	}
@@ -981,7 +1004,12 @@ func newFlushReaders(
 	pool *topology.GlobalNodePool,
 	subManager *topology.SubscriptionManager,
 	router *routing.Router,
+	maxLatencyTestIntervalFns ...func() time.Duration,
 ) state.CacheReaders {
+	maxLatencyTestInterval := func() time.Duration { return time.Hour }
+	if len(maxLatencyTestIntervalFns) > 0 && maxLatencyTestIntervalFns[0] != nil {
+		maxLatencyTestInterval = maxLatencyTestIntervalFns[0]
+	}
 	return state.CacheReaders{
 		ReadNodeStatic: func(hash string) *model.NodeStatic {
 			h, err := node.ParseHex(hash)
@@ -1007,7 +1035,7 @@ func newFlushReaders(
 			if !ok {
 				return nil
 			}
-			dynamic := nodeDynamicModelFromEntry(hash, entry)
+			dynamic := nodeDynamicModelFromEntry(hash, entry, maxLatencyTestInterval())
 			return &dynamic
 		},
 		ReadNodeLatency: func(key model.NodeLatencyKey) *model.NodeLatency {

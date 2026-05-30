@@ -106,6 +106,7 @@ func (r *CacheRepo) BulkUpsertNodesDynamic(nodes []model.NodeDynamic) error {
 				n.EgressRegion,
 				n.EgressUpdatedAtNs,
 				n.LastLatencyProbeAttemptNs,
+				n.NextLatencyProbeDueNs,
 				n.LastAuthorityLatencyProbeAttemptNs,
 				n.LastEgressUpdateAttemptNs,
 			)
@@ -131,7 +132,7 @@ func (r *CacheRepo) BulkDeleteNodesDynamic(hashes []string) error {
 func (r *CacheRepo) LoadNodeDynamic(hash string) (*model.NodeDynamic, error) {
 	row := r.db.QueryRow(`
 		SELECT hash, failure_count, circuit_open_since, egress_ip, egress_ips_json, egress_region, egress_updated_at_ns,
-		       last_latency_probe_attempt_ns, last_authority_latency_probe_attempt_ns, last_egress_update_attempt_ns
+		       last_latency_probe_attempt_ns, next_latency_probe_due_ns, last_authority_latency_probe_attempt_ns, last_egress_update_attempt_ns
 		FROM nodes_dynamic
 		WHERE hash = ?`, hash)
 	var n model.NodeDynamic
@@ -145,6 +146,7 @@ func (r *CacheRepo) LoadNodeDynamic(hash string) (*model.NodeDynamic, error) {
 		&n.EgressRegion,
 		&n.EgressUpdatedAtNs,
 		&n.LastLatencyProbeAttemptNs,
+		&n.NextLatencyProbeDueNs,
 		&n.LastAuthorityLatencyProbeAttemptNs,
 		&n.LastEgressUpdateAttemptNs,
 	); err != nil {
@@ -165,7 +167,7 @@ func (r *CacheRepo) LoadNodeDynamic(hash string) (*model.NodeDynamic, error) {
 func (r *CacheRepo) LoadAllNodesDynamic() ([]model.NodeDynamic, error) {
 	rows, err := r.db.Query(`
 		SELECT hash, failure_count, circuit_open_since, egress_ip, egress_ips_json, egress_region, egress_updated_at_ns,
-		       last_latency_probe_attempt_ns, last_authority_latency_probe_attempt_ns, last_egress_update_attempt_ns
+		       last_latency_probe_attempt_ns, next_latency_probe_due_ns, last_authority_latency_probe_attempt_ns, last_egress_update_attempt_ns
 		FROM nodes_dynamic`)
 	if err != nil {
 		return nil, err
@@ -185,6 +187,7 @@ func (r *CacheRepo) LoadAllNodesDynamic() ([]model.NodeDynamic, error) {
 			&n.EgressRegion,
 			&n.EgressUpdatedAtNs,
 			&n.LastLatencyProbeAttemptNs,
+			&n.NextLatencyProbeDueNs,
 			&n.LastAuthorityLatencyProbeAttemptNs,
 			&n.LastEgressUpdateAttemptNs,
 		); err != nil {
@@ -609,29 +612,37 @@ func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duratio
 	}
 
 	rows, err := r.db.Query(`
-		SELECT due.node_hash, ns.raw_options_json, rel.subscription_id, rel.tags_json
-		FROM (
-			SELECT sn.node_hash, MIN(sn.subscription_id) AS first_subscription_id
-			FROM subscription_nodes AS sn
-			JOIN nodes_static AS ns ON ns.hash = sn.node_hash
-			LEFT JOIN nodes_dynamic AS nd ON nd.hash = sn.node_hash
-			WHERE sn.evicted = 0
-			  AND (
-				nd.hash IS NULL
-				OR nd.last_latency_probe_attempt_ns = 0
-				OR nd.last_latency_probe_attempt_ns <= (? - (? * CASE
+		WITH candidate_hashes(node_hash) AS (
+			SELECT nd.hash
+			FROM nodes_dynamic AS nd
+			WHERE nd.next_latency_probe_due_ns > 0
+			  AND nd.next_latency_probe_due_ns <= ?
+			UNION
+			SELECT ns.hash
+			FROM nodes_static AS ns
+			LEFT JOIN nodes_dynamic AS nd ON nd.hash = ns.hash
+			WHERE nd.hash IS NULL
+			   OR nd.last_latency_probe_attempt_ns = 0
+			   OR (nd.next_latency_probe_due_ns = 0 AND nd.last_latency_probe_attempt_ns <= (? - (? * CASE
 					WHEN nd.failure_count IS NULL OR nd.failure_count <= 0 THEN 1
 					WHEN nd.failure_count > 5 THEN 32
 					ELSE (1 << nd.failure_count)
-				END))
-			  )
-			GROUP BY sn.node_hash
-			ORDER BY first_subscription_id ASC, sn.node_hash ASC
+				END)))
+		),
+		due AS (
+			SELECT ch.node_hash, MIN(sn.subscription_id) AS first_subscription_id
+			FROM candidate_hashes AS ch
+			JOIN subscription_nodes AS sn ON sn.node_hash = ch.node_hash AND sn.evicted = 0
+			JOIN nodes_static AS ns ON ns.hash = ch.node_hash
+			GROUP BY ch.node_hash
+			ORDER BY first_subscription_id ASC, ch.node_hash ASC
 			LIMIT ?
-		) AS due
+		)
+		SELECT due.node_hash, ns.raw_options_json, rel.subscription_id, rel.tags_json
+		FROM due
 		JOIN nodes_static AS ns ON ns.hash = due.node_hash
 		JOIN subscription_nodes AS rel ON rel.node_hash = due.node_hash AND rel.evicted = 0
-		ORDER BY due.first_subscription_id ASC, due.node_hash ASC, rel.subscription_id ASC`, nowNs, intervalNs, limit)
+		ORDER BY due.first_subscription_id ASC, due.node_hash ASC, rel.subscription_id ASC`, nowNs, nowNs, intervalNs, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -854,6 +865,7 @@ func (r *CacheRepo) FlushTx(ops FlushOps) error {
 				n.EgressRegion,
 				n.EgressUpdatedAtNs,
 				n.LastLatencyProbeAttemptNs,
+				n.NextLatencyProbeDueNs,
 				n.LastAuthorityLatencyProbeAttemptNs,
 				n.LastEgressUpdateAttemptNs,
 			)
@@ -911,9 +923,9 @@ const (
 
 	upsertNodesDynamicSQL = `INSERT INTO nodes_dynamic (
 			hash, failure_count, circuit_open_since, egress_ip, egress_ips_json, egress_region, egress_updated_at_ns,
-			last_latency_probe_attempt_ns, last_authority_latency_probe_attempt_ns, last_egress_update_attempt_ns
+			last_latency_probe_attempt_ns, next_latency_probe_due_ns, last_authority_latency_probe_attempt_ns, last_egress_update_attempt_ns
 		)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(hash) DO UPDATE SET
 			failure_count                          = excluded.failure_count,
 			circuit_open_since                     = excluded.circuit_open_since,
@@ -922,6 +934,7 @@ const (
 			egress_region                          = excluded.egress_region,
 			egress_updated_at_ns                   = excluded.egress_updated_at_ns,
 			last_latency_probe_attempt_ns          = excluded.last_latency_probe_attempt_ns,
+			next_latency_probe_due_ns              = excluded.next_latency_probe_due_ns,
 			last_authority_latency_probe_attempt_ns = excluded.last_authority_latency_probe_attempt_ns,
 			last_egress_update_attempt_ns          = excluded.last_egress_update_attempt_ns`
 

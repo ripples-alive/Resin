@@ -59,6 +59,7 @@ type NodeDynamic struct {
 	EgressRegion                       string   `json:"egress_region"`
 	EgressUpdatedAtNs                  int64    `json:"egress_updated_at_ns"`
 	LastLatencyProbeAttemptNs          int64    `json:"last_latency_probe_attempt_ns"`
+	NextLatencyProbeDueNs              int64    `json:"next_latency_probe_due_ns"`
 	LastAuthorityLatencyProbeAttemptNs int64    `json:"last_authority_latency_probe_attempt_ns"`
 	LastEgressUpdateAttemptNs          int64    `json:"last_egress_update_attempt_ns"`
 }

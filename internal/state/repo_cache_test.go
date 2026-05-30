@@ -93,6 +93,7 @@ func TestCacheRepo_NodesDynamic_BulkUpsertAndLoad(t *testing.T) {
 			EgressRegion:                       "us",
 			EgressUpdatedAtNs:                  500,
 			LastLatencyProbeAttemptNs:          700,
+			NextLatencyProbeDueNs:              1700,
 			LastAuthorityLatencyProbeAttemptNs: 800,
 			LastEgressUpdateAttemptNs:          900,
 		},
@@ -115,6 +116,7 @@ func TestCacheRepo_NodesDynamic_BulkUpsertAndLoad(t *testing.T) {
 		t.Fatalf("egress_ips: got %v", loaded[0].EgressIPs)
 	}
 	if loaded[0].LastLatencyProbeAttemptNs != 700 ||
+		loaded[0].NextLatencyProbeDueNs != 1700 ||
 		loaded[0].LastAuthorityLatencyProbeAttemptNs != 800 ||
 		loaded[0].LastEgressUpdateAttemptNs != 900 {
 		t.Fatalf("unexpected probe attempt fields: %+v", loaded[0])
@@ -435,6 +437,54 @@ func TestCacheRepo_LoadDueColdNodeCandidates_AppliesFailureBackoff(t *testing.T)
 	}
 	if len(got) != 1 || got[0].Hash != hashDue {
 		t.Fatalf("due candidates with backoff: got %+v, want only %s", got, hashDue.Hex())
+	}
+}
+
+func TestCacheRepo_LoadDueColdNodeCandidates_UsesPersistedNextLatencyProbeDue(t *testing.T) {
+	repo := newTestCacheRepo(t)
+	nowNs := int64(time.Hour)
+	interval := 100 * time.Nanosecond
+
+	rawFuture := json.RawMessage(`{"type":"stub","server":"198.51.100.33","server_port":443}`)
+	rawDue := json.RawMessage(`{"type":"stub","server":"198.51.100.34","server_port":443}`)
+	hashFuture := node.HashFromRawOptions(rawFuture)
+	hashDue := node.HashFromRawOptions(rawDue)
+
+	if err := repo.BulkUpsertNodesStatic([]model.NodeStatic{
+		{Hash: hashFuture.Hex(), RawOptions: rawFuture, CreatedAtNs: nowNs},
+		{Hash: hashDue.Hex(), RawOptions: rawDue, CreatedAtNs: nowNs},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := repo.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{SubscriptionID: "sub-a", NodeHash: hashFuture.Hex(), Tags: []string{"future"}},
+		{SubscriptionID: "sub-a", NodeHash: hashDue.Hex(), Tags: []string{"due"}},
+	}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+	if err := repo.BulkUpsertNodesDynamic([]model.NodeDynamic{
+		{
+			Hash:                      hashFuture.Hex(),
+			FailureCount:              0,
+			LastLatencyProbeAttemptNs: nowNs - int64(100*interval),
+			NextLatencyProbeDueNs:     nowNs + 1,
+		},
+		{
+			Hash:                      hashDue.Hex(),
+			FailureCount:              9,
+			LastLatencyProbeAttemptNs: nowNs - int64(interval),
+			NextLatencyProbeDueNs:     nowNs - 1,
+		},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
+
+	got, err := repo.LoadDueColdNodeCandidates(nowNs, interval, 10)
+	if err != nil {
+		t.Fatalf("LoadDueColdNodeCandidates: %v", err)
+	}
+	if len(got) != 1 || got[0].Hash != hashDue {
+		t.Fatalf("due candidates with persisted next due: got %+v, want only %s", got, hashDue.Hex())
 	}
 }
 
