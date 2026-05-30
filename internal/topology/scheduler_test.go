@@ -1079,6 +1079,68 @@ func TestScheduler_StaleFailureDoesNotApplyAfterSubscriptionReplaced(t *testing.
 	}
 }
 
+func TestScheduler_StaleSuccessDoesNotApplyAfterSubscriptionReplaced(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	oldSub := subscription.NewSubscription("s1", "OldSub", "http://example.com", true, false)
+	subMgr.Register(oldSub)
+
+	pool := newTestPool(subMgr)
+	body := makeSubscriptionJSON(
+		`{"type":"shadowsocks","tag":"stale-node","server":"1.1.1.1","server_port":443}`,
+	)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	fetcher := func(url string) ([]byte, error) {
+		close(firstStarted)
+		<-releaseFirst
+		return body, nil
+	}
+	var updatedCalls atomic.Int32
+	var refreshStateCalls atomic.Int32
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager: subMgr,
+		Pool:       pool,
+		Fetcher:    fetcher,
+		OnSubUpdated: func(sub *subscription.Subscription) {
+			updatedCalls.Add(1)
+		},
+		OnSubRefreshState: func(subID string, checkedNs int64, updatedNs *int64, lastError string) {
+			refreshStateCalls.Add(1)
+		},
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sched.UpdateSubscription(oldSub)
+	}()
+
+	<-firstStarted
+	replacement := subscription.NewSubscription("s1", "Replacement", "http://example.com/new", true, false)
+	subMgr.Register(replacement)
+	close(releaseFirst)
+	<-done
+
+	if oldSub.LastUpdatedNs.Load() != 0 {
+		t.Fatalf("stale success should not update replaced subscription, got LastUpdatedNs=%d", oldSub.LastUpdatedNs.Load())
+	}
+	if managedNodeCount(oldSub.ManagedNodes()) != 0 {
+		t.Fatalf("stale success should not add managed nodes to replaced subscription, got %d", managedNodeCount(oldSub.ManagedNodes()))
+	}
+	if managedNodeCount(replacement.ManagedNodes()) != 0 {
+		t.Fatalf("stale success should not affect replacement, got %d managed nodes", managedNodeCount(replacement.ManagedNodes()))
+	}
+	if pool.Size() != 0 {
+		t.Fatalf("stale success should not publish nodes to pool, got size %d", pool.Size())
+	}
+	if updatedCalls.Load() != 0 {
+		t.Fatalf("stale success should not fire OnSubUpdated, got %d", updatedCalls.Load())
+	}
+	if refreshStateCalls.Load() != 0 {
+		t.Fatalf("stale success should not fire OnSubRefreshState, got %d", refreshStateCalls.Load())
+	}
+}
+
 func TestScheduler_StaleSuccessDoesNotOverrideNewerSuccess(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)

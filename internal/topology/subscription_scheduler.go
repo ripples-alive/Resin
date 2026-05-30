@@ -331,6 +331,9 @@ func (s *SubscriptionScheduler) UpdateSubscription(sub *subscription.Subscriptio
 	// 4. Diff, swap, add/remove — under lock.
 	applied := false
 	sub.WithOpLock(func() {
+		if s.subManager != nil && s.subManager.Lookup(sub.ID) != sub {
+			return
+		}
 		// If refresh-input config changed while this attempt was in-flight, discard.
 		if sub.ConfigVersion() != attemptConfigVersion {
 			return
