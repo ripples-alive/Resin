@@ -2382,6 +2382,7 @@ func TestColdSubscriptionNodeSweepRunner_DrainsDueDBBatchesUntilEmpty(t *testing
 			if err := engine.BulkUpsertNodesDynamic([]model.NodeDynamic{{
 				Hash:                      candidate.Hash.Hex(),
 				LastLatencyProbeAttemptNs: now,
+				NextLatencyProbeDueNs:     now + int64(time.Minute),
 			}}); err != nil {
 				t.Errorf("BulkUpsertNodesDynamic %s: %v", candidate.Hash.Hex(), err)
 			}
