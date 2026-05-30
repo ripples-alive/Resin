@@ -84,6 +84,9 @@ export async function listNodes(filters: NodeListQuery): Promise<PageResponse<No
   if (filters.enabled !== undefined) {
     query.set("enabled", String(filters.enabled));
   }
+  if (filters.active !== undefined) {
+    query.set("active", String(filters.active));
+  }
 
   const data = await apiRequest<PageResponse<ApiNodeSummary>>(`${basePath}?${query.toString()}`);
   return {

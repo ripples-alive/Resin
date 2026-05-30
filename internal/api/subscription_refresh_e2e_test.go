@@ -108,7 +108,7 @@ func TestAPIContract_SubscriptionRefreshAction_E2EHTTPSource(t *testing.T) {
 		t.Fatalf("subscription healthy_node_count after refresh: got %v, want %v", got, 0)
 	}
 
-	nodesRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subID, nil, true)
+	nodesRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subID+"&active=true", nil, true)
 	if nodesRec.Code != http.StatusOK {
 		t.Fatalf("list nodes by subscription status: got %d, want %d, body=%s", nodesRec.Code, http.StatusOK, nodesRec.Body.String())
 	}

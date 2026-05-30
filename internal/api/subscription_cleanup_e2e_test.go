@@ -91,7 +91,7 @@ func TestAPIContract_SubscriptionCleanupAction_E2E(t *testing.T) {
 		t.Fatalf("cleanup cleaned_count: got %v, want 2", got)
 	}
 
-	nodesRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subID, nil, true)
+	nodesRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subID+"&active=true", nil, true)
 	if nodesRec.Code != http.StatusOK {
 		t.Fatalf("list nodes by subscription status: got %d, want %d, body=%s", nodesRec.Code, http.StatusOK, nodesRec.Body.String())
 	}

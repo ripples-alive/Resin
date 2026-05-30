@@ -45,6 +45,7 @@ export type NodeListFilters = {
   enabled?: boolean;
   circuit_open?: boolean;
   has_outbound?: boolean;
+  active?: boolean;
 };
 
 export type NodeListQuery = NodeListFilters & {

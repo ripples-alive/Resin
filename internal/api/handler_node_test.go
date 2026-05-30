@@ -69,7 +69,7 @@ func TestHandleListNodes_TagKeywordFiltersByNodeName(t *testing.T) {
 		t,
 		srv,
 		http.MethodGet,
-		"/api/v1/nodes?subscription_id="+subA.ID+"&tag_keyword=FAST",
+		"/api/v1/nodes?subscription_id="+subA.ID+"&active=true&tag_keyword=FAST",
 		nil,
 		true,
 	)
@@ -106,7 +106,7 @@ func TestHandleListNodes_UniqueEgressIPsUsesFilteredResult(t *testing.T) {
 	markNodeHealthyForNodeListTest(t, cp, rawA1)
 	markNodeHealthyForNodeListTest(t, cp, rawA2)
 
-	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subA.ID, nil, true)
+	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subA.ID+"&active=true", nil, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list nodes status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
@@ -125,7 +125,7 @@ func TestHandleListNodes_UniqueEgressIPsUsesFilteredResult(t *testing.T) {
 		t,
 		srv,
 		http.MethodGet,
-		"/api/v1/nodes?subscription_id="+subA.ID+"&limit=1",
+		"/api/v1/nodes?subscription_id="+subA.ID+"&active=true&limit=1",
 		nil,
 		true,
 	)
@@ -147,7 +147,7 @@ func TestHandleListNodes_UniqueEgressIPsUsesFilteredResult(t *testing.T) {
 		t,
 		srv,
 		http.MethodGet,
-		"/api/v1/nodes?subscription_id="+subA.ID+"&egress_ip=203.0.113.10",
+		"/api/v1/nodes?subscription_id="+subA.ID+"&active=true&egress_ip=203.0.113.10",
 		nil,
 		true,
 	)
@@ -197,7 +197,7 @@ func TestHandleListNodes_IncludesReferenceLatencyMs(t *testing.T) {
 		LastUpdated: time.Now(),
 	})
 
-	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subA.ID, nil, true)
+	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subA.ID+"&active=true", nil, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list nodes status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
@@ -265,7 +265,7 @@ func TestHandleListNodes_EnabledFilter(t *testing.T) {
 	addNodeForNodeListTestWithTag(t, cp, subEnabled, `{"type":"ss","server":"1.1.1.1","port":443}`, "", "enabled-tag")
 	addNodeForNodeListTestWithTag(t, cp, subDisabled, `{"type":"ss","server":"2.2.2.2","port":443}`, "", "disabled-tag")
 
-	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?enabled=true", nil, true)
+	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?enabled=true&active=true", nil, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("enabled=true status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
@@ -274,7 +274,7 @@ func TestHandleListNodes_EnabledFilter(t *testing.T) {
 		t.Fatalf("enabled=true total: got %v, want 1", body["total"])
 	}
 
-	rec = doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?enabled=false", nil, true)
+	rec = doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?enabled=false&active=true", nil, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("enabled=false status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
@@ -303,7 +303,7 @@ func seedInventoryNodeForNodeListTest(
 	return hash.Hex()
 }
 
-func TestHandleListNodes_ListsActiveRuntimeNodesOnly(t *testing.T) {
+func TestHandleListNodes_DefaultListsInventoryAndActiveParamListsRuntimeOnly(t *testing.T) {
 	srv, cp, _ := newControlPlaneTestServer(t)
 
 	subA := subscription.NewSubscription("11111111-1111-1111-1111-111111111111", "sub-a", "https://example.com/a", true, false)
@@ -328,10 +328,26 @@ func TestHandleListNodes_ListsActiveRuntimeNodesOnly(t *testing.T) {
 		t.Fatalf("default list status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	body := decodeJSONMap(t, rec)
+	if body["total"] != float64(2) {
+		t.Fatalf("default inventory total: got %v, want 2", body["total"])
+	}
+	seen := map[string]bool{}
+	for _, item := range body["items"].([]any) {
+		seen[item.(map[string]any)["node_hash"].(string)] = true
+	}
+	if !seen[activeHash] || !seen[coldHash] {
+		t.Fatalf("default inventory hashes = %v, want active %s and cold %s", seen, activeHash, coldHash)
+	}
+
+	rec = doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subA.ID+"&active=true", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("active list status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body = decodeJSONMap(t, rec)
 	if body["total"] != float64(1) {
 		t.Fatalf("active runtime total: got %v, want 1", body["total"])
 	}
-	seen := map[string]bool{}
+	seen = map[string]bool{}
 	for _, item := range body["items"].([]any) {
 		seen[item.(map[string]any)["node_hash"].(string)] = true
 	}

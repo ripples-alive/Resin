@@ -137,6 +137,11 @@ func HandleListNodes(cp *service.ControlPlaneService) http.HandlerFunc {
 		}
 		filters.Enabled = enabled
 
+		activeOnly, ok := parseBoolQueryOrWriteInvalid(w, r, "active")
+		if !ok {
+			return
+		}
+
 		if v := q.Get("probed_since"); v != "" {
 			t, err := time.Parse(time.RFC3339Nano, v)
 			if err != nil {
@@ -146,7 +151,13 @@ func HandleListNodes(cp *service.ControlPlaneService) http.HandlerFunc {
 			filters.ProbedSince = &t
 		}
 
-		nodes, err := cp.ListNodes(filters)
+		var nodes []service.NodeSummary
+		var err error
+		if activeOnly != nil && *activeOnly {
+			nodes, err = cp.ListNodes(filters)
+		} else {
+			nodes, err = cp.ListInventoryNodes(filters)
+		}
 		if err != nil {
 			writeServiceError(w, err)
 			return

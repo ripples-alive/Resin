@@ -34,6 +34,7 @@ type NodeFilterDraft = {
   region: string;
   egress_ip: string;
   status: NodeStatusFilter;
+  active: boolean;
 };
 
 const defaultFilterDraft: NodeFilterDraft = {
@@ -43,6 +44,7 @@ const defaultFilterDraft: NodeFilterDraft = {
   region: "",
   egress_ip: "",
   status: "all",
+  active: true,
 };
 
 const PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500, 1000, 2000, 5000] as const;
@@ -133,6 +135,7 @@ function draftFromQuery(search: string): NodeFilterDraft {
     region: trimQueryValue(params, "region").toUpperCase(),
     egress_ip: trimQueryValue(params, "egress_ip"),
     status: statusFromQuery(params),
+    active: parseBoolParam(params.get("active")) ?? true,
   };
 }
 
@@ -175,6 +178,7 @@ function draftToActiveFilters(draft: NodeFilterDraft): NodeListFilters {
     enabled,
     circuit_open,
     has_outbound,
+    active: draft.active ? true : undefined,
   };
 }
 
@@ -493,6 +497,17 @@ export function NodesPage() {
     });
   };
 
+  const handleActiveFilterChange = (active: boolean) => {
+    setDraftFilters((prev) => {
+      const next = { ...prev, active };
+      setActiveFilters(draftToActiveFilters(next));
+      setSelectedNodeHash("");
+      setDrawerOpen(false);
+      setPage(0);
+      return next;
+    });
+  };
+
   const resetFilters = () => {
     setDraftFilters(defaultFilterDraft);
     setActiveFilters(draftToActiveFilters(defaultFilterDraft));
@@ -783,6 +798,21 @@ export function NodesPage() {
                 <option value="circuit_open">{t("熔断 / 待测")}</option>
                 <option value="error">{t("错误")}</option>
                 <option value="disabled">{t("禁用")}</option>
+              </Select>
+            </div>
+
+            <div style={NODE_FILTER_ITEM_STYLE}>
+              <label htmlFor="node-active-scope" style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>
+                {t("范围")}
+              </label>
+              <Select
+                id="node-active-scope"
+                value={draftFilters.active ? "active" : "all"}
+                onChange={(event) => handleActiveFilterChange(event.target.value === "active")}
+                style={NODE_FILTER_CONTROL_STYLE}
+              >
+                <option value="active">{t("Active")}</option>
+                <option value="all">{t("全部")}</option>
               </Select>
             </div>
 

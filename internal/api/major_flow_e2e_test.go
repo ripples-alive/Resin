@@ -253,7 +253,7 @@ func TestMajorFlow_E2E_LocalProxyAndSubscriptionProvider(t *testing.T) {
 		t.Fatal("subscription source should be requested during refresh")
 	}
 
-	nodesRec := doJSONRequest(t, h.apiServer, http.MethodGet, "/api/v1/nodes?subscription_id="+subID, nil, true)
+	nodesRec := doJSONRequest(t, h.apiServer, http.MethodGet, "/api/v1/nodes?subscription_id="+subID+"&active=true", nil, true)
 	if nodesRec.Code != http.StatusOK {
 		t.Fatalf("list nodes status: got %d, want %d, body=%s", nodesRec.Code, http.StatusOK, nodesRec.Body.String())
 	}
