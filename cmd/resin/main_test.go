@@ -2153,20 +2153,26 @@ func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool
 }
 
 func TestColdSubscriptionNodeQueueConfig_UsesProbeConcurrencyAndExpandedCapacity(t *testing.T) {
-	workers, capacity := coldSubscriptionNodeQueueSizing(64)
+	workers, capacity, batchSize := coldSubscriptionNodeQueueSizing(64)
 	if workers != 64 {
 		t.Fatalf("workers: got %d, want 64", workers)
 	}
 	if capacity != 1024 {
 		t.Fatalf("capacity for small concurrency: got %d, want 1024", capacity)
 	}
+	if batchSize != 1024 {
+		t.Fatalf("batch size for small concurrency: got %d, want 1024", batchSize)
+	}
 
-	workers, capacity = coldSubscriptionNodeQueueSizing(250)
+	workers, capacity, batchSize = coldSubscriptionNodeQueueSizing(250)
 	if workers != 250 {
 		t.Fatalf("workers: got %d, want 250", workers)
 	}
 	if capacity != 2500 {
 		t.Fatalf("capacity for large concurrency: got %d, want 2500", capacity)
+	}
+	if batchSize != 2500 {
+		t.Fatalf("batch size for large concurrency: got %d, want 2500", batchSize)
 	}
 }
 

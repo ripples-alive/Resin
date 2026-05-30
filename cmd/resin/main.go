@@ -54,7 +54,7 @@ const (
 	coldSubscriptionNodeSweepBatchSize = 256
 )
 
-func coldSubscriptionNodeQueueSizing(probeConcurrency int) (int, int) {
+func coldSubscriptionNodeQueueSizing(probeConcurrency int) (int, int, int) {
 	workers := probeConcurrency
 	if workers <= 0 {
 		workers = 1
@@ -63,7 +63,7 @@ func coldSubscriptionNodeQueueSizing(probeConcurrency int) (int, int) {
 	if capacity < coldSubscriptionNodeMinQueueCapacity {
 		capacity = coldSubscriptionNodeMinQueueCapacity
 	}
-	return workers, capacity
+	return workers, capacity, capacity
 }
 
 func main() {
@@ -362,7 +362,7 @@ func newTopologyRuntime(
 			_, err := probeMgr.ProbeLatencySync(hash)
 			return err
 		})
-		workers, queueCapacity := coldSubscriptionNodeQueueSizing(envCfg.ProbeConcurrency)
+		workers, queueCapacity, batchSize := coldSubscriptionNodeQueueSizing(envCfg.ProbeConcurrency)
 		coldNodeQueue = newColdSubscriptionNodeCheckQueue(
 			coldChecker,
 			workers,
@@ -375,7 +375,7 @@ func newTopologyRuntime(
 			pool:          pool,
 			subManager:    subManager,
 			sweepInterval: coldSubscriptionNodeSweepInterval,
-			batchSize:     coldSubscriptionNodeSweepBatchSize,
+			batchSize:     batchSize,
 		})
 	}
 
