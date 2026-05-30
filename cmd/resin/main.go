@@ -37,6 +37,8 @@ type topologyRuntime struct {
 	probeMgr         *probe.ProbeManager
 	scheduler        *topology.SubscriptionScheduler
 	ephemeralCleaner *topology.EphemeralCleaner
+	coldNodeQueue    *coldSubscriptionNodeCheckQueue
+	coldSweepRunner  *coldSubscriptionNodeSweepRunner
 	router           *routing.Router
 	leaseCleaner     *routing.LeaseCleaner
 	outboundMgr      *outbound.OutboundManager
@@ -44,6 +46,14 @@ type topologyRuntime struct {
 }
 
 const downloadUserAgent = "clash.meta"
+
+const (
+	coldSubscriptionNodeQueueCapacity = 1024
+	coldSubscriptionNodeWorkerCount   = 4
+
+	coldSubscriptionNodeSweepInterval  = 5 * time.Minute
+	coldSubscriptionNodeSweepBatchSize = 256
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -333,10 +343,36 @@ func newTopologyRuntime(
 	})
 	log.Println("ProbeManager initialized")
 
+	var coldNodeQueue *coldSubscriptionNodeCheckQueue
+	var coldSweepRunner *coldSubscriptionNodeSweepRunner
+	var inventoryStore topology.SubscriptionInventoryStore
+	if envCfg.ActiveOnlyRuntime {
+		coldChecker := newColdSubscriptionNodeChecker(engine, pool, subManager, singboxBuilder, func(hash node.Hash) error {
+			_, err := probeMgr.ProbeLatencySync(hash)
+			return err
+		})
+		coldNodeQueue = newColdSubscriptionNodeCheckQueue(
+			coldChecker,
+			coldSubscriptionNodeWorkerCount,
+			coldSubscriptionNodeQueueCapacity,
+		)
+		inventoryStore = engine
+		coldSweepRunner = newColdSubscriptionNodeSweepRunner(coldSubscriptionNodeSweepRunnerConfig{
+			store:         engine,
+			checker:       coldNodeQueue,
+			pool:          pool,
+			subManager:    subManager,
+			sweepInterval: coldSubscriptionNodeSweepInterval,
+			batchSize:     coldSubscriptionNodeSweepBatchSize,
+		})
+	}
+
 	scheduler := topology.NewSubscriptionScheduler(topology.SchedulerConfig{
-		SubManager: subManager,
-		Pool:       pool,
-		Downloader: downloader,
+		SubManager:           subManager,
+		Pool:                 pool,
+		Downloader:           downloader,
+		InventoryStore:       inventoryStore,
+		ColdNodeSweepTrigger: coldSweepRunner,
 		OnSubRefreshState: func(subID string, checkedNs int64, updatedNs *int64, lastError string) {
 			if err := engine.UpdateSubscriptionRefreshState(subID, checkedNs, updatedNs, lastError); err != nil {
 				log.Printf("[scheduler] persist subscription refresh state %s: %v", subID, err)
@@ -362,6 +398,8 @@ func newTopologyRuntime(
 		probeMgr:         probeMgr,
 		scheduler:        scheduler,
 		ephemeralCleaner: ephemeralCleaner,
+		coldNodeQueue:    coldNodeQueue,
+		coldSweepRunner:  coldSweepRunner,
 		outboundMgr:      outboundMgr,
 		singboxBuilder:   singboxBuilder,
 	}, nil
@@ -503,6 +541,348 @@ func ensureDefaultAccountHeaderRule(engine *state.StateEngine) error {
 	return nil
 }
 
+type coldSubscriptionNodeChecker struct {
+	engine            *state.StateEngine
+	pool              *topology.GlobalNodePool
+	subManager        *topology.SubscriptionManager
+	relationValidator topology.ColdNodeRelationValidator
+	relationStore     topology.ColdNodeRelationStore
+	outbound          *outbound.OutboundManager
+	probe             func(node.Hash) error
+}
+
+type coldNodeDirtyFlusher interface {
+	FlushColdNodeDirty() error
+}
+
+type coldNodeBatchWorkChecker interface {
+	CheckForBatch(topology.ColdNodeCandidate) func()
+}
+
+func newColdSubscriptionNodeChecker(
+	engine *state.StateEngine,
+	pool *topology.GlobalNodePool,
+	subManager *topology.SubscriptionManager,
+	builder outbound.OutboundBuilder,
+	probe func(node.Hash) error,
+) *coldSubscriptionNodeChecker {
+	return &coldSubscriptionNodeChecker{
+		engine:            engine,
+		pool:              pool,
+		subManager:        subManager,
+		relationValidator: engine,
+		relationStore:     engine,
+		outbound:          outbound.NewOutboundManager(pool, builder),
+		probe:             probe,
+	}
+}
+
+func (c *coldSubscriptionNodeChecker) Check(candidate topology.ColdNodeCandidate) {
+	cleanup := c.CheckForBatch(candidate)
+	if err := c.FlushColdNodeDirty(); err != nil {
+		log.Printf("cold subscription node check: flush state for %s: %v", candidate.Hash.Hex(), err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+}
+
+func (c *coldSubscriptionNodeChecker) CheckBatch(ctx context.Context, candidates []topology.ColdNodeCandidate) int {
+	completed := 0
+	cleanups := make([]func(), 0, len(candidates))
+	for _, candidate := range candidates {
+		select {
+		case <-ctx.Done():
+			if err := c.FlushColdNodeDirty(); err != nil {
+				log.Printf("cold subscription node check: flush partial batch state: %v", err)
+			}
+			for _, cleanup := range cleanups {
+				cleanup()
+			}
+			return completed
+		default:
+		}
+		if cleanup := c.CheckForBatch(candidate); cleanup != nil {
+			cleanups = append(cleanups, cleanup)
+		}
+		completed++
+	}
+	if err := c.FlushColdNodeDirty(); err != nil {
+		log.Printf("cold subscription node check: flush batch state: %v", err)
+	}
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
+	return completed
+}
+
+func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeCandidate) func() {
+	if c == nil || c.pool == nil || c.engine == nil {
+		return nil
+	}
+	createdAt := time.Now()
+	checkStartedNs := createdAt.UnixNano()
+	// The cold sweep needs a pool entry so existing outbound/probe plumbing can
+	// operate, but this is not yet an active subscription relation. Keep a
+	// probe-only sentinel reference and remove it before returning. If another
+	// real relation already owns the hash, attach the sentinel without replacing
+	// its runtime state/outbound/latency table.
+	c.pool.LoadOrAttachColdCheckTransientNode(candidate.Hash, append(json.RawMessage(nil), candidate.RawOptions...))
+
+	if c.outbound != nil {
+		c.outbound.EnsureNodeOutbound(candidate.Hash)
+	}
+	probeErr := error(nil)
+	if c.probe != nil {
+		probeErr = c.probe(candidate.Hash)
+	}
+	entry, ok := c.pool.GetEntry(candidate.Hash)
+	success := probeErr == nil && ok && entry.HasOutbound() && !entry.IsCircuitOpen() && entry.HasLatency()
+	if success {
+		restored := false
+		for _, relation := range c.currentColdRelations(candidate) {
+			if c.attachCurrentColdRelation(candidate, relation) {
+				restored = true
+			}
+		}
+		if !restored {
+			c.removeTransientColdCheckEntry(candidate.Hash)
+			return nil
+		}
+		c.engine.MarkNodeStatic(candidate.Hash.Hex())
+		c.engine.MarkNodeDynamic(candidate.Hash.Hex())
+		c.removeTransientColdCheckEntry(candidate.Hash)
+		return nil
+	}
+
+	if ok {
+		if entry.LastLatencyProbeAttempt.Load() < checkStartedNs {
+			entry.LastLatencyProbeAttempt.Store(time.Now().UnixNano())
+		}
+		c.engine.MarkNodeDynamic(candidate.Hash.Hex())
+		return func() { c.removeTransientColdCheckEntry(candidate.Hash) }
+	}
+	return nil
+}
+
+func (c *coldSubscriptionNodeChecker) currentColdRelations(candidate topology.ColdNodeCandidate) []topology.ColdNodeRelation {
+	relations := candidate.EffectiveRelations()
+	if c == nil || c.relationStore == nil {
+		return relations
+	}
+	current, err := c.relationStore.LoadCurrentColdNodeRelations(candidate.Hash)
+	if err != nil {
+		log.Printf("cold subscription node check: load current relations for %s: %v", candidate.Hash.Hex(), err)
+		return nil
+	}
+	return current
+}
+
+func (c *coldSubscriptionNodeChecker) attachCurrentColdRelation(candidate topology.ColdNodeCandidate, relation topology.ColdNodeRelation) bool {
+	if c == nil || c.subManager == nil || c.pool == nil || c.engine == nil {
+		return false
+	}
+	sub := c.subManager.Lookup(relation.SubscriptionID)
+	if sub == nil {
+		return false
+	}
+	attached := false
+	sub.WithOpLock(func() {
+		current := c.subManager.Lookup(relation.SubscriptionID)
+		if current == nil || current != sub || !current.Enabled() || !c.isCurrentColdRelation(relation.SubscriptionID, candidate.Hash) {
+			return
+		}
+		current.ManagedNodes().StoreNode(candidate.Hash, subscription.ManagedNode{Tags: append([]string(nil), relation.Tags...)})
+		c.pool.AddNodeFromSub(candidate.Hash, candidate.RawOptions, relation.SubscriptionID)
+		c.engine.MarkSubscriptionNode(relation.SubscriptionID, candidate.Hash.Hex())
+		attached = true
+	})
+	return attached
+}
+
+func (c *coldSubscriptionNodeChecker) isCurrentColdRelation(subID string, hash node.Hash) bool {
+	if c == nil || c.relationValidator == nil {
+		return true
+	}
+	return c.relationValidator.IsColdNodeRelationCurrent(subID, hash)
+}
+
+func (c *coldSubscriptionNodeChecker) FlushColdNodeDirty() error {
+	if c == nil || c.engine == nil {
+		return nil
+	}
+	return c.engine.FlushNodeDirtySets(newFlushReaders(c.pool, c.subManager, nil))
+}
+
+func (c *coldSubscriptionNodeChecker) removeTransientColdCheckEntry(hash node.Hash) {
+	entry, ok := c.pool.GetEntry(hash)
+	if !ok || entry == nil {
+		return
+	}
+	if entry.SubscriptionCount() == 1 {
+		ids := entry.SubscriptionIDs()
+		if len(ids) == 1 && ids[0] == topology.ColdCheckTransientSubscriptionID {
+			c.pool.DeleteNodeFromBootstrap(hash)
+			if c.outbound != nil {
+				c.outbound.RemoveNodeOutbound(entry)
+			}
+			if entry.LatencyTable != nil {
+				entry.LatencyTable.Close()
+			}
+			return
+		}
+	}
+	c.pool.RemoveNodeFromSub(hash, topology.ColdCheckTransientSubscriptionID)
+}
+
+type coldSubscriptionNodeCheckQueue struct {
+	checker coldNodeChecker
+	ch      chan coldSubscriptionNodeCheckWork
+	stopCh  chan struct{}
+	workers int
+	stopped atomic.Bool
+	wg      sync.WaitGroup
+}
+
+type coldSubscriptionNodeCheckWork struct {
+	candidate topology.ColdNodeCandidate
+	done      chan coldSubscriptionNodeCheckResult
+}
+
+type coldSubscriptionNodeCheckResult struct {
+	cleanup func()
+}
+
+func newColdSubscriptionNodeCheckQueue(
+	checker coldNodeChecker,
+	workers int,
+	capacity int,
+) *coldSubscriptionNodeCheckQueue {
+	if workers <= 0 {
+		workers = 1
+	}
+	if capacity <= 0 {
+		capacity = 1
+	}
+	return &coldSubscriptionNodeCheckQueue{
+		checker: checker,
+		ch:      make(chan coldSubscriptionNodeCheckWork, capacity),
+		stopCh:  make(chan struct{}),
+		workers: workers,
+	}
+}
+
+func (q *coldSubscriptionNodeCheckQueue) Start() {
+	if q == nil || q.checker == nil {
+		return
+	}
+	for i := 0; i < q.workers; i++ {
+		q.wg.Add(1)
+		go func() {
+			defer q.wg.Done()
+			for {
+				select {
+				case <-q.stopCh:
+					return
+				case work := <-q.ch:
+					var cleanup func()
+					if batchChecker, ok := q.checker.(coldNodeBatchWorkChecker); ok {
+						cleanup = batchChecker.CheckForBatch(work.candidate)
+					} else {
+						q.checker.Check(work.candidate)
+					}
+					if work.done != nil {
+						work.done <- coldSubscriptionNodeCheckResult{cleanup: cleanup}
+					}
+				}
+			}
+		}()
+	}
+}
+
+func (q *coldSubscriptionNodeCheckQueue) Stop() {
+	if q == nil || !q.stopped.CompareAndSwap(false, true) {
+		return
+	}
+	close(q.stopCh)
+	q.wg.Wait()
+}
+
+func (q *coldSubscriptionNodeCheckQueue) Check(candidate topology.ColdNodeCandidate) {
+	_ = q.CheckBatch(context.Background(), []topology.ColdNodeCandidate{candidate})
+}
+
+func (q *coldSubscriptionNodeCheckQueue) CheckBatch(ctx context.Context, candidates []topology.ColdNodeCandidate) int {
+	if q == nil || q.checker == nil || q.stopped.Load() {
+		return 0
+	}
+	done := make(chan coldSubscriptionNodeCheckResult, len(candidates))
+	queued := 0
+candidateLoop:
+	for _, candidate := range candidates {
+		work := candidate.Clone()
+		select {
+		case <-ctx.Done():
+			break candidateLoop
+		case <-q.stopCh:
+			return queued
+		case q.ch <- coldSubscriptionNodeCheckWork{candidate: work, done: done}:
+			queued++
+		}
+	}
+
+	completed := 0
+	cleanups := make([]func(), 0, queued)
+	for completed < queued {
+		select {
+		case <-q.stopCh:
+			q.finishCompletedColdChecks(cleanups)
+			return completed
+		case result := <-done:
+			if result.cleanup != nil {
+				cleanups = append(cleanups, result.cleanup)
+			}
+			completed++
+		}
+	}
+	q.finishCompletedColdChecks(cleanups)
+	return completed
+}
+
+func (q *coldSubscriptionNodeCheckQueue) finishCompletedColdChecks(cleanups []func()) {
+	if q == nil {
+		return
+	}
+	if flusher, ok := q.checker.(coldNodeDirtyFlusher); ok {
+		if err := flusher.FlushColdNodeDirty(); err != nil {
+			log.Printf("cold subscription node check: flush batch state: %v", err)
+		}
+	}
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
+}
+
+func nodeDynamicModelFromEntry(hash string, entry *node.NodeEntry) model.NodeDynamic {
+	egressIP := entry.GetEgressIP()
+	egressStr := ""
+	if egressIP.IsValid() {
+		egressStr = egressIP.String()
+	}
+	return model.NodeDynamic{
+		Hash:                               hash,
+		FailureCount:                       int(entry.FailureCount.Load()),
+		CircuitOpenSince:                   entry.CircuitOpenSince.Load(),
+		EgressIP:                           egressStr,
+		EgressIPs:                          entry.GetObservedEgressIPStrings(),
+		EgressRegion:                       entry.GetEgressRegion(),
+		EgressUpdatedAtNs:                  entry.LastEgressUpdate.Load(),
+		LastLatencyProbeAttemptNs:          entry.LastLatencyProbeAttempt.Load(),
+		LastAuthorityLatencyProbeAttemptNs: entry.LastAuthorityLatencyProbeAttempt.Load(),
+		LastEgressUpdateAttemptNs:          entry.LastEgressUpdateAttempt.Load(),
+	}
+}
+
 func newFlushReaders(
 	pool *topology.GlobalNodePool,
 	subManager *topology.SubscriptionManager,
@@ -533,23 +913,8 @@ func newFlushReaders(
 			if !ok {
 				return nil
 			}
-			egressIP := entry.GetEgressIP()
-			egressStr := ""
-			if egressIP.IsValid() {
-				egressStr = egressIP.String()
-			}
-			return &model.NodeDynamic{
-				Hash:                               hash,
-				FailureCount:                       int(entry.FailureCount.Load()),
-				CircuitOpenSince:                   entry.CircuitOpenSince.Load(),
-				EgressIP:                           egressStr,
-				EgressIPs:                          entry.GetObservedEgressIPStrings(),
-				EgressRegion:                       entry.GetEgressRegion(),
-				EgressUpdatedAtNs:                  entry.LastEgressUpdate.Load(),
-				LastLatencyProbeAttemptNs:          entry.LastLatencyProbeAttempt.Load(),
-				LastAuthorityLatencyProbeAttemptNs: entry.LastAuthorityLatencyProbeAttempt.Load(),
-				LastEgressUpdateAttemptNs:          entry.LastEgressUpdateAttempt.Load(),
-			}
+			dynamic := nodeDynamicModelFromEntry(hash, entry)
+			return &dynamic
 		},
 		ReadNodeLatency: func(key model.NodeLatencyKey) *model.NodeLatency {
 			h, err := node.ParseHex(key.NodeHash)
@@ -899,10 +1264,14 @@ func restoreBootstrapNodeLatencies(
 	pool *topology.GlobalNodePool,
 	maxRegularEntries int,
 	latencyAuthorities []string,
+	latencies []model.NodeLatency,
 ) error {
-	latencies, err := engine.LoadAllNodeLatency()
-	if err != nil {
-		return fmt.Errorf("load node_latency: %w", err)
+	if latencies == nil {
+		var err error
+		latencies, err = engine.LoadAllNodeLatency()
+		if err != nil {
+			return fmt.Errorf("load node_latency: %w", err)
+		}
 	}
 
 	if maxRegularEntries <= 0 {
@@ -983,8 +1352,146 @@ func restoreBootstrapNodeLatencies(
 	return nil
 }
 
+func pruneColdBootstrapNodes(pool *topology.GlobalNodePool, subManager *topology.SubscriptionManager) {
+	if pool == nil || subManager == nil {
+		return
+	}
+	active := make(map[node.Hash]bool)
+	pool.Range(func(hash node.Hash, entry *node.NodeEntry) bool {
+		active[hash] = entry != nil && entry.HasOutbound() && !entry.IsCircuitOpen()
+		return true
+	})
+	subManager.Range(func(_ string, sub *subscription.Subscription) bool {
+		managed := subscription.NewManagedNodes()
+		if sub != nil && sub.Enabled() {
+			sub.ManagedNodes().RangeNodes(func(hash node.Hash, mn subscription.ManagedNode) bool {
+				if !mn.Evicted && active[hash] {
+					managed.StoreNode(hash, mn)
+				}
+				return true
+			})
+		}
+		sub.SwapManagedNodes(managed)
+		return true
+	})
+	pool.Range(func(hash node.Hash, entry *node.NodeEntry) bool {
+		if entry == nil || !active[hash] {
+			pool.DeleteNodeFromBootstrap(hash)
+			return true
+		}
+		keep := false
+		for _, subID := range entry.SubscriptionIDs() {
+			if sub := subManager.Lookup(subID); sub != nil && sub.Enabled() {
+				if mn, ok := sub.ManagedNodes().LoadNode(hash); ok && !mn.Evicted {
+					keep = true
+					break
+				}
+			}
+		}
+		if !keep {
+			pool.DeleteNodeFromBootstrap(hash)
+		}
+		return true
+	})
+}
+
+func enabledSubscriptionIDs(subManager *topology.SubscriptionManager) []string {
+	if subManager == nil {
+		return nil
+	}
+	ids := make([]string, 0)
+	subManager.Range(func(id string, sub *subscription.Subscription) bool {
+		if sub != nil && sub.Enabled() {
+			ids = append(ids, id)
+		}
+		return true
+	})
+	sort.Strings(ids)
+	return ids
+}
+
+func loadActiveOnlyBootstrapNodes(
+	engine *state.StateEngine,
+	pool *topology.GlobalNodePool,
+	subManager *topology.SubscriptionManager,
+	envCfg *config.EnvConfig,
+	latencyAuthorities []string,
+) ([]node.Hash, error) {
+	records, err := engine.LoadBootstrapActiveNodes(enabledSubscriptionIDs(subManager))
+	if err != nil {
+		return nil, fmt.Errorf("load active bootstrap nodes: %w", err)
+	}
+
+	hashes := make([]node.Hash, 0, len(records))
+	hashHexes := make([]string, 0, len(records))
+	for _, record := range records {
+		hash, err := node.ParseHex(record.Static.Hash)
+		if err != nil {
+			log.Printf("[bootstrap] skip active node %s: %v", record.Static.Hash, err)
+			continue
+		}
+		entry := &node.NodeEntry{
+			Hash:       hash,
+			RawOptions: append(json.RawMessage(nil), record.Static.RawOptions...),
+			CreatedAt:  time.Unix(0, record.Static.CreatedAtNs),
+		}
+		entry.LatencyTable = node.NewLatencyTable(envCfg.MaxLatencyTableEntries)
+		entry.FailureCount.Store(int32(record.Dynamic.FailureCount))
+		entry.CircuitOpenSince.Store(record.Dynamic.CircuitOpenSince)
+		entry.LastLatencyProbeAttempt.Store(record.Dynamic.LastLatencyProbeAttemptNs)
+		entry.LastAuthorityLatencyProbeAttempt.Store(record.Dynamic.LastAuthorityLatencyProbeAttemptNs)
+		entry.LastEgressUpdateAttempt.Store(record.Dynamic.LastEgressUpdateAttemptNs)
+		if record.Dynamic.EgressIP != "" {
+			if ip, err := netip.ParseAddr(record.Dynamic.EgressIP); err == nil {
+				entry.SetEgressIP(ip)
+			}
+		}
+		if len(record.Dynamic.EgressIPs) > 0 {
+			entry.SetObservedEgressIPStrings(record.Dynamic.EgressIPs)
+		}
+		entry.SetEgressRegion(record.Dynamic.EgressRegion)
+		entry.LastEgressUpdate.Store(record.Dynamic.EgressUpdatedAtNs)
+
+		managedBySub := make(map[string]subscription.ManagedNode, len(record.Relations))
+		for _, relation := range record.Relations {
+			if relation.Evicted {
+				continue
+			}
+			if sub := subManager.Lookup(relation.SubscriptionID); sub != nil && sub.Enabled() {
+				entry.AddSubscriptionID(relation.SubscriptionID)
+				managedBySub[relation.SubscriptionID] = subscription.ManagedNode{
+					Tags: append([]string(nil), relation.Tags...),
+				}
+			}
+		}
+		if entry.SubscriptionCount() == 0 {
+			continue
+		}
+
+		pool.LoadNodeFromBootstrap(entry)
+		for subID, managed := range managedBySub {
+			if sub := subManager.Lookup(subID); sub != nil {
+				sub.ManagedNodes().StoreNode(hash, managed)
+			}
+		}
+		hashes = append(hashes, hash)
+		hashHexes = append(hashHexes, record.Static.Hash)
+	}
+
+	latencies, err := engine.LoadNodeLatencyForHashes(hashHexes)
+	if err != nil {
+		return nil, fmt.Errorf("load active bootstrap latencies: %w", err)
+	}
+	if err := restoreBootstrapNodeLatencies(engine, pool, envCfg.MaxLatencyTableEntries, latencyAuthorities, latencies); err != nil {
+		return nil, err
+	}
+	log.Printf("Loaded %d active bootstrap nodes from cache.db", len(hashes))
+	return hashes, nil
+}
+
 // bootstrapNodes loads cached node data from persistence for bootstrap recovery.
-// Steps: static nodes → subscription bindings → dynamic state → latency tables.
+// In active-only mode, DB filtering restores only persisted active candidates;
+// legacy mode restores the full cache inventory before outbound warmup.
 func bootstrapNodes(
 	engine *state.StateEngine,
 	pool *topology.GlobalNodePool,
@@ -993,12 +1500,20 @@ func bootstrapNodes(
 	envCfg *config.EnvConfig,
 	latencyAuthorities []string,
 ) error {
+	if envCfg.ActiveOnlyRuntime {
+		hashes, err := loadActiveOnlyBootstrapNodes(engine, pool, subManager, envCfg, latencyAuthorities)
+		if err != nil {
+			return err
+		}
+		warmupBootstrapOutbounds(hashes, outboundMgr)
+		pruneColdBootstrapNodes(pool, subManager)
+		return nil
+	}
+
 	hashes, err := loadBootstrapNodeStatics(engine, pool, envCfg)
 	if err != nil {
 		return err
 	}
-
-	warmupBootstrapOutbounds(hashes, outboundMgr)
 
 	if err := restoreBootstrapSubscriptionBindings(engine, pool, subManager); err != nil {
 		return err
@@ -1011,8 +1526,10 @@ func bootstrapNodes(
 		pool,
 		envCfg.MaxLatencyTableEntries,
 		latencyAuthorities,
+		nil,
 	); err != nil {
 		return err
 	}
+	warmupBootstrapOutbounds(hashes, outboundMgr)
 	return nil
 }

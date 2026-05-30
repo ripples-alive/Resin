@@ -122,12 +122,26 @@ func classifyDirtySet[K comparable, V any](
 // and batch-writes to cache.db in a single transaction.
 // On failure, undrained entries are merged back.
 func (e *StateEngine) FlushDirtySets(readers CacheReaders) error {
+	return e.flushDirtySets(readers, true)
+}
+
+// FlushNodeDirtySets drains only node/inventory dirty sets, leaving leases for
+// the regular cache flush worker. This is useful for cold-node checks, which
+// need to persist probe outcomes but do not have a router/lease reader.
+func (e *StateEngine) FlushNodeDirtySets(readers CacheReaders) error {
+	return e.flushDirtySets(readers, false)
+}
+
+func (e *StateEngine) flushDirtySets(readers CacheReaders, includeLeases bool) error {
 	// Drain all sets atomically (each set is individually atomic).
 	drainedStatic := e.dirtyNodesStatic.Drain()
 	drainedSubNodes := e.dirtySubscriptionNodes.Drain()
 	drainedDynamic := e.dirtyNodesDynamic.Drain()
 	drainedLatency := e.dirtyNodeLatency.Drain()
-	drainedLeases := e.dirtyLeases.Drain()
+	drainedLeases := map[LeaseDirtyKey]DirtyOp(nil)
+	if includeLeases {
+		drainedLeases = e.dirtyLeases.Drain()
+	}
 
 	// Re-merge helper on failure.
 	remerge := func() {
@@ -135,7 +149,9 @@ func (e *StateEngine) FlushDirtySets(readers CacheReaders) error {
 		e.dirtySubscriptionNodes.Merge(drainedSubNodes)
 		e.dirtyNodesDynamic.Merge(drainedDynamic)
 		e.dirtyNodeLatency.Merge(drainedLatency)
-		e.dirtyLeases.Merge(drainedLeases)
+		if includeLeases {
+			e.dirtyLeases.Merge(drainedLeases)
+		}
 	}
 
 	// Classify each dirty set into upsert values and delete keys.
@@ -143,7 +159,11 @@ func (e *StateEngine) FlushDirtySets(readers CacheReaders) error {
 	upsertSubNodes, deleteSubNodes := classifyDirtySet(drainedSubNodes, readers.ReadSubscriptionNode)
 	upsertDynamic, deleteDynamic := classifyDirtySet(drainedDynamic, readers.ReadNodeDynamic)
 	upsertLatency, deleteLatency := classifyDirtySet(drainedLatency, readers.ReadNodeLatency)
-	upsertLeases, deleteLeases := classifyDirtySet(drainedLeases, readers.ReadLease)
+	var upsertLeases []model.Lease
+	var deleteLeases []LeaseDirtyKey
+	if includeLeases {
+		upsertLeases, deleteLeases = classifyDirtySet(drainedLeases, readers.ReadLease)
+	}
 
 	// Execute all writes in a single transaction.
 	if err := e.CacheRepo.FlushTx(FlushOps{
@@ -162,7 +182,11 @@ func (e *StateEngine) FlushDirtySets(readers CacheReaders) error {
 		return fmt.Errorf("flush: %w", err)
 	}
 
+	leaseCount := 0
+	if includeLeases {
+		leaseCount = len(drainedLeases)
+	}
 	log.Printf("[state] flushed dirty sets: static=%d, sub_nodes=%d, dynamic=%d, latency=%d, leases=%d",
-		len(drainedStatic), len(drainedSubNodes), len(drainedDynamic), len(drainedLatency), len(drainedLeases))
+		len(drainedStatic), len(drainedSubNodes), len(drainedDynamic), len(drainedLatency), leaseCount)
 	return nil
 }

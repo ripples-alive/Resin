@@ -99,6 +99,7 @@ func newControlPlaneTestServerWithBodyLimit(
 			DefaultPlatformReverseProxyFixedAccountHeader:   "Authorization",
 			DefaultPlatformAllocationPolicy:                 "BALANCED",
 			EnableEmbeddedSecureDNS:                         true,
+			ActiveOnlyRuntime:                               true,
 		},
 	}
 
@@ -1119,6 +1120,9 @@ func TestAPIContract_SystemEnvConfigSnapshot(t *testing.T) {
 	}
 	if body["enable_embedded_secure_dns"] != true {
 		t.Fatalf("enable_embedded_secure_dns: got %v, want true", body["enable_embedded_secure_dns"])
+	}
+	if body["active_only_runtime"] != true {
+		t.Fatalf("active_only_runtime: got %v, want true", body["active_only_runtime"])
 	}
 	if body["admin_token_set"] != false {
 		t.Fatalf("admin_token_set: got %v, want false", body["admin_token_set"])

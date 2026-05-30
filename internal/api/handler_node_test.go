@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Resinat/Resin/internal/config"
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/probe"
 	"github.com/Resinat/Resin/internal/service"
@@ -280,5 +281,64 @@ func TestHandleListNodes_EnabledFilter(t *testing.T) {
 	body = decodeJSONMap(t, rec)
 	if body["total"] != float64(1) {
 		t.Fatalf("enabled=false total: got %v, want 1", body["total"])
+	}
+}
+
+func seedInventoryNodeForNodeListTest(
+	t *testing.T,
+	cp *service.ControlPlaneService,
+	sub *subscription.Subscription,
+	raw string,
+	tag string,
+) string {
+	t.Helper()
+	hash := node.HashFromRawOptions([]byte(raw))
+	if err := cp.Engine.ReplaceSubscriptionRefresh(sub.ID,
+		[]model.NodeStatic{{Hash: hash.Hex(), RawOptions: []byte(raw), CreatedAtNs: time.Now().Add(-time.Minute).UnixNano()}},
+		[]model.SubscriptionNode{{SubscriptionID: sub.ID, NodeHash: hash.Hex(), Tags: []string{tag}}},
+		nil,
+	); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh: %v", err)
+	}
+	return hash.Hex()
+}
+
+func TestHandleListNodes_ListsActiveRuntimeNodesOnly(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+
+	subA := subscription.NewSubscription("11111111-1111-1111-1111-111111111111", "sub-a", "https://example.com/a", true, false)
+	cp.SubMgr.Register(subA)
+
+	activeRaw := `{"type":"ss","server":"1.1.1.1","port":443}`
+	coldRaw := `{"type":"ss","server":"2.2.2.2","port":443}`
+	activeHash := node.HashFromRawOptions([]byte(activeRaw)).Hex()
+	coldHash := seedInventoryNodeForNodeListTest(t, cp, subA, coldRaw, "cold-tag")
+
+	addNodeForNodeListTestWithTag(t, cp, subA, activeRaw, "203.0.113.10", "active-tag")
+	if err := cp.Engine.ReplaceSubscriptionRefresh(subA.ID,
+		[]model.NodeStatic{{Hash: activeHash, RawOptions: []byte(activeRaw), CreatedAtNs: time.Now().Add(-2 * time.Minute).UnixNano()}},
+		[]model.SubscriptionNode{{SubscriptionID: subA.ID, NodeHash: activeHash, Tags: []string{"active-tag"}}},
+		nil,
+	); err != nil {
+		t.Fatalf("seed active inventory row: %v", err)
+	}
+
+	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subA.ID, nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default list status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := decodeJSONMap(t, rec)
+	if body["total"] != float64(1) {
+		t.Fatalf("active runtime total: got %v, want 1", body["total"])
+	}
+	seen := map[string]bool{}
+	for _, item := range body["items"].([]any) {
+		seen[item.(map[string]any)["node_hash"].(string)] = true
+	}
+	if !seen[activeHash] {
+		t.Fatalf("active runtime hashes = %v, want active %s", seen, activeHash)
+	}
+	if seen[coldHash] {
+		t.Fatalf("active runtime hashes = %v, should not include inventory-only %s", seen, coldHash)
 	}
 }

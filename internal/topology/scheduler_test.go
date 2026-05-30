@@ -7,13 +7,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/platform"
@@ -46,6 +49,79 @@ func newTestScheduler(subMgr *SubscriptionManager, pool *GlobalNodePool, fetcher
 		Pool:       pool,
 		Fetcher:    fetcher,
 	})
+}
+
+type recordingSubscriptionInventoryStore struct {
+	loadRows []model.SubscriptionNode
+
+	replaceCalls []inventoryReplaceCall
+	onLoad       func(subID string)
+	onReplace    func()
+}
+
+type inventoryReplaceCall struct {
+	subID   string
+	statics []model.NodeStatic
+	upserts []model.SubscriptionNode
+	deletes []model.SubscriptionNodeKey
+}
+
+func (s *recordingSubscriptionInventoryStore) LoadSubscriptionNodes(subID string) ([]model.SubscriptionNode, error) {
+	if s.onLoad != nil {
+		s.onLoad(subID)
+	}
+	out := make([]model.SubscriptionNode, 0, len(s.loadRows))
+	for _, row := range s.loadRows {
+		if row.SubscriptionID == subID {
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+func (s *recordingSubscriptionInventoryStore) ReplaceSubscriptionRefresh(
+	subID string,
+	statics []model.NodeStatic,
+	upserts []model.SubscriptionNode,
+	deletes []model.SubscriptionNodeKey,
+) error {
+	if s.onReplace != nil {
+		s.onReplace()
+	}
+	s.replaceCalls = append(s.replaceCalls, inventoryReplaceCall{
+		subID:   subID,
+		statics: append([]model.NodeStatic(nil), statics...),
+		upserts: append([]model.SubscriptionNode(nil), upserts...),
+		deletes: append([]model.SubscriptionNodeKey(nil), deletes...),
+	})
+	return nil
+}
+
+type recordingColdNodeSweepTrigger struct {
+	reasons []string
+}
+
+func (t *recordingColdNodeSweepTrigger) TriggerColdNodeSweep(reason string) bool {
+	t.reasons = append(t.reasons, reason)
+	return true
+}
+
+func managedNodeCount(mn *subscription.ManagedNodes) int {
+	count := 0
+	mn.RangeNodes(func(_ node.Hash, _ subscription.ManagedNode) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+func subscriptionNodeByHash(rows []model.SubscriptionNode, h node.Hash) (model.SubscriptionNode, bool) {
+	for _, row := range rows {
+		if row.NodeHash == h.Hex() {
+			return row, true
+		}
+	}
+	return model.SubscriptionNode{}, false
 }
 
 // --- Test: UpdateSubscription success path ---
@@ -353,6 +429,442 @@ func TestScheduler_UpdateSubscription_KeepEvictedDoesNotReAddToPool(t *testing.T
 	}
 }
 
+func TestScheduler_InventoryRefresh_PersistsNewNodesBeforeMemoryPromotionAndTriggersColdSweep(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := `{"type":"shadowsocks","tag":"cold-node","server":"1.1.1.1","server_port":443}`
+	hash := node.HashFromRawOptions([]byte(raw))
+	body := makeSubscriptionJSON(raw)
+	inventoryStore := &recordingSubscriptionInventoryStore{
+		onReplace: func() {
+			if pool.Size() != 0 {
+				t.Fatalf("inventory persistence must happen before memory promotion, pool size=%d", pool.Size())
+			}
+			if got := managedNodeCount(sub.ManagedNodes()); got != 0 {
+				t.Fatalf("inventory persistence must happen before active managed update, got %d managed nodes", got)
+			}
+		},
+	}
+	coldTrigger := &recordingColdNodeSweepTrigger{}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:           subMgr,
+		Pool:                 pool,
+		Fetcher:              makeMockFetcher(body, nil),
+		InventoryStore:       inventoryStore,
+		ColdNodeSweepTrigger: coldTrigger,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
+	}
+	call := inventoryStore.replaceCalls[0]
+	if call.subID != sub.ID {
+		t.Fatalf("inventory subID: got %q, want %q", call.subID, sub.ID)
+	}
+	if len(call.statics) != 1 || call.statics[0].Hash != hash.Hex() || string(call.statics[0].RawOptions) != raw {
+		t.Fatalf("inventory statics: got %+v, want hash %s raw %s", call.statics, hash.Hex(), raw)
+	}
+	if len(call.upserts) != 1 {
+		t.Fatalf("inventory upserts: got %+v, want one relation", call.upserts)
+	}
+	upsert := call.upserts[0]
+	if upsert.SubscriptionID != sub.ID || upsert.NodeHash != hash.Hex() || upsert.Evicted {
+		t.Fatalf("inventory relation: got %+v, want non-evicted relation for %s", upsert, hash.Hex())
+	}
+	if !reflect.DeepEqual(upsert.Tags, []string{"cold-node"}) {
+		t.Fatalf("inventory tags: got %v, want [cold-node]", upsert.Tags)
+	}
+	if len(call.deletes) != 0 {
+		t.Fatalf("unexpected inventory deletes: %+v", call.deletes)
+	}
+	if pool.Size() != 0 {
+		t.Fatalf("new cold node must not be promoted into memory before check, pool size=%d", pool.Size())
+	}
+	if got := managedNodeCount(sub.ManagedNodes()); got != 0 {
+		t.Fatalf("new cold node must not be in active managed memory, got %d managed nodes", got)
+	}
+	if len(coldTrigger.reasons) != 1 {
+		t.Fatalf("expected one cold sweep trigger, got %d", len(coldTrigger.reasons))
+	}
+	if coldTrigger.reasons[0] != "subscription_refresh" {
+		t.Fatalf("cold sweep reason: got %q, want subscription_refresh", coldTrigger.reasons[0])
+	}
+}
+
+func TestScheduler_InventoryRefresh_OldViewMergesInventoryAndLiveWithLiveWinning(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	rawLive := `{"type":"shadowsocks","tag":"live-new","server":"1.1.1.1","server_port":443}`
+	rawNewCold := `{"type":"shadowsocks","tag":"new-cold","server":"2.2.2.2","server_port":443}`
+	rawRemovedCold := `{"type":"shadowsocks","tag":"removed-cold","server":"3.3.3.3","server_port":443}`
+	liveHash := node.HashFromRawOptions([]byte(rawLive))
+	newColdHash := node.HashFromRawOptions([]byte(rawNewCold))
+	removedColdHash := node.HashFromRawOptions([]byte(rawRemovedCold))
+
+	mn := subscription.NewManagedNodes()
+	mn.StoreNode(liveHash, subscription.ManagedNode{Tags: []string{"live-old"}, Evicted: false})
+	sub.SwapManagedNodes(mn)
+	pool.AddNodeFromSub(liveHash, json.RawMessage(rawLive), sub.ID)
+	entry, ok := pool.GetEntry(liveHash)
+	if !ok {
+		t.Fatal("live node missing from setup")
+	}
+	ob := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&ob)
+	entry.CircuitOpenSince.Store(0)
+
+	inventoryStore := &recordingSubscriptionInventoryStore{
+		loadRows: []model.SubscriptionNode{
+			{SubscriptionID: sub.ID, NodeHash: liveHash.Hex(), Tags: []string{"db-live-old"}, Evicted: true},
+			{SubscriptionID: sub.ID, NodeHash: removedColdHash.Hex(), Tags: []string{"removed-cold"}, Evicted: false},
+		},
+	}
+	coldTrigger := &recordingColdNodeSweepTrigger{}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:           subMgr,
+		Pool:                 pool,
+		Fetcher:              makeMockFetcher(makeSubscriptionJSON(rawLive, rawNewCold), nil),
+		InventoryStore:       inventoryStore,
+		ColdNodeSweepTrigger: coldTrigger,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
+	}
+	call := inventoryStore.replaceCalls[0]
+	liveRow, ok := subscriptionNodeByHash(call.upserts, liveHash)
+	if !ok {
+		t.Fatalf("live relation missing from upserts: %+v", call.upserts)
+	}
+	if liveRow.Evicted {
+		t.Fatalf("live state should override inventory evicted row, got %+v", liveRow)
+	}
+	if !reflect.DeepEqual(liveRow.Tags, []string{"live-new"}) {
+		t.Fatalf("live relation tags: got %v, want [live-new]", liveRow.Tags)
+	}
+	if _, ok := subscriptionNodeByHash(call.upserts, newColdHash); !ok {
+		t.Fatalf("new cold relation missing from upserts: %+v", call.upserts)
+	}
+	if len(call.deletes) != 1 || call.deletes[0].NodeHash != removedColdHash.Hex() {
+		t.Fatalf("removed inventory relation deletes: got %+v, want %s", call.deletes, removedColdHash.Hex())
+	}
+	managed, ok := sub.ManagedNodes().LoadNode(liveHash)
+	if !ok {
+		t.Fatal("live relation should remain in active managed memory")
+	}
+	if managed.Evicted {
+		t.Fatal("live relation should not become evicted from DB inventory row")
+	}
+	if _, ok := sub.ManagedNodes().LoadNode(newColdHash); ok {
+		t.Fatal("new cold relation should not enter active managed memory before cold check")
+	}
+	if len(coldTrigger.reasons) != 1 || coldTrigger.reasons[0] != "subscription_refresh" {
+		t.Fatalf("cold sweep trigger: got %+v, want one subscription_refresh trigger", coldTrigger.reasons)
+	}
+}
+
+func TestScheduler_InventoryRefresh_RemovedLiveRelationIsAuthoritativelyDeleted(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	rawLive := json.RawMessage(`{"type":"shadowsocks","tag":"live-old","server":"1.1.1.1","server_port":443}`)
+	liveHash := node.HashFromRawOptions(rawLive)
+	mn := subscription.NewManagedNodes()
+	mn.StoreNode(liveHash, subscription.ManagedNode{Tags: []string{"live-old"}})
+	sub.SwapManagedNodes(mn)
+	pool.AddNodeFromSub(liveHash, rawLive, sub.ID)
+	entry, ok := pool.GetEntry(liveHash)
+	if !ok {
+		t.Fatal("live node missing from setup")
+	}
+	ob := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&ob)
+	entry.CircuitOpenSince.Store(0)
+
+	inventoryStore := &recordingSubscriptionInventoryStore{}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:     subMgr,
+		Pool:           pool,
+		Fetcher:        makeMockFetcher(makeSubscriptionJSON(), nil),
+		InventoryStore: inventoryStore,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	if _, ok := pool.GetEntry(liveHash); ok {
+		t.Fatal("refresh result missing this node should remove the subscription relation from pool")
+	}
+	if _, ok := sub.ManagedNodes().LoadNode(liveHash); ok {
+		t.Fatal("refresh result missing this node should remove it from managed memory")
+	}
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
+	}
+	if _, ok := subscriptionNodeByHash(inventoryStore.replaceCalls[0].upserts, liveHash); ok {
+		t.Fatalf("removed live relation should not be retained in inventory upserts: %+v", inventoryStore.replaceCalls[0].upserts)
+	}
+	if len(inventoryStore.replaceCalls[0].deletes) != 1 || inventoryStore.replaceCalls[0].deletes[0].SubscriptionID != sub.ID || inventoryStore.replaceCalls[0].deletes[0].NodeHash != liveHash.Hex() {
+		t.Fatalf("removed live relation should be deleted from inventory: %+v", inventoryStore.replaceCalls[0].deletes)
+	}
+}
+
+func TestScheduler_InventoryRefresh_AttachesParsedRelationToExistingRealMemoryNode(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	anchorSub := subscription.NewSubscription("s2", "AnchorSub", "http://example.com/anchor", true, false)
+	subMgr.Register(sub)
+	subMgr.Register(anchorSub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"shadowsocks","tag":"shared-node","server":"1.1.1.1","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	anchorManaged := subscription.NewManagedNodes()
+	anchorManaged.StoreNode(hash, subscription.ManagedNode{Tags: []string{"anchor"}})
+	anchorSub.SwapManagedNodes(anchorManaged)
+	pool.AddNodeFromSub(hash, raw, anchorSub.ID)
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("anchor node missing from setup")
+	}
+	entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma:        100 * time.Millisecond,
+		LastUpdated: time.Now(),
+	})
+	ob := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&ob)
+	entry.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	pool.RecordResult(hash, true)
+
+	plat := platform.NewPlatform("p-shared", "Shared", []*regexp.Regexp{regexp.MustCompile("shared-node")}, nil)
+	pool.RegisterPlatform(plat)
+	pool.RebuildAllPlatforms()
+	if plat.View().Contains(hash) {
+		t.Fatal("anchor-only relation should not match shared-node platform before refresh")
+	}
+
+	inventoryStore := &recordingSubscriptionInventoryStore{}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:     subMgr,
+		Pool:           pool,
+		Fetcher:        makeMockFetcher(makeSubscriptionJSON(string(raw)), nil),
+		InventoryStore: inventoryStore,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	managed, ok := sub.ManagedNodes().LoadNode(hash)
+	if !ok {
+		t.Fatal("parsed relation should attach to existing real in-memory node even when it is not healthy yet")
+	}
+	if !reflect.DeepEqual(managed.Tags, []string{"shared-node"}) {
+		t.Fatalf("managed tags: got %v, want [shared-node]", managed.Tags)
+	}
+	entry, ok = pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("shared node should remain in pool")
+	}
+	ids := entry.SubscriptionIDs()
+	sort.Strings(ids)
+	if !reflect.DeepEqual(ids, []string{"s1", "s2"}) {
+		t.Fatalf("subscription refs: got %v, want [s1 s2]", ids)
+	}
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
+	}
+	if _, ok := subscriptionNodeByHash(inventoryStore.replaceCalls[0].upserts, hash); !ok {
+		t.Fatalf("parsed relation missing from inventory upserts: %+v", inventoryStore.replaceCalls[0].upserts)
+	}
+	if !plat.View().Contains(hash) {
+		t.Fatal("platform view should include shared node immediately after inventory refresh attaches matching relation")
+	}
+}
+
+func TestScheduler_InventoryRefresh_DoesNotAttachParsedRelationToTransientColdCheckNode(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"shadowsocks","tag":"transient-node","server":"1.1.1.1","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	entry := node.NewNodeEntry(hash, raw, time.Now(), 16)
+	entry.AddSubscriptionID(ColdCheckTransientSubscriptionID)
+	pool.LoadNodeFromBootstrap(entry)
+
+	inventoryStore := &recordingSubscriptionInventoryStore{}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:     subMgr,
+		Pool:           pool,
+		Fetcher:        makeMockFetcher(makeSubscriptionJSON(string(raw)), nil),
+		InventoryStore: inventoryStore,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	if _, ok := sub.ManagedNodes().LoadNode(hash); ok {
+		t.Fatal("parsed relation must not attach to a probe-only transient cold-check node")
+	}
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("test setup transient entry should remain until cold checker cleanup")
+	}
+	if ids := entry.SubscriptionIDs(); !reflect.DeepEqual(ids, []string{ColdCheckTransientSubscriptionID}) {
+		t.Fatalf("transient entry subscriptions: got %v, want only transient sentinel", ids)
+	}
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
+	}
+	if _, ok := subscriptionNodeByHash(inventoryStore.replaceCalls[0].upserts, hash); !ok {
+		t.Fatalf("transient relation should still be persisted to cold inventory: %+v", inventoryStore.replaceCalls[0].upserts)
+	}
+}
+
+func TestScheduler_InventoryRefresh_EvictedRelationNotRevived(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := `{"type":"shadowsocks","tag":"evicted-node","server":"1.1.1.1","server_port":443}`
+	hash := node.HashFromRawOptions([]byte(raw))
+	inventoryStore := &recordingSubscriptionInventoryStore{
+		loadRows: []model.SubscriptionNode{
+			{SubscriptionID: sub.ID, NodeHash: hash.Hex(), Tags: []string{"old-evicted"}, Evicted: true},
+		},
+	}
+	coldTrigger := &recordingColdNodeSweepTrigger{}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:           subMgr,
+		Pool:                 pool,
+		Fetcher:              makeMockFetcher(makeSubscriptionJSON(raw), nil),
+		InventoryStore:       inventoryStore,
+		ColdNodeSweepTrigger: coldTrigger,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	if pool.Size() != 0 {
+		t.Fatalf("evicted relation should not be promoted, pool size=%d", pool.Size())
+	}
+	if got := managedNodeCount(sub.ManagedNodes()); got != 0 {
+		t.Fatalf("evicted relation should not enter active memory, got %d managed nodes", got)
+	}
+	if len(coldTrigger.reasons) != 1 || coldTrigger.reasons[0] != "subscription_refresh" {
+		t.Fatalf("cold sweep trigger: got %+v, want one subscription_refresh trigger", coldTrigger.reasons)
+	}
+	if len(inventoryStore.replaceCalls) != 1 {
+		t.Fatalf("expected one inventory replace call, got %d", len(inventoryStore.replaceCalls))
+	}
+	row, ok := subscriptionNodeByHash(inventoryStore.replaceCalls[0].upserts, hash)
+	if !ok {
+		t.Fatalf("evicted relation should stay in inventory upserts: %+v", inventoryStore.replaceCalls[0].upserts)
+	}
+	if !row.Evicted {
+		t.Fatalf("evicted relation was revived: %+v", row)
+	}
+}
+
+func TestScheduler_InventoryRefresh_IgnoresApplyAfterSubscriptionUnregistered(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"shadowsocks","tag":"deleted-live","server":"1.1.1.1","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	managed := subscription.NewManagedNodes()
+	managed.StoreNode(hash, subscription.ManagedNode{Tags: []string{"deleted-live"}})
+	sub.SwapManagedNodes(managed)
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+
+	inventoryStore := &recordingSubscriptionInventoryStore{
+		onLoad: func(string) {
+			sub.WithOpLock(func() {
+				pool.RemoveNodeFromSub(hash, sub.ID)
+				subMgr.Unregister(sub.ID)
+			})
+		},
+	}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:     subMgr,
+		Pool:           pool,
+		Fetcher:        makeMockFetcher(makeSubscriptionJSON(string(raw)), nil),
+		InventoryStore: inventoryStore,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	if subMgr.Lookup(sub.ID) != nil {
+		t.Fatal("subscription should remain unregistered after stale refresh")
+	}
+	if len(inventoryStore.replaceCalls) != 0 {
+		t.Fatalf("stale refresh for unregistered subscription must not write inventory: %+v", inventoryStore.replaceCalls)
+	}
+	if entry, ok := pool.GetEntry(hash); ok {
+		ids := entry.SubscriptionIDs()
+		for _, id := range ids {
+			if id == sub.ID {
+				t.Fatalf("stale refresh must not restore deleted subscription pool relation: %v", ids)
+			}
+		}
+	}
+}
+
+func TestScheduler_InventoryRefresh_PreservesConcurrentColdPromotion(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"shadowsocks","tag":"promoted-cold","server":"1.1.1.1","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	inventoryStore := &recordingSubscriptionInventoryStore{
+		onReplace: func() {
+			// Simulate a cold check promotion that completed after activeNext was
+			// computed from the old pool snapshot but before refresh apply removes
+			// current active relations.
+			sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"promoted-cold"}})
+			pool.AddNodeFromSub(hash, raw, sub.ID)
+		},
+	}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager:     subMgr,
+		Pool:           pool,
+		Fetcher:        makeMockFetcher(makeSubscriptionJSON(string(raw)), nil),
+		InventoryStore: inventoryStore,
+	})
+
+	sched.UpdateSubscription(sub)
+
+	managed, ok := sub.ManagedNodes().LoadNode(hash)
+	if !ok {
+		t.Fatal("refresh must preserve a concurrently promoted cold relation")
+	}
+	if managed.Evicted {
+		t.Fatal("concurrently promoted relation should remain active, not evicted")
+	}
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("pool should retain concurrently promoted relation")
+	}
+	ids := entry.SubscriptionIDs()
+	if !reflect.DeepEqual(ids, []string{sub.ID}) {
+		t.Fatalf("pool subscription refs: got %v, want [%s]", ids, sub.ID)
+	}
+}
+
 // --- Test: Rename triggers re-filter ---
 
 func TestScheduler_RenameSubscription(t *testing.T) {
@@ -508,6 +1020,124 @@ func TestScheduler_StaleFailureDoesNotOverrideNewerSuccess(t *testing.T) {
 	h := node.HashFromRawOptions([]byte(`{"type":"shadowsocks","tag":"ok-node","server":"1.1.1.1","server_port":443}`))
 	if _, ok := sub.ManagedNodes().LoadNode(h); !ok {
 		t.Fatal("managed nodes should contain hash from newer successful update")
+	}
+}
+
+func TestScheduler_StaleFailureDoesNotApplyAfterSubscriptionReplaced(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	oldSub := subscription.NewSubscription("s1", "OldSub", "http://example.com", true, false)
+	subMgr.Register(oldSub)
+
+	pool := newTestPool(subMgr)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	fetcher := func(url string) ([]byte, error) {
+		close(firstStarted)
+		<-releaseFirst
+		return nil, errors.New("stale failure")
+	}
+	var updatedCalls atomic.Int32
+	var refreshStateCalls atomic.Int32
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager: subMgr,
+		Pool:       pool,
+		Fetcher:    fetcher,
+		OnSubUpdated: func(sub *subscription.Subscription) {
+			updatedCalls.Add(1)
+		},
+		OnSubRefreshState: func(subID string, checkedNs int64, updatedNs *int64, lastError string) {
+			refreshStateCalls.Add(1)
+		},
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sched.UpdateSubscription(oldSub)
+	}()
+
+	<-firstStarted
+	replacement := subscription.NewSubscription("s1", "Replacement", "http://example.com/new", true, false)
+	subMgr.Register(replacement)
+	close(releaseFirst)
+	<-done
+
+	if oldSub.GetLastError() != "" {
+		t.Fatalf("stale failure should not mutate replaced subscription, got %q", oldSub.GetLastError())
+	}
+	if oldSub.LastCheckedNs.Load() != 0 {
+		t.Fatalf("stale failure should not update LastCheckedNs, got %d", oldSub.LastCheckedNs.Load())
+	}
+	if replacement.GetLastError() != "" {
+		t.Fatalf("stale failure should not affect replacement, got %q", replacement.GetLastError())
+	}
+	if updatedCalls.Load() != 0 {
+		t.Fatalf("stale failure should not fire OnSubUpdated, got %d", updatedCalls.Load())
+	}
+	if refreshStateCalls.Load() != 0 {
+		t.Fatalf("stale failure should not fire OnSubRefreshState, got %d", refreshStateCalls.Load())
+	}
+}
+
+func TestScheduler_StaleSuccessDoesNotApplyAfterSubscriptionReplaced(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	oldSub := subscription.NewSubscription("s1", "OldSub", "http://example.com", true, false)
+	subMgr.Register(oldSub)
+
+	pool := newTestPool(subMgr)
+	body := makeSubscriptionJSON(
+		`{"type":"shadowsocks","tag":"stale-node","server":"1.1.1.1","server_port":443}`,
+	)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	fetcher := func(url string) ([]byte, error) {
+		close(firstStarted)
+		<-releaseFirst
+		return body, nil
+	}
+	var updatedCalls atomic.Int32
+	var refreshStateCalls atomic.Int32
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager: subMgr,
+		Pool:       pool,
+		Fetcher:    fetcher,
+		OnSubUpdated: func(sub *subscription.Subscription) {
+			updatedCalls.Add(1)
+		},
+		OnSubRefreshState: func(subID string, checkedNs int64, updatedNs *int64, lastError string) {
+			refreshStateCalls.Add(1)
+		},
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sched.UpdateSubscription(oldSub)
+	}()
+
+	<-firstStarted
+	replacement := subscription.NewSubscription("s1", "Replacement", "http://example.com/new", true, false)
+	subMgr.Register(replacement)
+	close(releaseFirst)
+	<-done
+
+	if oldSub.LastUpdatedNs.Load() != 0 {
+		t.Fatalf("stale success should not update replaced subscription, got LastUpdatedNs=%d", oldSub.LastUpdatedNs.Load())
+	}
+	if managedNodeCount(oldSub.ManagedNodes()) != 0 {
+		t.Fatalf("stale success should not add managed nodes to replaced subscription, got %d", managedNodeCount(oldSub.ManagedNodes()))
+	}
+	if managedNodeCount(replacement.ManagedNodes()) != 0 {
+		t.Fatalf("stale success should not affect replacement, got %d managed nodes", managedNodeCount(replacement.ManagedNodes()))
+	}
+	if pool.Size() != 0 {
+		t.Fatalf("stale success should not publish nodes to pool, got size %d", pool.Size())
+	}
+	if updatedCalls.Load() != 0 {
+		t.Fatalf("stale success should not fire OnSubUpdated, got %d", updatedCalls.Load())
+	}
+	if refreshStateCalls.Load() != 0 {
+		t.Fatalf("stale success should not fire OnSubRefreshState, got %d", refreshStateCalls.Load())
 	}
 }
 

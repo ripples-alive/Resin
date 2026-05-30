@@ -172,10 +172,38 @@ func (p *GlobalNodePool) Size() int {
 	return p.nodes.Size()
 }
 
+// DeleteNodeFromBootstrap removes a node during bootstrap shaping without dirty
+// marks, outbound cleanup callbacks, or platform notifications.
+func (p *GlobalNodePool) DeleteNodeFromBootstrap(hash node.Hash) {
+	p.nodes.Delete(hash)
+}
+
 // LoadNodeFromBootstrap inserts a node during bootstrap recovery.
 // No dirty-marks, no platform notifications.
 func (p *GlobalNodePool) LoadNodeFromBootstrap(entry *node.NodeEntry) {
 	p.nodes.Store(entry.Hash, entry)
+}
+
+// LoadOrAttachColdCheckTransientNode creates a probe-only cold-check entry when
+// absent, or attaches the transient relation to the existing entry without
+// replacing its runtime state. No dirty-marks or platform notifications are
+// emitted for the private transient relation.
+func (p *GlobalNodePool) LoadOrAttachColdCheckTransientNode(hash node.Hash, rawOpts json.RawMessage) *node.NodeEntry {
+	if p == nil {
+		return nil
+	}
+	createdAt := time.Now()
+	var current *node.NodeEntry
+	p.nodes.Compute(hash, func(entry *node.NodeEntry, loaded bool) (*node.NodeEntry, xsync.ComputeOp) {
+		if !loaded || entry == nil {
+			entry = node.NewNodeEntry(hash, rawOpts, createdAt, p.maxLatencyTableEntries)
+			entry.CircuitOpenSince.Store(createdAt.UnixNano())
+		}
+		entry.AddSubscriptionID(ColdCheckTransientSubscriptionID)
+		current = entry
+		return entry, xsync.UpdateOp
+	})
+	return current
 }
 
 // RegisterPlatform adds a platform to receive dirty notifications.

@@ -350,10 +350,19 @@ func (a *resinApp) startBackgroundServices() {
 	a.topoRuntime.ephemeralCleaner.Start()
 	log.Println("Ephemeral cleaner started (batch 2)")
 
-	// --- Step 8 Batch 3: Subscription scheduler (force full refresh on start) ---
+	if a.topoRuntime.coldNodeQueue != nil {
+		a.topoRuntime.coldNodeQueue.Start()
+		log.Println("Cold subscription node check queue started (batch 2)")
+	}
+
+	if a.topoRuntime.coldSweepRunner != nil {
+		a.topoRuntime.coldSweepRunner.Start()
+		log.Println("Cold subscription node sweep runner started (batch 2)")
+	}
+
+	// --- Step 8 Batch 3: Subscription scheduler ---
 	a.topoRuntime.scheduler.Start()
-	a.topoRuntime.scheduler.ForceRefreshAllAsync()
-	log.Println("Subscription scheduler started; forced full refresh running in background (batch 3)")
+	log.Println("Subscription scheduler started (batch 3)")
 }
 
 func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
@@ -552,6 +561,16 @@ func (a *resinApp) shutdown(ctx context.Context) {
 
 	a.topoRuntime.scheduler.Stop()
 	log.Println("Subscription scheduler stopped")
+
+	if a.topoRuntime.coldSweepRunner != nil {
+		a.topoRuntime.coldSweepRunner.Stop()
+		log.Println("Cold subscription node sweep runner stopped")
+	}
+
+	if a.topoRuntime.coldNodeQueue != nil {
+		a.topoRuntime.coldNodeQueue.Stop()
+		log.Println("Cold subscription node check queue stopped")
+	}
 
 	a.topoRuntime.probeMgr.Stop()
 	log.Println("Probe manager stopped")
