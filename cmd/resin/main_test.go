@@ -115,6 +115,9 @@ func newColdCheckTestRuntime(
 		LatencyDecayWindow: func() time.Duration {
 			return time.Duration(runtimeCfg.LatencyDecayWindow)
 		},
+		MaxLatencyTestInterval: func() time.Duration {
+			return time.Duration(runtimeCfg.MaxLatencyTestInterval)
+		},
 		OnNodeAdded: func(hash node.Hash) {
 			engine.MarkNodeStatic(hash.Hex())
 		},
@@ -1929,6 +1932,86 @@ func TestColdSubscriptionNodeCheck_FailureIncrementsPersistedFailureCount(t *tes
 	}
 	if len(dynamics) != 1 || dynamics[0].Hash != hash.Hex() || dynamics[0].FailureCount != 4 {
 		t.Fatalf("failed cold check should increment persisted failure count, got %+v", dynamics)
+	}
+	if dynamics[0].NextLatencyProbeDueNs <= dynamics[0].LastLatencyProbeAttemptNs {
+		t.Fatalf("failed cold check should persist future next due, got %+v", dynamics[0])
+	}
+}
+
+func TestColdSubscriptionNodeCheck_ProbeSetupFailurePersistsNextDue(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-cold-setup-failure"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "ColdSetupFailure",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	runtimeCfg.MaxLatencyTestInterval = config.Duration(time.Minute)
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.73","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{{
+		Hash:        hash.Hex(),
+		RawOptions:  raw,
+		CreatedAtNs: now,
+	}}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := engine.BulkUpsertNodesDynamic([]model.NodeDynamic{{
+		Hash:                      hash.Hex(),
+		LastLatencyProbeAttemptNs: now - int64(time.Hour),
+		NextLatencyProbeDueNs:     0,
+	}}); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: subID,
+		NodeHash:       hash.Hex(),
+		Tags:           []string{"cold-setup-failure"},
+	}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(node.Hash) error {
+		return errors.New("node outbound not ready")
+	})
+	checker.Check(topology.ColdNodeCandidate{
+		SubscriptionID: subID,
+		Hash:           hash,
+		RawOptions:     raw,
+		Tags:           []string{"cold-setup-failure"},
+	})
+
+	dynamics, err := engine.LoadAllNodesDynamic()
+	if err != nil {
+		t.Fatalf("LoadAllNodesDynamic: %v", err)
+	}
+	if len(dynamics) != 1 || dynamics[0].Hash != hash.Hex() {
+		t.Fatalf("expected one dynamic row for setup failure, got %+v", dynamics)
+	}
+	if dynamics[0].LastLatencyProbeAttemptNs <= now {
+		t.Fatalf("setup failure should update last attempt, got %+v", dynamics[0])
+	}
+	if dynamics[0].NextLatencyProbeDueNs <= dynamics[0].LastLatencyProbeAttemptNs {
+		t.Fatalf("setup failure should advance next due to avoid immediate retry, got %+v", dynamics[0])
 	}
 }
 

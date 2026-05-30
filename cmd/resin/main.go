@@ -690,13 +690,33 @@ func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeC
 	}
 
 	if ok {
-		if entry.LastLatencyProbeAttempt.Load() < checkStartedNs {
-			entry.LastLatencyProbeAttempt.Store(time.Now().UnixNano())
-		}
+		c.recordColdCheckFailureAttempt(entry, checkStartedNs)
 		c.engine.MarkNodeDynamic(candidate.Hash.Hex())
 		return coldNodeCheckOutcome{failed: true, cleanup: func() { c.removeTransientColdCheckEntry(candidate.Hash) }}
 	}
 	return coldNodeCheckOutcome{failed: true}
+}
+
+func (c *coldSubscriptionNodeChecker) recordColdCheckFailureAttempt(entry *node.NodeEntry, checkStartedNs int64) {
+	if entry == nil {
+		return
+	}
+	lastAttemptNs := entry.LastLatencyProbeAttempt.Load()
+	if lastAttemptNs < checkStartedNs {
+		lastAttemptNs = time.Now().UnixNano()
+		entry.LastLatencyProbeAttempt.Store(lastAttemptNs)
+	}
+	if lastAttemptNs <= 0 {
+		return
+	}
+	if nextDueNs := entry.NextLatencyProbeDue.Load(); nextDueNs > lastAttemptNs {
+		return
+	}
+	entry.NextLatencyProbeDue.Store(coldLatencyProbeDueNs(
+		lastAttemptNs,
+		int(entry.FailureCount.Load()),
+		coldSubscriptionNodeSweepInterval,
+	))
 }
 
 func (c *coldSubscriptionNodeChecker) currentColdRelations(candidate topology.ColdNodeCandidate) []topology.ColdNodeRelation {
