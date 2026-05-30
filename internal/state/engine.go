@@ -3,8 +3,11 @@ package state
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/Resinat/Resin/internal/model"
+	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/topology"
 )
 
 // NodeLatencyDirtyKey is the composite key for the node_latency dirty set.
@@ -81,6 +84,42 @@ func (e *StateEngine) MarkSubscriptionNode(subID, nodeHash string) {
 }
 func (e *StateEngine) MarkSubscriptionNodeDelete(subID, nodeHash string) {
 	e.dirtySubscriptionNodes.MarkDelete(SubscriptionNodeDirtyKey{SubscriptionID: subID, NodeHash: nodeHash})
+}
+
+func (e *StateEngine) enabledSubscriptionIDs() ([]string, error) {
+	subs, err := e.ListSubscriptions()
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(subs))
+	for _, sub := range subs {
+		if sub.Enabled {
+			ids = append(ids, sub.ID)
+		}
+	}
+	return ids, nil
+}
+
+func (e *StateEngine) LoadDueColdNodeCandidates(nowNs int64, interval time.Duration, limit int) ([]topology.ColdNodeCandidate, error) {
+	ids, err := e.enabledSubscriptionIDs()
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return e.CacheRepo.loadDueColdNodeCandidates(nowNs, interval, limit, ids)
+}
+
+func (e *StateEngine) LoadCurrentColdNodeRelations(hash node.Hash) ([]topology.ColdNodeRelation, error) {
+	ids, err := e.enabledSubscriptionIDs()
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return e.CacheRepo.loadCurrentColdNodeRelations(hash, ids)
 }
 
 func (e *StateEngine) UpdateSubscriptionRefreshState(id string, checkedNs int64, updatedNs *int64, lastError string) error {

@@ -594,6 +594,38 @@ func TestPool_IsNodeDisabled(t *testing.T) {
 	}
 }
 
+func TestPool_RecordLatencyStoresNextDueBeforeDynamicDirtyCallback(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	raw := json.RawMessage(`{"type":"ss","server":"next-due-dirty-order"}`)
+	h := node.HashFromRawOptions(raw)
+	var entry *node.NodeEntry
+	callbackSeen := int64(0)
+	pool := NewGlobalNodePool(PoolConfig{
+		SubLookup:              subMgr.Lookup,
+		MaxLatencyTableEntries: 16,
+		MaxLatencyTestInterval: func() time.Duration { return 10 * time.Second },
+		MaxConsecutiveFailures: func() int { return 3 },
+		OnNodeDynamicChanged: func(hash node.Hash) {
+			if hash != h || entry == nil {
+				return
+			}
+			callbackSeen = entry.NextLatencyProbeDue.Load()
+		},
+	})
+	pool.AddNodeFromSub(h, raw, "s1")
+	var ok bool
+	entry, ok = pool.GetEntry(h)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	entry.FailureCount.Store(1)
+
+	pool.RecordLatency(h, "example.com", nil)
+	if callbackSeen <= 0 {
+		t.Fatalf("dynamic dirty callback saw next due %d, want populated future due", callbackSeen)
+	}
+}
+
 func TestPool_MakeHealthyAndEnabledEvaluator_ExcludesDisabledNodes(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	enabledSub := subscription.NewSubscription("sub-enabled", "Enabled", "url", true, false)

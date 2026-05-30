@@ -572,9 +572,23 @@ func (r *CacheRepo) IsColdNodeRelationCurrent(subID string, hash node.Hash) bool
 // potentially stale sweep snapshot so in-flight subscription refreshes are not
 // left cold after the node proves healthy.
 func (r *CacheRepo) LoadCurrentColdNodeRelations(hash node.Hash) ([]topology.ColdNodeRelation, error) {
+	return r.loadCurrentColdNodeRelations(hash, nil)
+}
+
+func (r *CacheRepo) loadCurrentColdNodeRelations(hash node.Hash, enabledSubscriptionIDs []string) ([]topology.ColdNodeRelation, error) {
+	enabledSubscriptionIDs = compactUniqueStrings(enabledSubscriptionIDs)
+	enabledFilter := ""
+	args := []any{hash.Hex()}
+	if len(enabledSubscriptionIDs) > 0 {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(enabledSubscriptionIDs)), ",")
+		enabledFilter = " AND subscription_id IN (" + placeholders + ")"
+		for _, subID := range enabledSubscriptionIDs {
+			args = append(args, subID)
+		}
+	}
 	rows, err := r.db.Query(
-		"SELECT subscription_id, tags_json FROM subscription_nodes WHERE node_hash = ? AND evicted = 0 ORDER BY subscription_id ASC",
-		hash.Hex(),
+		"SELECT subscription_id, tags_json FROM subscription_nodes WHERE node_hash = ? AND evicted = 0"+enabledFilter+" ORDER BY subscription_id ASC",
+		args...,
 	)
 	if err != nil {
 		return nil, err
@@ -604,10 +618,25 @@ func (r *CacheRepo) LoadCurrentColdNodeRelations(hash node.Hash) ([]topology.Col
 // Each candidate carries all non-evicted inventory relations for that node so a
 // successful cold check can restore the full node relationship set atomically.
 func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duration, limit int) ([]topology.ColdNodeCandidate, error) {
+	return r.loadDueColdNodeCandidates(nowNs, interval, limit, nil)
+}
+
+func (r *CacheRepo) loadDueColdNodeCandidates(nowNs int64, interval time.Duration, limit int, enabledSubscriptionIDs []string) ([]topology.ColdNodeCandidate, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	_ = interval
+	enabledSubscriptionIDs = compactUniqueStrings(enabledSubscriptionIDs)
+	enabledFilter := ""
+	args := []any{nowNs}
+	if len(enabledSubscriptionIDs) > 0 {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(enabledSubscriptionIDs)), ",")
+		enabledFilter = " AND subscription_id IN (" + placeholders + ")"
+		for _, subID := range enabledSubscriptionIDs {
+			args = append(args, subID)
+		}
+	}
+	args = append(args, limit)
 
 	rows, err := r.db.Query(`
 		WITH candidate_hashes(node_hash) AS (
@@ -621,10 +650,15 @@ func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duratio
 			LEFT JOIN nodes_dynamic AS nd ON nd.hash = ns.hash
 			WHERE nd.hash IS NULL
 		),
+		eligible_relations AS (
+			SELECT subscription_id, node_hash, tags_json
+			FROM subscription_nodes
+			WHERE evicted = 0`+enabledFilter+`
+		),
 		due AS (
 			SELECT ch.node_hash, MIN(sn.subscription_id) AS first_subscription_id
 			FROM candidate_hashes AS ch
-			JOIN subscription_nodes AS sn ON sn.node_hash = ch.node_hash AND sn.evicted = 0
+			JOIN eligible_relations AS sn ON sn.node_hash = ch.node_hash
 			JOIN nodes_static AS ns ON ns.hash = ch.node_hash
 			GROUP BY ch.node_hash
 			ORDER BY first_subscription_id ASC, ch.node_hash ASC
@@ -633,8 +667,8 @@ func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duratio
 		SELECT due.node_hash, ns.raw_options_json, rel.subscription_id, rel.tags_json
 		FROM due
 		JOIN nodes_static AS ns ON ns.hash = due.node_hash
-		JOIN subscription_nodes AS rel ON rel.node_hash = due.node_hash AND rel.evicted = 0
-		ORDER BY due.first_subscription_id ASC, due.node_hash ASC, rel.subscription_id ASC`, nowNs, limit)
+		JOIN eligible_relations AS rel ON rel.node_hash = due.node_hash
+		ORDER BY due.first_subscription_id ASC, due.node_hash ASC, rel.subscription_id ASC`, args...)
 	if err != nil {
 		return nil, err
 	}

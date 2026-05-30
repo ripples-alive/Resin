@@ -272,6 +272,124 @@ func TestCacheRepo_SubscriptionNodes_BulkDelete(t *testing.T) {
 	}
 }
 
+func TestMigrateCacheDB_BackfillsLegacyNextLatencyProbeDue(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenDB(dir + "/cache.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE nodes_static (
+			hash             TEXT PRIMARY KEY,
+			raw_options_json TEXT NOT NULL,
+			created_at_ns    INTEGER NOT NULL
+		);
+		CREATE TABLE nodes_dynamic (
+			hash                                TEXT PRIMARY KEY,
+			failure_count                       INTEGER NOT NULL DEFAULT 0,
+			circuit_open_since                  INTEGER NOT NULL DEFAULT 0,
+			egress_ip                           TEXT NOT NULL DEFAULT '',
+			egress_region                       TEXT NOT NULL DEFAULT '',
+			egress_updated_at_ns                INTEGER NOT NULL DEFAULT 0,
+			last_latency_probe_attempt_ns       INTEGER NOT NULL DEFAULT 0,
+			last_authority_latency_probe_attempt_ns INTEGER NOT NULL DEFAULT 0,
+			last_egress_update_attempt_ns       INTEGER NOT NULL DEFAULT 0,
+			egress_ips_json                     TEXT NOT NULL DEFAULT '[]'
+		);
+		CREATE TABLE node_latency (
+			node_hash       TEXT NOT NULL,
+			domain          TEXT NOT NULL,
+			ewma_ns         INTEGER NOT NULL,
+			last_updated_ns INTEGER NOT NULL,
+			PRIMARY KEY (node_hash, domain)
+		);
+		CREATE TABLE leases (
+			platform_id      TEXT NOT NULL,
+			account          TEXT NOT NULL,
+			node_hash        TEXT NOT NULL,
+			egress_ip        TEXT NOT NULL DEFAULT '',
+			created_at_ns    INTEGER NOT NULL DEFAULT 0,
+			expiry_ns        INTEGER NOT NULL,
+			last_accessed_ns INTEGER NOT NULL,
+			PRIMARY KEY (platform_id, account)
+		);
+		CREATE TABLE subscription_nodes (
+			subscription_id TEXT NOT NULL,
+			node_hash       TEXT NOT NULL,
+			tags_json       TEXT NOT NULL DEFAULT '[]',
+			evicted         INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (subscription_id, node_hash)
+		);
+		CREATE TABLE schema_migrations (version INTEGER NOT NULL, dirty BOOLEAN NOT NULL);
+		INSERT INTO schema_migrations (version, dirty) VALUES (3, false);
+	`)
+	if err != nil {
+		t.Fatalf("create legacy cache schema: %v", err)
+	}
+
+	lastAttemptNs := int64(time.Hour)
+	dueRaw := json.RawMessage(`{"type":"stub","server":"198.51.100.60","server_port":443}`)
+	neverAttemptedRaw := json.RawMessage(`{"type":"stub","server":"198.51.100.61","server_port":443}`)
+	dueHash := node.HashFromRawOptions(dueRaw)
+	neverAttemptedHash := node.HashFromRawOptions(neverAttemptedRaw)
+	if _, err := db.Exec(`INSERT INTO nodes_static (hash, raw_options_json, created_at_ns) VALUES (?, ?, 1), (?, ?, 1)`, dueHash.Hex(), string(dueRaw), neverAttemptedHash.Hex(), string(neverAttemptedRaw)); err != nil {
+		t.Fatalf("seed legacy static rows: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO subscription_nodes (subscription_id, node_hash, tags_json, evicted) VALUES ('sub-a', ?, '[]', 0), ('sub-a', ?, '[]', 0)`, dueHash.Hex(), neverAttemptedHash.Hex()); err != nil {
+		t.Fatalf("seed legacy subscription rows: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO nodes_dynamic (hash, failure_count, last_latency_probe_attempt_ns) VALUES (?, 2, ?), (?, 0, 0)`, dueHash.Hex(), lastAttemptNs, neverAttemptedHash.Hex()); err != nil {
+		t.Fatalf("seed legacy dynamic rows: %v", err)
+	}
+
+	if err := MigrateCacheDB(db); err != nil {
+		t.Fatalf("MigrateCacheDB: %v", err)
+	}
+
+	var nextDueNs int64
+	if err := db.QueryRow(`SELECT next_latency_probe_due_ns FROM nodes_dynamic WHERE hash = ?`, dueHash.Hex()).Scan(&nextDueNs); err != nil {
+		t.Fatalf("query migrated next due: %v", err)
+	}
+	wantNextDueNs := lastAttemptNs + int64(20*time.Minute)
+	if nextDueNs != wantNextDueNs {
+		t.Fatalf("migrated next due: got %d, want %d", nextDueNs, wantNextDueNs)
+	}
+
+	var zeroNextDueNs int64
+	if err := db.QueryRow(`SELECT next_latency_probe_due_ns FROM nodes_dynamic WHERE hash = ?`, neverAttemptedHash.Hex()).Scan(&zeroNextDueNs); err != nil {
+		t.Fatalf("query never attempted next due: %v", err)
+	}
+	if zeroNextDueNs != 0 {
+		t.Fatalf("never attempted next due: got %d, want 0", zeroNextDueNs)
+	}
+
+	repo := newCacheRepo(db)
+	early, err := repo.LoadDueColdNodeCandidates(wantNextDueNs-1, time.Hour, 10)
+	if err != nil {
+		t.Fatalf("LoadDueColdNodeCandidates early: %v", err)
+	}
+	for _, candidate := range early {
+		if candidate.Hash == dueHash {
+			t.Fatalf("migrated node became due before persisted next due: got %+v", early)
+		}
+	}
+	due, err := repo.LoadDueColdNodeCandidates(wantNextDueNs, time.Hour, 10)
+	if err != nil {
+		t.Fatalf("LoadDueColdNodeCandidates at due: %v", err)
+	}
+	foundDue := false
+	for _, candidate := range due {
+		if candidate.Hash == dueHash {
+			foundDue = true
+		}
+	}
+	if !foundDue {
+		t.Fatalf("migrated node was not due at persisted next due: got %+v, want %s", due, dueHash.Hex())
+	}
+}
+
 func TestCacheRepo_LoadDueColdNodeCandidates_FiltersOrdersAndLimits(t *testing.T) {
 	repo := newTestCacheRepo(t)
 
@@ -491,6 +609,75 @@ func TestCacheRepo_LoadDueColdNodeCandidates_UsesPersistedNextLatencyProbeDue(t 
 	}
 	if len(got) != 1 || got[0].Hash != hashDue {
 		t.Fatalf("due candidates with persisted next due: got %+v, want only %s", got, hashDue.Hex())
+	}
+}
+
+func TestCacheRepo_LoadDueColdNodeCandidates_ExcludesDisabledSubscriptions(t *testing.T) {
+	engine, closer, err := PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	nowNs := int64(time.Hour)
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               "sub-enabled",
+		Name:             "Enabled",
+		URL:              "https://example.com/enabled",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      nowNs,
+		UpdatedAtNs:      nowNs,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription enabled: %v", err)
+	}
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               "sub-disabled",
+		Name:             "Disabled",
+		URL:              "https://example.com/disabled",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          false,
+		CreatedAtNs:      nowNs,
+		UpdatedAtNs:      nowNs,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription disabled: %v", err)
+	}
+
+	rawDisabledOnly := json.RawMessage(`{"type":"stub","server":"198.51.100.70","server_port":443}`)
+	rawMixed := json.RawMessage(`{"type":"stub","server":"198.51.100.71","server_port":443}`)
+	disabledOnlyHash := node.HashFromRawOptions(rawDisabledOnly)
+	mixedHash := node.HashFromRawOptions(rawMixed)
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{
+		{Hash: disabledOnlyHash.Hex(), RawOptions: rawDisabledOnly, CreatedAtNs: nowNs},
+		{Hash: mixedHash.Hex(), RawOptions: rawMixed, CreatedAtNs: nowNs},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{SubscriptionID: "sub-disabled", NodeHash: disabledOnlyHash.Hex(), Tags: []string{"disabled-only"}},
+		{SubscriptionID: "sub-disabled", NodeHash: mixedHash.Hex(), Tags: []string{"disabled-mixed"}},
+		{SubscriptionID: "sub-enabled", NodeHash: mixedHash.Hex(), Tags: []string{"enabled-mixed"}},
+	}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	got, err := engine.LoadDueColdNodeCandidates(nowNs, time.Minute, 10)
+	if err != nil {
+		t.Fatalf("LoadDueColdNodeCandidates: %v", err)
+	}
+	if len(got) != 1 || got[0].Hash != mixedHash {
+		t.Fatalf("due candidates: got %+v, want only mixed enabled relation hash %s", got, mixedHash.Hex())
+	}
+	if len(got[0].Relations) != 1 || got[0].Relations[0].SubscriptionID != "sub-enabled" {
+		t.Fatalf("candidate relations: got %+v, want only enabled subscription relation", got[0].Relations)
+	}
+
+	relations, err := engine.LoadCurrentColdNodeRelations(mixedHash)
+	if err != nil {
+		t.Fatalf("LoadCurrentColdNodeRelations: %v", err)
+	}
+	if len(relations) != 1 || relations[0].SubscriptionID != "sub-enabled" {
+		t.Fatalf("current cold relations: got %+v, want only enabled subscription relation", relations)
 	}
 }
 

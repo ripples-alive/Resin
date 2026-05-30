@@ -610,9 +610,6 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 	if isAuthority {
 		entry.LastAuthorityLatencyProbeAttempt.Store(nowNs)
 	}
-	if p.onNodeDynamicChanged != nil {
-		p.onNodeDynamicChanged(hash)
-	}
 
 	interval := time.Hour
 	if p.maxLatencyTestInterval != nil {
@@ -622,6 +619,9 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 	}
 	nextDueNs := nowNs + int64(ProbeFailureBackoffInterval(interval, entry.FailureCount.Load()))
 	entry.NextLatencyProbeDue.Store(nextDueNs)
+	if p.onNodeDynamicChanged != nil {
+		p.onNodeDynamicChanged(hash)
+	}
 
 	if latency == nil || *latency <= 0 || entry.LatencyTable == nil {
 		return
