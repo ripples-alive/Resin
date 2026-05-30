@@ -392,6 +392,52 @@ func TestCacheRepo_LoadDueColdNodeCandidates_FiltersOrdersAndLimits(t *testing.T
 	}
 }
 
+func TestCacheRepo_LoadDueColdNodeCandidates_AppliesFailureBackoff(t *testing.T) {
+	repo := newTestCacheRepo(t)
+	nowNs := int64(time.Hour)
+	interval := 100 * time.Nanosecond
+
+	rawTooSoon := json.RawMessage(`{"type":"stub","server":"198.51.100.30","server_port":443}`)
+	rawDue := json.RawMessage(`{"type":"stub","server":"198.51.100.31","server_port":443}`)
+	rawCappedTooSoon := json.RawMessage(`{"type":"stub","server":"198.51.100.32","server_port":443}`)
+	hashTooSoon := node.HashFromRawOptions(rawTooSoon)
+	hashDue := node.HashFromRawOptions(rawDue)
+	hashCappedTooSoon := node.HashFromRawOptions(rawCappedTooSoon)
+
+	if err := repo.BulkUpsertNodesStatic([]model.NodeStatic{
+		{Hash: hashTooSoon.Hex(), RawOptions: rawTooSoon, CreatedAtNs: nowNs},
+		{Hash: hashDue.Hex(), RawOptions: rawDue, CreatedAtNs: nowNs},
+		{Hash: hashCappedTooSoon.Hex(), RawOptions: rawCappedTooSoon, CreatedAtNs: nowNs},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := repo.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{SubscriptionID: "sub-a", NodeHash: hashTooSoon.Hex(), Tags: []string{"too-soon"}},
+		{SubscriptionID: "sub-a", NodeHash: hashDue.Hex(), Tags: []string{"due"}},
+		{SubscriptionID: "sub-a", NodeHash: hashCappedTooSoon.Hex(), Tags: []string{"capped-too-soon"}},
+	}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+	if err := repo.BulkUpsertNodesDynamic([]model.NodeDynamic{
+		// failure_count=1 doubles the retry interval. This would be due under the
+		// old fixed interval, but should not be due with backoff.
+		{Hash: hashTooSoon.Hex(), FailureCount: 1, LastLatencyProbeAttemptNs: nowNs - int64(interval) - 1},
+		{Hash: hashDue.Hex(), FailureCount: 1, LastLatencyProbeAttemptNs: nowNs - int64(2*interval) - 1},
+		// failure_count caps at 5 => 32x base interval.
+		{Hash: hashCappedTooSoon.Hex(), FailureCount: 9, LastLatencyProbeAttemptNs: nowNs - int64(31*interval)},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
+
+	got, err := repo.LoadDueColdNodeCandidates(nowNs, interval, 10)
+	if err != nil {
+		t.Fatalf("LoadDueColdNodeCandidates: %v", err)
+	}
+	if len(got) != 1 || got[0].Hash != hashDue {
+		t.Fatalf("due candidates with backoff: got %+v, want only %s", got, hashDue.Hex())
+	}
+}
+
 func TestCacheRepo_LoadBootstrapActiveNodes_FiltersAtDBAndGroupsRelations(t *testing.T) {
 	repo := newTestCacheRepo(t)
 	nowNs := int64(20_000)

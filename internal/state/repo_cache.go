@@ -25,6 +25,16 @@ func newCacheRepo(db *sql.DB) *CacheRepo {
 
 const sqliteQueryParamBatchSize = 900
 
+func probeFailureBackoffMultiplier(failureCount int) int64 {
+	if failureCount <= 0 {
+		return 1
+	}
+	if failureCount > 5 {
+		failureCount = 5
+	}
+	return int64(1) << failureCount
+}
+
 // --- nodes_static ---
 
 // BulkUpsertNodesStatic batch-inserts or updates node static records.
@@ -115,6 +125,40 @@ func (r *CacheRepo) BulkDeleteNodesDynamic(hashes []string) error {
 			return err
 		},
 	)
+}
+
+// LoadNodeDynamic reads one node dynamic record by hash.
+func (r *CacheRepo) LoadNodeDynamic(hash string) (*model.NodeDynamic, error) {
+	row := r.db.QueryRow(`
+		SELECT hash, failure_count, circuit_open_since, egress_ip, egress_ips_json, egress_region, egress_updated_at_ns,
+		       last_latency_probe_attempt_ns, last_authority_latency_probe_attempt_ns, last_egress_update_attempt_ns
+		FROM nodes_dynamic
+		WHERE hash = ?`, hash)
+	var n model.NodeDynamic
+	var egressIPsJSON string
+	if err := row.Scan(
+		&n.Hash,
+		&n.FailureCount,
+		&n.CircuitOpenSince,
+		&n.EgressIP,
+		&egressIPsJSON,
+		&n.EgressRegion,
+		&n.EgressUpdatedAtNs,
+		&n.LastLatencyProbeAttemptNs,
+		&n.LastAuthorityLatencyProbeAttemptNs,
+		&n.LastEgressUpdateAttemptNs,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	egressIPs, err := decodeStringSliceJSON(egressIPsJSON)
+	if err != nil {
+		return nil, fmt.Errorf("decode node dynamic egress_ips for %s: %w", n.Hash, err)
+	}
+	n.EgressIPs = egressIPs
+	return &n, nil
 }
 
 // LoadAllNodesDynamic reads all node dynamic records.
@@ -563,7 +607,6 @@ func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duratio
 	if intervalNs < 0 {
 		intervalNs = 0
 	}
-	thresholdNs := nowNs - intervalNs
 
 	rows, err := r.db.Query(`
 		SELECT due.node_hash, ns.raw_options_json, rel.subscription_id, rel.tags_json
@@ -576,7 +619,11 @@ func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duratio
 			  AND (
 				nd.hash IS NULL
 				OR nd.last_latency_probe_attempt_ns = 0
-				OR nd.last_latency_probe_attempt_ns <= ?
+				OR nd.last_latency_probe_attempt_ns <= (? - (? * CASE
+					WHEN nd.failure_count IS NULL OR nd.failure_count <= 0 THEN 1
+					WHEN nd.failure_count > 5 THEN 32
+					ELSE (1 << nd.failure_count)
+				END))
 			  )
 			GROUP BY sn.node_hash
 			ORDER BY first_subscription_id ASC, sn.node_hash ASC
@@ -584,7 +631,7 @@ func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duratio
 		) AS due
 		JOIN nodes_static AS ns ON ns.hash = due.node_hash
 		JOIN subscription_nodes AS rel ON rel.node_hash = due.node_hash AND rel.evicted = 0
-		ORDER BY due.first_subscription_id ASC, due.node_hash ASC, rel.subscription_id ASC`, thresholdNs, limit)
+		ORDER BY due.first_subscription_id ASC, due.node_hash ASC, rel.subscription_id ASC`, nowNs, intervalNs, limit)
 	if err != nil {
 		return nil, err
 	}

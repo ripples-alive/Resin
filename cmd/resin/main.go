@@ -651,7 +651,14 @@ func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeC
 	// probe-only sentinel reference and remove it before returning. If another
 	// real relation already owns the hash, attach the sentinel without replacing
 	// its runtime state/outbound/latency table.
+	hadEntry := false
+	if _, ok := c.pool.GetEntry(candidate.Hash); ok {
+		hadEntry = true
+	}
 	c.pool.LoadOrAttachColdCheckTransientNode(candidate.Hash, append(json.RawMessage(nil), candidate.RawOptions...))
+	if !hadEntry {
+		c.restoreColdCheckDynamic(candidate.Hash)
+	}
 
 	if c.outbound != nil {
 		c.outbound.EnsureNodeOutbound(candidate.Hash)
@@ -700,6 +707,39 @@ func (c *coldSubscriptionNodeChecker) currentColdRelations(candidate topology.Co
 		return nil
 	}
 	return current
+}
+
+func (c *coldSubscriptionNodeChecker) restoreColdCheckDynamic(hash node.Hash) {
+	if c == nil || c.engine == nil || c.pool == nil {
+		return
+	}
+	dynamic, err := c.engine.LoadNodeDynamic(hash.Hex())
+	if err != nil {
+		log.Printf("cold subscription node check: load dynamic state for %s: %v", hash.Hex(), err)
+		return
+	}
+	if dynamic == nil {
+		return
+	}
+	entry, ok := c.pool.GetEntry(hash)
+	if !ok || entry == nil {
+		return
+	}
+	if dynamic.FailureCount > 0 {
+		entry.FailureCount.Store(int32(dynamic.FailureCount))
+	}
+	if dynamic.CircuitOpenSince > 0 {
+		entry.CircuitOpenSince.Store(dynamic.CircuitOpenSince)
+	}
+	if dynamic.LastLatencyProbeAttemptNs > 0 {
+		entry.LastLatencyProbeAttempt.Store(dynamic.LastLatencyProbeAttemptNs)
+	}
+	if dynamic.LastAuthorityLatencyProbeAttemptNs > 0 {
+		entry.LastAuthorityLatencyProbeAttempt.Store(dynamic.LastAuthorityLatencyProbeAttemptNs)
+	}
+	if dynamic.LastEgressUpdateAttemptNs > 0 {
+		entry.LastEgressUpdateAttempt.Store(dynamic.LastEgressUpdateAttemptNs)
+	}
 }
 
 func (c *coldSubscriptionNodeChecker) attachCurrentColdRelation(candidate topology.ColdNodeCandidate, relation topology.ColdNodeRelation) bool {
