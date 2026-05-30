@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/netip"
 	"path/filepath"
 	"reflect"
@@ -1525,6 +1527,83 @@ func TestColdSubscriptionNodeCheckQueue_PreservesCandidateRelations(t *testing.T
 		}
 		if !reflect.DeepEqual(managed.Tags, wantTags) {
 			t.Fatalf("tags for %s: got %v, want %v", subID, managed.Tags, wantTags)
+		}
+	}
+}
+
+func TestColdSubscriptionNodeCheckQueue_LogsBatchProgress(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-cold-progress"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "ColdProgress",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	rawA := json.RawMessage(`{"type":"stub","server":"198.51.100.88","server_port":443}`)
+	rawB := json.RawMessage(`{"type":"stub","server":"198.51.100.89","server_port":443}`)
+	hashA := node.HashFromRawOptions(rawA)
+	hashB := node.HashFromRawOptions(rawB)
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{SubscriptionID: subID, NodeHash: hashA.Hex(), Tags: []string{"progress-a"}},
+		{SubscriptionID: subID, NodeHash: hashB.Hex(), Tags: []string{"progress-b"}},
+	}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	latency := 10 * time.Millisecond
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(hash node.Hash) error {
+		if hash == hashA {
+			pool.RecordResult(hash, true)
+			pool.RecordLatency(hash, "example.com", &latency)
+			return nil
+		}
+		return errors.New("synthetic probe failure")
+	})
+	queue := newColdSubscriptionNodeCheckQueue(checker, 2, 2)
+	queue.Start()
+	t.Cleanup(queue.Stop)
+
+	var buf bytes.Buffer
+	originalOutput := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(originalOutput) })
+
+	completed := queue.CheckBatch(context.Background(), []topology.ColdNodeCandidate{
+		{SubscriptionID: subID, Hash: hashA, RawOptions: rawA, Tags: []string{"progress-a"}},
+		{SubscriptionID: subID, Hash: hashB, RawOptions: rawB, Tags: []string{"progress-b"}},
+	})
+	if completed != 2 {
+		t.Fatalf("completed checks: got %d, want 2", completed)
+	}
+	logText := buf.String()
+	for _, want := range []string{
+		"cold subscription node check: batch progress",
+		"queued=2",
+		"completed=2",
+		"promoted=1",
+		"failed=1",
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("progress log missing %q in %q", want, logText)
 		}
 	}
 }

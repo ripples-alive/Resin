@@ -555,8 +555,15 @@ type coldNodeDirtyFlusher interface {
 	FlushColdNodeDirty() error
 }
 
+type coldNodeCheckOutcome struct {
+	cleanup  func()
+	promoted bool
+	failed   bool
+	skipped  bool
+}
+
 type coldNodeBatchWorkChecker interface {
-	CheckForBatch(topology.ColdNodeCandidate) func()
+	CheckForBatch(topology.ColdNodeCandidate) coldNodeCheckOutcome
 }
 
 func newColdSubscriptionNodeChecker(
@@ -578,47 +585,52 @@ func newColdSubscriptionNodeChecker(
 }
 
 func (c *coldSubscriptionNodeChecker) Check(candidate topology.ColdNodeCandidate) {
-	cleanup := c.CheckForBatch(candidate)
+	outcome := c.CheckForBatch(candidate)
 	if err := c.FlushColdNodeDirty(); err != nil {
 		log.Printf("cold subscription node check: flush state for %s: %v", candidate.Hash.Hex(), err)
 	}
-	if cleanup != nil {
-		cleanup()
+	if outcome.cleanup != nil {
+		outcome.cleanup()
 	}
 }
 
 func (c *coldSubscriptionNodeChecker) CheckBatch(ctx context.Context, candidates []topology.ColdNodeCandidate) int {
 	completed := 0
-	cleanups := make([]func(), 0, len(candidates))
+	outcomes := make([]coldNodeCheckOutcome, 0, len(candidates))
+	started := time.Now()
 	for _, candidate := range candidates {
 		select {
 		case <-ctx.Done():
 			if err := c.FlushColdNodeDirty(); err != nil {
 				log.Printf("cold subscription node check: flush partial batch state: %v", err)
 			}
-			for _, cleanup := range cleanups {
-				cleanup()
+			for _, outcome := range outcomes {
+				if outcome.cleanup != nil {
+					outcome.cleanup()
+				}
 			}
+			c.logBatchProgress(completed, completed, outcomes, time.Since(started))
 			return completed
 		default:
 		}
-		if cleanup := c.CheckForBatch(candidate); cleanup != nil {
-			cleanups = append(cleanups, cleanup)
-		}
+		outcomes = append(outcomes, c.CheckForBatch(candidate))
 		completed++
 	}
 	if err := c.FlushColdNodeDirty(); err != nil {
 		log.Printf("cold subscription node check: flush batch state: %v", err)
 	}
-	for _, cleanup := range cleanups {
-		cleanup()
+	for _, outcome := range outcomes {
+		if outcome.cleanup != nil {
+			outcome.cleanup()
+		}
 	}
+	c.logBatchProgress(len(candidates), completed, outcomes, time.Since(started))
 	return completed
 }
 
-func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeCandidate) func() {
+func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeCandidate) coldNodeCheckOutcome {
 	if c == nil || c.pool == nil || c.engine == nil {
-		return nil
+		return coldNodeCheckOutcome{skipped: true}
 	}
 	createdAt := time.Now()
 	checkStartedNs := createdAt.UnixNano()
@@ -647,12 +659,12 @@ func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeC
 		}
 		if !restored {
 			c.removeTransientColdCheckEntry(candidate.Hash)
-			return nil
+			return coldNodeCheckOutcome{skipped: true}
 		}
 		c.engine.MarkNodeStatic(candidate.Hash.Hex())
 		c.engine.MarkNodeDynamic(candidate.Hash.Hex())
 		c.removeTransientColdCheckEntry(candidate.Hash)
-		return nil
+		return coldNodeCheckOutcome{promoted: true}
 	}
 
 	if ok {
@@ -660,9 +672,9 @@ func (c *coldSubscriptionNodeChecker) CheckForBatch(candidate topology.ColdNodeC
 			entry.LastLatencyProbeAttempt.Store(time.Now().UnixNano())
 		}
 		c.engine.MarkNodeDynamic(candidate.Hash.Hex())
-		return func() { c.removeTransientColdCheckEntry(candidate.Hash) }
+		return coldNodeCheckOutcome{failed: true, cleanup: func() { c.removeTransientColdCheckEntry(candidate.Hash) }}
 	}
-	return nil
+	return coldNodeCheckOutcome{failed: true}
 }
 
 func (c *coldSubscriptionNodeChecker) currentColdRelations(candidate topology.ColdNodeCandidate) []topology.ColdNodeRelation {
@@ -750,7 +762,7 @@ type coldSubscriptionNodeCheckWork struct {
 }
 
 type coldSubscriptionNodeCheckResult struct {
-	cleanup func()
+	outcome coldNodeCheckOutcome
 }
 
 func newColdSubscriptionNodeCheckQueue(
@@ -785,14 +797,15 @@ func (q *coldSubscriptionNodeCheckQueue) Start() {
 				case <-q.stopCh:
 					return
 				case work := <-q.ch:
-					var cleanup func()
+					var outcome coldNodeCheckOutcome
 					if batchChecker, ok := q.checker.(coldNodeBatchWorkChecker); ok {
-						cleanup = batchChecker.CheckForBatch(work.candidate)
+						outcome = batchChecker.CheckForBatch(work.candidate)
 					} else {
 						q.checker.Check(work.candidate)
+						outcome = coldNodeCheckOutcome{skipped: true}
 					}
 					if work.done != nil {
-						work.done <- coldSubscriptionNodeCheckResult{cleanup: cleanup}
+						work.done <- coldSubscriptionNodeCheckResult{outcome: outcome}
 					}
 				}
 			}
@@ -818,6 +831,7 @@ func (q *coldSubscriptionNodeCheckQueue) CheckBatch(ctx context.Context, candida
 	}
 	done := make(chan coldSubscriptionNodeCheckResult, len(candidates))
 	queued := 0
+	started := time.Now()
 candidateLoop:
 	for _, candidate := range candidates {
 		work := candidate.Clone()
@@ -832,24 +846,24 @@ candidateLoop:
 	}
 
 	completed := 0
-	cleanups := make([]func(), 0, queued)
+	outcomes := make([]coldNodeCheckOutcome, 0, queued)
 	for completed < queued {
 		select {
 		case <-q.stopCh:
-			q.finishCompletedColdChecks(cleanups)
+			q.finishCompletedColdChecks(outcomes)
+			q.logBatchProgress(queued, completed, outcomes, time.Since(started))
 			return completed
 		case result := <-done:
-			if result.cleanup != nil {
-				cleanups = append(cleanups, result.cleanup)
-			}
+			outcomes = append(outcomes, result.outcome)
 			completed++
 		}
 	}
-	q.finishCompletedColdChecks(cleanups)
+	q.finishCompletedColdChecks(outcomes)
+	q.logBatchProgress(queued, completed, outcomes, time.Since(started))
 	return completed
 }
 
-func (q *coldSubscriptionNodeCheckQueue) finishCompletedColdChecks(cleanups []func()) {
+func (q *coldSubscriptionNodeCheckQueue) finishCompletedColdChecks(outcomes []coldNodeCheckOutcome) {
 	if q == nil {
 		return
 	}
@@ -858,9 +872,37 @@ func (q *coldSubscriptionNodeCheckQueue) finishCompletedColdChecks(cleanups []fu
 			log.Printf("cold subscription node check: flush batch state: %v", err)
 		}
 	}
-	for _, cleanup := range cleanups {
-		cleanup()
+	for _, outcome := range outcomes {
+		if outcome.cleanup != nil {
+			outcome.cleanup()
+		}
 	}
+}
+
+func (q *coldSubscriptionNodeCheckQueue) logBatchProgress(queued, completed int, outcomes []coldNodeCheckOutcome, elapsed time.Duration) {
+	logColdNodeCheckBatchProgress(queued, completed, outcomes, elapsed)
+}
+
+func (c *coldSubscriptionNodeChecker) logBatchProgress(queued, completed int, outcomes []coldNodeCheckOutcome, elapsed time.Duration) {
+	logColdNodeCheckBatchProgress(queued, completed, outcomes, elapsed)
+}
+
+func logColdNodeCheckBatchProgress(queued, completed int, outcomes []coldNodeCheckOutcome, elapsed time.Duration) {
+	promoted := 0
+	failed := 0
+	skipped := 0
+	for _, outcome := range outcomes {
+		if outcome.promoted {
+			promoted++
+		}
+		if outcome.failed {
+			failed++
+		}
+		if outcome.skipped {
+			skipped++
+		}
+	}
+	log.Printf("cold subscription node check: batch progress queued=%d completed=%d promoted=%d failed=%d skipped=%d elapsed=%s", queued, completed, promoted, failed, skipped, elapsed.Truncate(time.Millisecond))
 }
 
 func nodeDynamicModelFromEntry(hash string, entry *node.NodeEntry) model.NodeDynamic {
