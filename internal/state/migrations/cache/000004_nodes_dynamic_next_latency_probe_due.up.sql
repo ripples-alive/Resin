@@ -3,7 +3,7 @@ ADD COLUMN next_latency_probe_due_ns INTEGER NOT NULL DEFAULT 0;
 
 UPDATE nodes_dynamic
 SET next_latency_probe_due_ns = last_latency_probe_attempt_ns +
-	(300000000000 * CASE
+	(3600000000000 * CASE
 		WHEN failure_count <= 0 THEN 1
 		WHEN failure_count = 1 THEN 2
 		WHEN failure_count = 2 THEN 4

@@ -352,7 +352,7 @@ func TestMigrateCacheDB_BackfillsLegacyNextLatencyProbeDue(t *testing.T) {
 	if err := db.QueryRow(`SELECT next_latency_probe_due_ns FROM nodes_dynamic WHERE hash = ?`, dueHash.Hex()).Scan(&nextDueNs); err != nil {
 		t.Fatalf("query migrated next due: %v", err)
 	}
-	wantNextDueNs := lastAttemptNs + int64(20*time.Minute)
+	wantNextDueNs := lastAttemptNs + int64(4*time.Hour)
 	if nextDueNs != wantNextDueNs {
 		t.Fatalf("migrated next due: got %d, want %d", nextDueNs, wantNextDueNs)
 	}

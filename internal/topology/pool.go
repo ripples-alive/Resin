@@ -581,6 +581,9 @@ func (p *GlobalNodePool) recordResult(hash node.Hash, success bool, notifyDynami
 	}
 
 	dynamicChanged, circuitStateChanged := p.applyResult(entry, success)
+	if dynamicChanged {
+		p.refreshNextLatencyProbeDue(entry, time.Now().UnixNano())
+	}
 	if circuitStateChanged {
 		p.notifyAllPlatformsDirty(hash)
 	}
@@ -620,6 +623,26 @@ func (p *GlobalNodePool) currentMaxConsecutiveFailures() int {
 	return p.maxConsecutiveFailures()
 }
 
+func (p *GlobalNodePool) maxLatencyProbeInterval() time.Duration {
+	interval := time.Hour
+	if p != nil && p.maxLatencyTestInterval != nil {
+		if configured := p.maxLatencyTestInterval(); configured > 0 {
+			interval = configured
+		}
+	}
+	return interval
+}
+
+func (p *GlobalNodePool) refreshNextLatencyProbeDue(entry *node.NodeEntry, nowNs int64) bool {
+	if entry == nil || entry.LastLatencyProbeAttempt.Load() <= 0 {
+		return false
+	}
+	interval := p.maxLatencyProbeInterval()
+	nextDueNs := nowNs + int64(ProbeFailureBackoffInterval(interval, entry.FailureCount.Load()))
+	entry.NextLatencyProbeDue.Store(nextDueNs)
+	return true
+}
+
 // RecordLatency records a latency probe attempt for the given node and raw target.
 // rawTarget is normalized through ExtractDomain (eTLD+1). latency may be nil,
 // which means "attempt only" without latency sample writeback.
@@ -646,12 +669,7 @@ func (p *GlobalNodePool) recordLatencyOnEntry(entry *node.NodeEntry, rawTarget s
 		entry.LastAuthorityLatencyProbeAttempt.Store(nowNs)
 	}
 
-	interval := time.Hour
-	if p.maxLatencyTestInterval != nil {
-		if configured := p.maxLatencyTestInterval(); configured > 0 {
-			interval = configured
-		}
-	}
+	interval := p.maxLatencyProbeInterval()
 	nextDueNs := nowNs + int64(ProbeFailureBackoffInterval(interval, entry.FailureCount.Load()))
 	entry.NextLatencyProbeDue.Store(nextDueNs)
 

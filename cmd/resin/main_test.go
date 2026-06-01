@@ -1861,6 +1861,12 @@ func TestColdSubscriptionNodeCheck_LeavesLeaseDirtyForRegularFlush(t *testing.T)
 	}
 }
 
+func TestColdSubscriptionNodeSweepInterval_IsDatabasePollCadence(t *testing.T) {
+	if coldSubscriptionNodeSweepInterval != time.Minute {
+		t.Fatalf("cold subscription sweep interval = %s, want 1m database poll cadence", coldSubscriptionNodeSweepInterval)
+	}
+}
+
 func TestColdSubscriptionNodeCheck_FailureIncrementsPersistedFailureCount(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
@@ -1933,10 +1939,10 @@ func TestColdSubscriptionNodeCheck_FailureIncrementsPersistedFailureCount(t *tes
 	if len(dynamics) != 1 || dynamics[0].Hash != hash.Hex() || dynamics[0].FailureCount != 4 {
 		t.Fatalf("failed cold check should increment persisted failure count, got %+v", dynamics)
 	}
-	wantDelay := coldSubscriptionNodeSweepInterval * 16
+	wantDelay := time.Duration(runtimeCfg.MaxLatencyTestInterval) * 16
 	gotDelay := time.Duration(dynamics[0].NextLatencyProbeDueNs - dynamics[0].LastLatencyProbeAttemptNs)
 	if gotDelay < wantDelay || gotDelay > wantDelay+time.Second {
-		t.Fatalf("failed cold check should persist cold-sweep next due delay %s, got %s (%+v)", wantDelay, gotDelay, dynamics[0])
+		t.Fatalf("failed cold check should persist shared latency next due delay %s, got %s (%+v)", wantDelay, gotDelay, dynamics[0])
 	}
 }
 
@@ -1962,7 +1968,7 @@ func TestColdSubscriptionNodeCheck_ProbeSetupFailurePersistsNextDue(t *testing.T
 	}
 
 	runtimeCfg := config.NewDefaultRuntimeConfig()
-	runtimeCfg.MaxLatencyTestInterval = config.Duration(time.Minute)
+	runtimeCfg.MaxLatencyTestInterval = config.Duration(2 * time.Minute)
 	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
 	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
 		t.Fatalf("bootstrapTopology: %v", err)
@@ -1994,6 +2000,8 @@ func TestColdSubscriptionNodeCheck_ProbeSetupFailurePersistsNextDue(t *testing.T
 
 	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, &testutil.StubOutboundBuilder{}, func(node.Hash) error {
 		return errors.New("node outbound not ready")
+	}, func() time.Duration {
+		return time.Duration(runtimeCfg.MaxLatencyTestInterval)
 	})
 	checker.Check(topology.ColdNodeCandidate{
 		SubscriptionID: subID,
@@ -2012,8 +2020,10 @@ func TestColdSubscriptionNodeCheck_ProbeSetupFailurePersistsNextDue(t *testing.T
 	if dynamics[0].LastLatencyProbeAttemptNs <= now {
 		t.Fatalf("setup failure should update last attempt, got %+v", dynamics[0])
 	}
-	if dynamics[0].NextLatencyProbeDueNs <= dynamics[0].LastLatencyProbeAttemptNs {
-		t.Fatalf("setup failure should advance next due to avoid immediate retry, got %+v", dynamics[0])
+	wantDelay := time.Duration(runtimeCfg.MaxLatencyTestInterval)
+	gotDelay := time.Duration(dynamics[0].NextLatencyProbeDueNs - dynamics[0].LastLatencyProbeAttemptNs)
+	if gotDelay < wantDelay || gotDelay > wantDelay+time.Second {
+		t.Fatalf("setup failure should persist shared latency next due delay %s, got %s (%+v)", wantDelay, gotDelay, dynamics[0])
 	}
 }
 

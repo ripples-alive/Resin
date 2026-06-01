@@ -50,7 +50,7 @@ const downloadUserAgent = "clash.meta"
 const (
 	coldSubscriptionNodeMinQueueCapacity = 1024
 
-	coldSubscriptionNodeSweepInterval  = 5 * time.Minute
+	coldSubscriptionNodeSweepInterval  = time.Minute
 	coldSubscriptionNodeSweepBatchSize = 256
 )
 
@@ -364,6 +364,8 @@ func newTopologyRuntime(
 		coldChecker := newColdSubscriptionNodeChecker(engine, pool, subManager, singboxBuilder, func(hash node.Hash) error {
 			_, err := probeMgr.ProbeLatencySync(hash)
 			return err
+		}, func() time.Duration {
+			return time.Duration(runtimeConfigSnapshot(runtimeCfg).MaxLatencyTestInterval)
 		})
 		workers, queueCapacity, batchSize := coldSubscriptionNodeQueueSizing(envCfg.ProbeConcurrency)
 		coldNodeQueue = newColdSubscriptionNodeCheckQueue(
@@ -557,13 +559,14 @@ func ensureDefaultAccountHeaderRule(engine *state.StateEngine) error {
 }
 
 type coldSubscriptionNodeChecker struct {
-	engine            *state.StateEngine
-	pool              *topology.GlobalNodePool
-	subManager        *topology.SubscriptionManager
-	relationValidator topology.ColdNodeRelationValidator
-	relationStore     topology.ColdNodeRelationStore
-	outbound          *outbound.OutboundManager
-	probe             func(node.Hash) error
+	engine                 *state.StateEngine
+	pool                   *topology.GlobalNodePool
+	subManager             *topology.SubscriptionManager
+	relationValidator      topology.ColdNodeRelationValidator
+	relationStore          topology.ColdNodeRelationStore
+	outbound               *outbound.OutboundManager
+	probe                  func(node.Hash) error
+	maxLatencyTestInterval func() time.Duration
 }
 
 type coldNodeDirtyFlusher interface {
@@ -587,15 +590,21 @@ func newColdSubscriptionNodeChecker(
 	subManager *topology.SubscriptionManager,
 	builder outbound.OutboundBuilder,
 	probe func(node.Hash) error,
+	maxLatencyTestIntervalFns ...func() time.Duration,
 ) *coldSubscriptionNodeChecker {
+	maxLatencyTestInterval := func() time.Duration { return time.Hour }
+	if len(maxLatencyTestIntervalFns) > 0 && maxLatencyTestIntervalFns[0] != nil {
+		maxLatencyTestInterval = maxLatencyTestIntervalFns[0]
+	}
 	return &coldSubscriptionNodeChecker{
-		engine:            engine,
-		pool:              pool,
-		subManager:        subManager,
-		relationValidator: engine,
-		relationStore:     engine,
-		outbound:          outbound.NewOutboundManager(pool, builder),
-		probe:             probe,
+		engine:                 engine,
+		pool:                   pool,
+		subManager:             subManager,
+		relationValidator:      engine,
+		relationStore:          engine,
+		outbound:               outbound.NewOutboundManager(pool, builder),
+		probe:                  probe,
+		maxLatencyTestInterval: maxLatencyTestInterval,
 	}
 }
 
@@ -709,10 +718,10 @@ func (c *coldSubscriptionNodeChecker) recordColdCheckFailureAttempt(entry *node.
 	if lastAttemptNs <= 0 {
 		return
 	}
-	entry.NextLatencyProbeDue.Store(coldLatencyProbeDueNs(
+	entry.NextLatencyProbeDue.Store(latencyProbeDueNs(
 		lastAttemptNs,
-		int(entry.FailureCount.Load()),
-		coldSubscriptionNodeSweepInterval,
+		entry.FailureCount.Load(),
+		c.maxLatencyInterval(),
 	))
 }
 
@@ -798,9 +807,7 @@ func (c *coldSubscriptionNodeChecker) FlushColdNodeDirty() error {
 	if c == nil || c.engine == nil {
 		return nil
 	}
-	return c.engine.FlushNodeDirtySets(newFlushReaders(c.pool, c.subManager, nil, func() time.Duration {
-		return coldSubscriptionNodeSweepInterval
-	}))
+	return c.engine.FlushNodeDirtySets(newFlushReaders(c.pool, c.subManager, nil, c.maxLatencyInterval))
 }
 
 func (c *coldSubscriptionNodeChecker) removeTransientColdCheckEntry(hash node.Hash) {
@@ -982,24 +989,23 @@ func logColdNodeCheckBatchProgress(queued, completed int, outcomes []coldNodeChe
 	log.Printf("cold subscription node check: batch progress queued=%d completed=%d promoted=%d failed=%d skipped=%d elapsed=%s", queued, completed, promoted, failed, skipped, elapsed.Truncate(time.Millisecond))
 }
 
-func coldLatencyProbeBackoffMultiplier(failureCount int) int64 {
-	if failureCount <= 0 {
-		return 1
-	}
-	if failureCount > 5 {
-		failureCount = 5
-	}
-	return int64(1) << failureCount
-}
-
-func coldLatencyProbeDueNs(lastAttemptNs int64, failureCount int, baseInterval time.Duration) int64 {
+func latencyProbeDueNs(lastAttemptNs int64, failureCount int32, baseInterval time.Duration) int64 {
 	if lastAttemptNs <= 0 {
 		return 0
 	}
 	if baseInterval <= 0 {
 		baseInterval = time.Hour
 	}
-	return lastAttemptNs + int64(baseInterval)*coldLatencyProbeBackoffMultiplier(failureCount)
+	return lastAttemptNs + int64(topology.ProbeFailureBackoffInterval(baseInterval, failureCount))
+}
+
+func (c *coldSubscriptionNodeChecker) maxLatencyInterval() time.Duration {
+	if c != nil && c.maxLatencyTestInterval != nil {
+		if interval := c.maxLatencyTestInterval(); interval > 0 {
+			return interval
+		}
+	}
+	return time.Hour
 }
 
 func nodeDynamicModelFromEntry(hash string, entry *node.NodeEntry, maxLatencyTestInterval time.Duration) model.NodeDynamic {

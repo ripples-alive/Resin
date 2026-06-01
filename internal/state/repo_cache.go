@@ -614,7 +614,7 @@ func (r *CacheRepo) loadCurrentColdNodeRelations(hash node.Hash, enabledSubscrip
 }
 
 // LoadDueColdNodeCandidates reads node-scoped cold-check candidates whose
-// latency probe attempt is missing, zero, or older than the supplied interval.
+// persisted latency probe due timestamp is missing, zero, or due by now.
 // Each candidate carries all non-evicted inventory relations for that node so a
 // successful cold check can restore the full node relationship set atomically.
 func (r *CacheRepo) LoadDueColdNodeCandidates(nowNs int64, interval time.Duration, limit int) ([]topology.ColdNodeCandidate, error) {
