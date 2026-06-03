@@ -415,6 +415,11 @@ func TestCacheRepo_LoadDueColdNodeCandidates_FiltersOrdersAndLimits(t *testing.T
 	var subNodes []model.SubscriptionNode
 	var dynamics []model.NodeDynamic
 	dueByKey := make(map[string]seedNode)
+	wantDue := make([]struct {
+		key       string
+		nextDueNs int64
+		hashHex   string
+	}, 0)
 	var sharedDueHash node.Hash
 	for _, seed := range seeds {
 		hash := node.HashFromRawOptions(seed.raw)
@@ -432,7 +437,17 @@ func TestCacheRepo_LoadDueColdNodeCandidates_FiltersOrdersAndLimits(t *testing.T
 			dynamics = append(dynamics, model.NodeDynamic{Hash: hash.Hex(), NextLatencyProbeDueNs: seed.nextDueNs})
 		}
 		if !seed.evicted && (!seed.hasDynamic || seed.nextDueNs <= nowNs) {
-			dueByKey[seed.subID+"/"+hash.Hex()] = seed
+			key := seed.subID + "/" + hash.Hex()
+			nextDueNs := seed.nextDueNs
+			if !seed.hasDynamic {
+				nextDueNs = 0
+			}
+			dueByKey[key] = seed
+			wantDue = append(wantDue, struct {
+				key       string
+				nextDueNs int64
+				hashHex   string
+			}{key: key, nextDueNs: nextDueNs, hashHex: hash.Hex()})
 		}
 	}
 	subNodes = append(subNodes, model.SubscriptionNode{
@@ -462,18 +477,19 @@ func TestCacheRepo_LoadDueColdNodeCandidates_FiltersOrdersAndLimits(t *testing.T
 	if err != nil {
 		t.Fatalf("LoadDueColdNodeCandidates limited: %v", err)
 	}
-	wantKeys := make([]string, 0, len(dueByKey))
-	for key := range dueByKey {
-		wantKeys = append(wantKeys, key)
-	}
-	sort.Strings(wantKeys)
+	sort.Slice(wantDue, func(i, j int) bool {
+		if wantDue[i].nextDueNs == wantDue[j].nextDueNs {
+			return wantDue[i].hashHex < wantDue[j].hashHex
+		}
+		return wantDue[i].nextDueNs < wantDue[j].nextDueNs
+	})
 	if len(got) != 2 {
 		t.Fatalf("limited candidates: got %d, want 2", len(got))
 	}
 	for i, candidate := range got {
 		key := candidate.SubscriptionID + "/" + candidate.Hash.Hex()
-		if key != wantKeys[i] {
-			t.Fatalf("candidate %d key: got %s, want %s", i, key, wantKeys[i])
+		if key != wantDue[i].key {
+			t.Fatalf("candidate %d key: got %s, want %s", i, key, wantDue[i].key)
 		}
 		seed := dueByKey[key]
 		if string(candidate.RawOptions) != string(seed.raw) {
@@ -488,13 +504,13 @@ func TestCacheRepo_LoadDueColdNodeCandidates_FiltersOrdersAndLimits(t *testing.T
 	if err != nil {
 		t.Fatalf("LoadDueColdNodeCandidates full: %v", err)
 	}
-	if len(got) != len(wantKeys) {
-		t.Fatalf("full candidates: got %d, want %d (%v)", len(got), len(wantKeys), wantKeys)
+	if len(got) != len(wantDue) {
+		t.Fatalf("full candidates: got %d, want %d (%v)", len(got), len(wantDue), wantDue)
 	}
 	for i, candidate := range got {
 		key := candidate.SubscriptionID + "/" + candidate.Hash.Hex()
-		if key != wantKeys[i] {
-			t.Fatalf("full candidate %d key: got %s, want %s", i, key, wantKeys[i])
+		if key != wantDue[i].key {
+			t.Fatalf("full candidate %d key: got %s, want %s", i, key, wantDue[i].key)
 		}
 	}
 	var sharedCandidate *topology.ColdNodeCandidate
@@ -561,6 +577,62 @@ func TestCacheRepo_LoadDueColdNodeCandidates_UsesNextDueInsteadOfAttemptBackoff(
 	sort.Strings(wantKeys)
 	if !reflect.DeepEqual(gotKeys, wantKeys) {
 		t.Fatalf("due candidates with persisted next due: got %v, want %v", gotKeys, wantKeys)
+	}
+}
+
+func TestCacheRepo_LoadDueColdNodeCandidates_OrdersByNextDueBeforeSubscriptionID(t *testing.T) {
+	repo := newTestCacheRepo(t)
+	nowNs := int64(time.Hour)
+	interval := 100 * time.Nanosecond
+
+	type dueNode struct {
+		subID     string
+		server    string
+		nextDueNs int64
+	}
+	nodes := []dueNode{
+		{subID: "sub-a", server: "198.51.100.80", nextDueNs: nowNs - 100},
+		{subID: "sub-c", server: "198.51.100.81", nextDueNs: nowNs - 300},
+		{subID: "sub-b", server: "198.51.100.82", nextDueNs: nowNs - 200},
+	}
+
+	statics := make([]model.NodeStatic, 0, len(nodes))
+	relations := make([]model.SubscriptionNode, 0, len(nodes))
+	dynamics := make([]model.NodeDynamic, 0, len(nodes))
+	expectedHashes := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		raw := json.RawMessage(`{"type":"stub","server":"` + n.server + `","server_port":443}`)
+		hash := node.HashFromRawOptions(raw)
+		statics = append(statics, model.NodeStatic{Hash: hash.Hex(), RawOptions: raw, CreatedAtNs: nowNs})
+		relations = append(relations, model.SubscriptionNode{SubscriptionID: n.subID, NodeHash: hash.Hex()})
+		dynamics = append(dynamics, model.NodeDynamic{Hash: hash.Hex(), NextLatencyProbeDueNs: n.nextDueNs})
+	}
+	// Expected order is next_due ASC, not subscription_id ASC.
+	for _, n := range []dueNode{nodes[1], nodes[2], nodes[0]} {
+		raw := json.RawMessage(`{"type":"stub","server":"` + n.server + `","server_port":443}`)
+		expectedHashes = append(expectedHashes, node.HashFromRawOptions(raw).Hex())
+	}
+
+	if err := repo.BulkUpsertNodesStatic(statics); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := repo.BulkUpsertSubscriptionNodes(relations); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+	if err := repo.BulkUpsertNodesDynamic(dynamics); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
+
+	got, err := repo.LoadDueColdNodeCandidates(nowNs, interval, 10)
+	if err != nil {
+		t.Fatalf("LoadDueColdNodeCandidates: %v", err)
+	}
+	gotHashes := make([]string, 0, len(got))
+	for _, candidate := range got {
+		gotHashes = append(gotHashes, candidate.Hash.Hex())
+	}
+	if !reflect.DeepEqual(gotHashes, expectedHashes) {
+		t.Fatalf("due candidates order: got %v, want %v", gotHashes, expectedHashes)
 	}
 }
 

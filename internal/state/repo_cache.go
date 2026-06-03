@@ -627,85 +627,230 @@ func (r *CacheRepo) loadDueColdNodeCandidates(nowNs int64, interval time.Duratio
 	}
 	_ = interval
 	enabledSubscriptionIDs = compactUniqueStrings(enabledSubscriptionIDs)
-	enabledFilter := ""
-	args := []any{nowNs}
-	if len(enabledSubscriptionIDs) > 0 {
-		placeholders := strings.TrimRight(strings.Repeat("?,", len(enabledSubscriptionIDs)), ",")
-		enabledFilter = " AND subscription_id IN (" + placeholders + ")"
-		for _, subID := range enabledSubscriptionIDs {
-			args = append(args, subID)
-		}
+
+	selected, err := r.loadDueColdNodeCandidateHashes(nowNs, limit, enabledSubscriptionIDs)
+	if err != nil {
+		return nil, err
 	}
+	if len(selected) == 0 {
+		return nil, nil
+	}
+	return r.loadColdNodeCandidatesForHashes(selected, enabledSubscriptionIDs)
+}
+
+type coldNodeCandidateHash struct {
+	hashHex   string
+	nextDueNs int64
+}
+
+func (r *CacheRepo) loadDueColdNodeCandidateHashes(nowNs int64, limit int, enabledSubscriptionIDs []string) ([]coldNodeCandidateHash, error) {
+	selected, err := r.loadImmediateColdNodeCandidateHashes(limit, enabledSubscriptionIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(selected) >= limit {
+		return selected, nil
+	}
+	positiveDue, err := r.loadPositiveDueColdNodeCandidateHashes(nowNs, limit-len(selected), enabledSubscriptionIDs)
+	if err != nil {
+		return nil, err
+	}
+	selected = append(selected, positiveDue...)
+	return selected, nil
+}
+
+func enabledSubscriptionSQLFilter(alias string, enabledSubscriptionIDs []string) (string, []any) {
+	if len(enabledSubscriptionIDs) == 0 {
+		return "", nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(enabledSubscriptionIDs)), ",")
+	args := make([]any, 0, len(enabledSubscriptionIDs))
+	for _, subID := range enabledSubscriptionIDs {
+		args = append(args, subID)
+	}
+	return " AND " + alias + ".subscription_id IN (" + placeholders + ")", args
+}
+
+func (r *CacheRepo) loadImmediateColdNodeCandidateHashes(limit int, enabledSubscriptionIDs []string) ([]coldNodeCandidateHash, error) {
+	enabledFilter, enabledArgs := enabledSubscriptionSQLFilter("sn", enabledSubscriptionIDs)
+	args := make([]any, 0, len(enabledArgs)*2+1)
+	args = append(args, enabledArgs...)
+	args = append(args, enabledArgs...)
 	args = append(args, limit)
 
 	rows, err := r.db.Query(`
-		WITH candidate_hashes(node_hash) AS (
-			SELECT nd.hash
+		WITH immediate_hashes(node_hash, next_due_ns) AS (
+			SELECT nd.hash, nd.next_latency_probe_due_ns
 			FROM nodes_dynamic AS nd
-			WHERE nd.next_latency_probe_due_ns = 0
-			   OR nd.next_latency_probe_due_ns <= ?
-			UNION
-			SELECT ns.hash
+			WHERE nd.next_latency_probe_due_ns <= 0
+			  AND EXISTS (SELECT 1 FROM nodes_static AS ns WHERE ns.hash = nd.hash)
+			  AND EXISTS (
+				SELECT 1
+				FROM subscription_nodes AS sn
+				WHERE sn.node_hash = nd.hash
+				  AND sn.evicted = 0`+enabledFilter+`
+			  )
+			UNION ALL
+			SELECT ns.hash, 0
 			FROM nodes_static AS ns
-			LEFT JOIN nodes_dynamic AS nd ON nd.hash = ns.hash
-			WHERE nd.hash IS NULL
-		),
-		eligible_relations AS (
-			SELECT subscription_id, node_hash, tags_json
-			FROM subscription_nodes
-			WHERE evicted = 0`+enabledFilter+`
-		),
-		due AS (
-			SELECT ch.node_hash, MIN(sn.subscription_id) AS first_subscription_id
-			FROM candidate_hashes AS ch
-			JOIN eligible_relations AS sn ON sn.node_hash = ch.node_hash
-			JOIN nodes_static AS ns ON ns.hash = ch.node_hash
-			GROUP BY ch.node_hash
-			ORDER BY first_subscription_id ASC, ch.node_hash ASC
-			LIMIT ?
+			WHERE NOT EXISTS (SELECT 1 FROM nodes_dynamic AS nd WHERE nd.hash = ns.hash)
+			  AND EXISTS (
+				SELECT 1
+				FROM subscription_nodes AS sn
+				WHERE sn.node_hash = ns.hash
+				  AND sn.evicted = 0`+enabledFilter+`
+			  )
 		)
-		SELECT due.node_hash, ns.raw_options_json, rel.subscription_id, rel.tags_json
-		FROM due
-		JOIN nodes_static AS ns ON ns.hash = due.node_hash
-		JOIN eligible_relations AS rel ON rel.node_hash = due.node_hash
-		ORDER BY due.first_subscription_id ASC, due.node_hash ASC, rel.subscription_id ASC`, args...)
+		SELECT node_hash, next_due_ns
+		FROM immediate_hashes
+		ORDER BY next_due_ns ASC, node_hash ASC
+		LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanColdNodeCandidateHashes(rows, limit)
+}
 
-	candidates := make([]topology.ColdNodeCandidate, 0)
-	indexByHash := make(map[string]int)
+func (r *CacheRepo) loadPositiveDueColdNodeCandidateHashes(nowNs int64, limit int, enabledSubscriptionIDs []string) ([]coldNodeCandidateHash, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	enabledFilter, enabledArgs := enabledSubscriptionSQLFilter("sn", enabledSubscriptionIDs)
+	args := make([]any, 0, len(enabledArgs)+2)
+	args = append(args, nowNs)
+	args = append(args, enabledArgs...)
+	args = append(args, limit)
+
+	rows, err := r.db.Query(`
+		SELECT nd.hash, nd.next_latency_probe_due_ns
+		FROM nodes_dynamic AS nd
+		WHERE nd.next_latency_probe_due_ns > 0
+		  AND nd.next_latency_probe_due_ns <= ?
+		  AND EXISTS (SELECT 1 FROM nodes_static AS ns WHERE ns.hash = nd.hash)
+		  AND EXISTS (
+			SELECT 1
+			FROM subscription_nodes AS sn
+			WHERE sn.node_hash = nd.hash
+			  AND sn.evicted = 0`+enabledFilter+`
+		  )
+		ORDER BY nd.next_latency_probe_due_ns ASC, nd.hash ASC
+		LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanColdNodeCandidateHashes(rows, limit)
+}
+
+func scanColdNodeCandidateHashes(rows *sql.Rows, limit int) ([]coldNodeCandidateHash, error) {
+	selected := make([]coldNodeCandidateHash, 0, limit)
+	for rows.Next() {
+		var item coldNodeCandidateHash
+		if err := rows.Scan(&item.hashHex, &item.nextDueNs); err != nil {
+			return nil, err
+		}
+		selected = append(selected, item)
+	}
+	return selected, rows.Err()
+}
+
+func (r *CacheRepo) loadColdNodeCandidatesForHashes(selected []coldNodeCandidateHash, enabledSubscriptionIDs []string) ([]topology.ColdNodeCandidate, error) {
+	if len(selected) == 0 {
+		return nil, nil
+	}
+
+	selectedHashes := make([]string, 0, len(selected))
+	for _, item := range selected {
+		selectedHashes = append(selectedHashes, item.hashHex)
+	}
+
+	byHash := make(map[string]*topology.ColdNodeCandidate, len(selected))
+	for start := 0; start < len(selectedHashes); start += sqliteQueryParamBatchSize {
+		end := start + sqliteQueryParamBatchSize
+		if end > len(selectedHashes) {
+			end = len(selectedHashes)
+		}
+		if err := r.loadColdNodeCandidatesForHashBatch(selectedHashes[start:end], enabledSubscriptionIDs, byHash); err != nil {
+			return nil, err
+		}
+	}
+
+	candidates := make([]topology.ColdNodeCandidate, 0, len(byHash))
+	for _, item := range selected {
+		candidate, ok := byHash[item.hashHex]
+		if !ok {
+			continue
+		}
+		sort.SliceStable(candidate.Relations, func(i, j int) bool {
+			return candidate.Relations[i].SubscriptionID < candidate.Relations[j].SubscriptionID
+		})
+		if len(candidate.Relations) > 0 {
+			candidate.SubscriptionID = candidate.Relations[0].SubscriptionID
+			candidate.Tags = append([]string(nil), candidate.Relations[0].Tags...)
+		}
+		candidates = append(candidates, *candidate)
+	}
+	return candidates, nil
+}
+
+func (r *CacheRepo) loadColdNodeCandidatesForHashBatch(hashBatch []string, enabledSubscriptionIDs []string, byHash map[string]*topology.ColdNodeCandidate) error {
+	if len(hashBatch) == 0 {
+		return nil
+	}
+	hashPlaceholders := strings.TrimRight(strings.Repeat("?,", len(hashBatch)), ",")
+	args := make([]any, 0, len(hashBatch)+len(enabledSubscriptionIDs))
+	for _, hash := range hashBatch {
+		args = append(args, hash)
+	}
+	enabledFilter := ""
+	if len(enabledSubscriptionIDs) > 0 {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(enabledSubscriptionIDs)), ",")
+		enabledFilter = " AND sn.subscription_id IN (" + placeholders + ")"
+		for _, subID := range enabledSubscriptionIDs {
+			args = append(args, subID)
+		}
+	}
+
+	rows, err := r.db.Query(`
+		SELECT ns.hash, ns.raw_options_json, sn.subscription_id, sn.tags_json
+		FROM nodes_static AS ns
+		JOIN subscription_nodes AS sn ON sn.node_hash = ns.hash
+		WHERE ns.hash IN (`+hashPlaceholders+`)
+		  AND sn.evicted = 0`+enabledFilter+`
+		ORDER BY ns.hash ASC, sn.subscription_id ASC`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
 	for rows.Next() {
 		var hashHex, rawOptionsJSON, subID, tagsJSON string
 		if err := rows.Scan(&hashHex, &rawOptionsJSON, &subID, &tagsJSON); err != nil {
-			return nil, err
+			return err
 		}
 		tags, err := decodeStringSliceJSON(tagsJSON)
 		if err != nil {
-			return nil, fmt.Errorf("decode cold candidate tags_json for %s/%s: %w", subID, hashHex, err)
+			return fmt.Errorf("decode cold candidate tags_json for %s/%s: %w", subID, hashHex, err)
 		}
-		idx, ok := indexByHash[hashHex]
+		candidate, ok := byHash[hashHex]
 		if !ok {
 			hash, err := node.ParseHex(hashHex)
 			if err != nil {
-				return nil, fmt.Errorf("parse cold candidate hash %s: %w", hashHex, err)
+				return fmt.Errorf("parse cold candidate hash %s: %w", hashHex, err)
 			}
-			idx = len(candidates)
-			indexByHash[hashHex] = idx
-			candidates = append(candidates, topology.ColdNodeCandidate{
-				SubscriptionID: subID,
-				Hash:           hash,
-				RawOptions:     json.RawMessage(rawOptionsJSON),
-				Tags:           append([]string(nil), tags...),
-			})
+			candidate = &topology.ColdNodeCandidate{
+				Hash:       hash,
+				RawOptions: json.RawMessage(rawOptionsJSON),
+			}
+			byHash[hashHex] = candidate
 		}
-		candidates[idx].Relations = append(candidates[idx].Relations, topology.ColdNodeRelation{
+		candidate.Relations = append(candidate.Relations, topology.ColdNodeRelation{
 			SubscriptionID: subID,
 			Tags:           append([]string(nil), tags...),
 		})
 	}
-	return candidates, rows.Err()
+	return rows.Err()
 }
 
 // ReplaceSubscriptionRefresh atomically applies a DB-first refresh inventory diff.

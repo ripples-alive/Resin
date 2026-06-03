@@ -86,10 +86,10 @@ func (e *StateEngine) MarkSubscriptionNodeDelete(subID, nodeHash string) {
 	e.dirtySubscriptionNodes.MarkDelete(SubscriptionNodeDirtyKey{SubscriptionID: subID, NodeHash: nodeHash})
 }
 
-func (e *StateEngine) enabledSubscriptionIDs() ([]string, error) {
+func (e *StateEngine) enabledSubscriptionFilterIDs() ([]string, bool, error) {
 	subs, err := e.ListSubscriptions()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	ids := make([]string, 0, len(subs))
 	for _, sub := range subs {
@@ -97,26 +97,32 @@ func (e *StateEngine) enabledSubscriptionIDs() ([]string, error) {
 			ids = append(ids, sub.ID)
 		}
 	}
-	return ids, nil
+	if len(ids) == 0 {
+		return nil, false, nil
+	}
+	if len(ids) == len(subs) {
+		return nil, true, nil
+	}
+	return ids, true, nil
 }
 
 func (e *StateEngine) LoadDueColdNodeCandidates(nowNs int64, interval time.Duration, limit int) ([]topology.ColdNodeCandidate, error) {
-	ids, err := e.enabledSubscriptionIDs()
+	ids, hasEnabled, err := e.enabledSubscriptionFilterIDs()
 	if err != nil {
 		return nil, err
 	}
-	if len(ids) == 0 {
+	if !hasEnabled {
 		return nil, nil
 	}
 	return e.CacheRepo.loadDueColdNodeCandidates(nowNs, interval, limit, ids)
 }
 
 func (e *StateEngine) LoadCurrentColdNodeRelations(hash node.Hash) ([]topology.ColdNodeRelation, error) {
-	ids, err := e.enabledSubscriptionIDs()
+	ids, hasEnabled, err := e.enabledSubscriptionFilterIDs()
 	if err != nil {
 		return nil, err
 	}
-	if len(ids) == 0 {
+	if !hasEnabled {
 		return nil, nil
 	}
 	return e.CacheRepo.loadCurrentColdNodeRelations(hash, ids)
