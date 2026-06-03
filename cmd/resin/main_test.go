@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net"
 	"net/netip"
 	"path/filepath"
 	"reflect"
@@ -27,6 +28,7 @@ import (
 	"github.com/Resinat/Resin/internal/testutil"
 	"github.com/Resinat/Resin/internal/topology"
 	"github.com/sagernet/sing-box/adapter"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 func newBootstrapTestRuntime(runtimeCfg *config.RuntimeConfig) (*topology.SubscriptionManager, *topology.GlobalNodePool) {
@@ -88,6 +90,46 @@ func (b *trackingBootstrapBuilder) Build(raw json.RawMessage) (adapter.Outbound,
 		return nil, errors.New("bootstrap build failed")
 	}
 	return testutil.NewNoopOutbound(), nil
+}
+
+type blockingCloseTestBuilder struct {
+	release          <-chan struct{}
+	closeStarted     chan struct{}
+	closeStartedOnce sync.Once
+}
+
+func (b *blockingCloseTestBuilder) Build(_ json.RawMessage) (adapter.Outbound, error) {
+	return &blockingCloseTestOutbound{
+		release: b.release,
+		markCloseStarted: func() {
+			b.closeStartedOnce.Do(func() { close(b.closeStarted) })
+		},
+	}, nil
+}
+
+type blockingCloseTestOutbound struct {
+	release          <-chan struct{}
+	markCloseStarted func()
+}
+
+func (o *blockingCloseTestOutbound) Type() string { return "blocking-close" }
+func (o *blockingCloseTestOutbound) Tag() string  { return "blocking-close" }
+func (o *blockingCloseTestOutbound) Network() []string {
+	return []string{"tcp", "udp"}
+}
+func (o *blockingCloseTestOutbound) Dependencies() []string { return nil }
+func (o *blockingCloseTestOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	return nil, errors.New("blocking-close: dial not supported")
+}
+func (o *blockingCloseTestOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, errors.New("blocking-close: listen packet not supported")
+}
+func (o *blockingCloseTestOutbound) Close() error {
+	if o.markCloseStarted != nil {
+		o.markCloseStarted()
+	}
+	<-o.release
+	return nil
 }
 
 type staticSubscriptionDownloader struct {
@@ -1626,6 +1668,107 @@ func TestColdSubscriptionNodeCheckQueue_LogsBatchProgress(t *testing.T) {
 			t.Fatalf("progress log missing %q in %q", want, logText)
 		}
 	}
+}
+
+func TestColdSubscriptionNodeCheckQueue_SlowTransientOutboundCleanupDoesNotBlockBatchProgress(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-cold-slow-cleanup"
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "ColdSlowCleanup",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	runtimeCfg := config.NewDefaultRuntimeConfig()
+	subManager, pool := newColdCheckTestRuntime(engine, runtimeCfg)
+	if err := bootstrapTopology(engine, subManager, pool, newDefaultPlatformEnvConfig()); err != nil {
+		t.Fatalf("bootstrapTopology: %v", err)
+	}
+
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.90","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{{
+		Hash:        hash.Hex(),
+		RawOptions:  raw,
+		CreatedAtNs: now,
+	}}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: subID,
+		NodeHash:       hash.Hex(),
+		Tags:           []string{"slow-cleanup"},
+	}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	releaseClose := make(chan struct{})
+	var releaseCloseOnce sync.Once
+	t.Cleanup(func() { releaseCloseOnce.Do(func() { close(releaseClose) }) })
+	builder := &blockingCloseTestBuilder{
+		release:      releaseClose,
+		closeStarted: make(chan struct{}),
+	}
+	checker := newColdSubscriptionNodeChecker(engine, pool, subManager, builder, func(node.Hash) error {
+		return errors.New("synthetic probe failure")
+	})
+	queue := newColdSubscriptionNodeCheckQueue(checker, 1, 1)
+	queue.Start()
+	t.Cleanup(queue.Stop)
+
+	batchDone := make(chan int, 1)
+	go func() {
+		batchDone <- queue.CheckBatch(context.Background(), []topology.ColdNodeCandidate{{
+			SubscriptionID: subID,
+			Hash:           hash,
+			RawOptions:     raw,
+			Tags:           []string{"slow-cleanup"},
+		}})
+	}()
+
+	select {
+	case <-builder.closeStarted:
+	case completed := <-batchDone:
+		if completed != 1 {
+			releaseCloseOnce.Do(func() { close(releaseClose) })
+			t.Fatalf("completed checks: got %d, want 1", completed)
+		}
+		select {
+		case <-builder.closeStarted:
+		case <-time.After(time.Second):
+			releaseCloseOnce.Do(func() { close(releaseClose) })
+			t.Fatal("batch completed but transient outbound close was not queued")
+		}
+		return
+	case <-time.After(time.Second):
+		releaseCloseOnce.Do(func() { close(releaseClose) })
+		t.Fatal("transient outbound close was not attempted")
+	}
+
+	select {
+	case completed := <-batchDone:
+		if completed != 1 {
+			t.Fatalf("completed checks: got %d, want 1", completed)
+		}
+	case <-time.After(200 * time.Millisecond):
+		releaseCloseOnce.Do(func() { close(releaseClose) })
+		completed := <-batchDone
+		t.Fatalf("slow transient outbound cleanup blocked batch progress; completed after releasing close=%d", completed)
+	}
+
+	releaseCloseOnce.Do(func() { close(releaseClose) })
 }
 
 func TestColdSubscriptionNodeCheck_DoesNotOverwriteExistingRealEntry(t *testing.T) {

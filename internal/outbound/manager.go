@@ -111,6 +111,19 @@ func (m *OutboundManager) RemoveNodeOutbound(entry *node.NodeEntry) {
 	}
 }
 
+// RemoveNodeOutboundAsync clears a node's outbound reference and closes the old
+// outbound from a bounded background queue so slow protocol shutdowns do not
+// block callers that are only detaching transient/runtime state.
+func (m *OutboundManager) RemoveNodeOutboundAsync(entry *node.NodeEntry, reason string) {
+	if entry == nil {
+		return
+	}
+	old := entry.Outbound.Swap(nil)
+	if old != nil {
+		closeOutboundAsync(*old, reason)
+	}
+}
+
 // WarmupAll iterates all nodes in the pool and ensures each has an outbound.
 // Called once after bootstrap to avoid ErrOutboundNotReady on restart.
 func (m *OutboundManager) WarmupAll() {

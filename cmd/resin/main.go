@@ -820,7 +820,7 @@ func (c *coldSubscriptionNodeChecker) removeTransientColdCheckEntry(hash node.Ha
 		if len(ids) == 1 && ids[0] == topology.ColdCheckTransientSubscriptionID {
 			c.pool.DeleteNodeFromBootstrap(hash)
 			if c.outbound != nil {
-				c.outbound.RemoveNodeOutbound(entry)
+				c.outbound.RemoveNodeOutboundAsync(entry, "cold transient cleanup")
 			}
 			if entry.LatencyTable != nil {
 				entry.LatencyTable.Close()
