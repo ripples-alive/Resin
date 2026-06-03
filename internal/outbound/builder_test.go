@@ -562,7 +562,7 @@ func TestSingboxBuilder_InvalidJSON(t *testing.T) {
 	}
 }
 
-func TestSingboxBuilder_RecoverRealityShortIDPanic(t *testing.T) {
+func TestSingboxBuilder_RejectsInvalidRealityShortIDBeforeCreate(t *testing.T) {
 	b, err := NewSingboxBuilder()
 	if err != nil {
 		t.Fatalf("NewSingboxBuilder() error: %v", err)
@@ -595,13 +595,13 @@ func TestSingboxBuilder_RecoverRealityShortIDPanic(t *testing.T) {
 		t.Fatal("expected malformed Reality short_id to return an error")
 	}
 	if ob != nil {
-		t.Fatalf("expected nil outbound on recovered panic, got %T", ob)
+		t.Fatalf("expected nil outbound for malformed Reality short_id, got %T", ob)
 	}
-	if strings.Contains(err.Error(), "uTLS, which is required by reality is not included") {
-		t.Skipf("Reality panic regression requires with_utls build tag: %v", err)
+	if !strings.Contains(err.Error(), "invalid reality short_id") {
+		t.Fatalf("expected Reality short_id validation error, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "panic while building outbound [vless]") {
-		t.Fatalf("expected panic conversion error, got: %v", err)
+	if strings.Contains(err.Error(), "panic while building outbound") {
+		t.Fatalf("invalid Reality short_id should be rejected before sing-box panic path, got: %v", err)
 	}
 }
 

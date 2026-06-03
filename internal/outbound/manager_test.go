@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -199,8 +201,10 @@ func TestEnsureNodeOutbound_BuilderPanicSetsLastError(t *testing.T) {
 	pool := &mockPool{}
 	pool.addEntry(entry)
 
-	mgr := NewOutboundManager(pool, &panicBuilder{})
-	mgr.EnsureNodeOutbound(entry.Hash)
+	stderr := captureStderr(t, func() {
+		mgr := NewOutboundManager(pool, &panicBuilder{})
+		mgr.EnsureNodeOutbound(entry.Hash)
+	})
 
 	if entry.HasOutbound() {
 		t.Fatal("expected HasOutbound() == false after builder panic")
@@ -209,6 +213,35 @@ func TestEnsureNodeOutbound_BuilderPanicSetsLastError(t *testing.T) {
 	if !strings.Contains(lastErr, "panic in outbound builder") || !strings.Contains(lastErr, "simulated builder panic") {
 		t.Fatalf("expected panic to be recorded as LastError, got %q", lastErr)
 	}
+	if stderr != "" {
+		t.Fatalf("builder panic recovery should not print stack to stderr, got %q", stderr)
+	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	oldStderr := os.Stderr
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = writer
+
+	out := make(chan string, 1)
+	go func() {
+		var buf strings.Builder
+		_, _ = io.Copy(&buf, reader)
+		out <- buf.String()
+	}()
+
+	fn()
+
+	_ = writer.Close()
+	os.Stderr = oldStderr
+	captured := <-out
+	_ = reader.Close()
+	return captured
 }
 
 func TestEnsureNodeOutbound_Idempotent(t *testing.T) {

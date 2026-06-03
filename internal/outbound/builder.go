@@ -2,10 +2,11 @@ package outbound
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"runtime/debug"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
@@ -142,7 +143,6 @@ func (b *SingboxBuilder) Build(rawOptions json.RawMessage) (ob adapter.Outbound,
 				ob = nil
 			}
 			err = fmt.Errorf("panic while building outbound [%s]: %v", outboundType, r)
-			debug.PrintStack()
 		}
 	}()
 
@@ -154,6 +154,9 @@ func (b *SingboxBuilder) Build(rawOptions json.RawMessage) (ob adapter.Outbound,
 	}
 	if outboundConfig.Type != "" {
 		outboundType = outboundConfig.Type
+	}
+	if err := validateOutboundOptions(outboundConfig); err != nil {
+		return nil, err
 	}
 
 	// 2. Create the outbound instance via the registry.
@@ -179,6 +182,32 @@ func (b *SingboxBuilder) Build(rawOptions json.RawMessage) (ob adapter.Outbound,
 	}
 
 	return ob, nil
+}
+
+func validateOutboundOptions(outboundConfig option.Outbound) error {
+	tlsWrapper, ok := outboundConfig.Options.(option.OutboundTLSOptionsWrapper)
+	if !ok {
+		return nil
+	}
+	tlsOptions := tlsWrapper.TakeOutboundTLSOptions()
+	if tlsOptions == nil || tlsOptions.Reality == nil || !tlsOptions.Reality.Enabled {
+		return nil
+	}
+
+	reality := tlsOptions.Reality
+	publicKey, err := base64.RawURLEncoding.DecodeString(reality.PublicKey)
+	if err != nil || len(publicKey) != 32 {
+		return fmt.Errorf("invalid reality public_key for outbound [%s]", outboundConfig.Type)
+	}
+
+	if reality.ShortID == "" {
+		return nil
+	}
+	shortID, err := hex.DecodeString(reality.ShortID)
+	if err != nil || len(shortID) > 8 {
+		return fmt.Errorf("invalid reality short_id for outbound [%s]", outboundConfig.Type)
+	}
+	return nil
 }
 
 // Close shuts down the builder's internal DNS services.

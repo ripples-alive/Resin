@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"runtime/debug"
 	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
@@ -51,7 +50,6 @@ func (m *OutboundManager) buildSafely(rawOptions []byte) (ob adapter.Outbound, e
 				ob = nil
 			}
 			err = fmt.Errorf("panic in outbound builder: %v", r)
-			debug.PrintStack()
 		}
 	}()
 	return m.builder.Build(rawOptions)
