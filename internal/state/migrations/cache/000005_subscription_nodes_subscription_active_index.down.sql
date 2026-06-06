@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_subscription_nodes_subscription_active;

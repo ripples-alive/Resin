@@ -36,6 +36,7 @@ export type NodeSortBy = "tag" | "created_at" | "failure_count" | "region";
 export type SortOrder = "asc" | "desc";
 
 export type NodeListFilters = {
+  active?: boolean;
   platform_id?: string;
   subscription_id?: string;
   tag_keyword?: string;

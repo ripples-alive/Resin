@@ -25,6 +25,44 @@ func newCacheRepo(db *sql.DB) *CacheRepo {
 
 const sqliteQueryParamBatchSize = 900
 
+// NodeInventorySubscriptionMeta is the minimal subscription metadata needed for
+// DB-side inventory filtering and tag sorting.
+type NodeInventorySubscriptionMeta struct {
+	ID          string
+	Name        string
+	Enabled     bool
+	CreatedAtNs int64
+}
+
+// NodeInventoryListOptions controls a bounded DB-inventory node listing. It is
+// intentionally SQL-shaped so callers can keep limit/offset at the persistence
+// layer instead of materializing the whole node catalog in memory.
+type NodeInventoryListOptions struct {
+	SubscriptionMeta  []NodeInventorySubscriptionMeta
+	SubscriptionID    *string
+	HashFilter        []string
+	ExcludedHashes    []string
+	ExcludedEgressIPs []string
+	Enabled           *bool
+	Region            *string
+	CircuitOpen       *bool
+	HasOutbound       *bool
+	EgressIP          *string
+	ProbedSinceNs     *int64
+	TagKeyword        *string
+	SortBy            string
+	SortOrder         string
+	Limit             int
+	Offset            int
+}
+
+// NodeInventoryPage is a bounded inventory page plus whole-result aggregates.
+type NodeInventoryPage struct {
+	Items           []model.NodeInventory
+	Total           int
+	UniqueEgressIPs int
+}
+
 func probeFailureBackoffMultiplier(failureCount int) int64 {
 	if failureCount <= 0 {
 		return 1
@@ -553,6 +591,53 @@ func (r *CacheRepo) LoadSubscriptionNodes(subID string) ([]model.SubscriptionNod
 		result = append(result, sn)
 	}
 	return result, rows.Err()
+}
+
+// CountSubscriptionNodes returns non-evicted inventory node counts for the given subscriptions.
+func (r *CacheRepo) CountSubscriptionNodes(subIDs []string) (map[string]int, error) {
+	ids := compactUniqueStrings(subIDs)
+	counts := make(map[string]int, len(ids))
+	if len(ids) == 0 {
+		return counts, nil
+	}
+
+	for start := 0; start < len(ids); start += sqliteQueryParamBatchSize {
+		end := start + sqliteQueryParamBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, 0, len(batch))
+		for _, id := range batch {
+			args = append(args, id)
+		}
+
+		rows, err := r.db.Query(
+			"SELECT subscription_id, COUNT(*) FROM subscription_nodes WHERE evicted = 0 AND subscription_id IN ("+placeholders+") GROUP BY subscription_id",
+			args...,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		for rows.Next() {
+			var subID string
+			var count int
+			if err := rows.Scan(&subID, &count); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			counts[subID] = count
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return counts, nil
 }
 
 // IsColdNodeRelationCurrent reports whether the non-evicted subscription-node

@@ -23,6 +23,7 @@ import type { NodeSummary } from "./types";
 import { getAllRegions, getCompactRegionLabel, getRegionTitle } from "./regions";
 import type { NodeListFilters, NodeSortBy, SortOrder } from "./types";
 
+type NodeScopeFilter = "active" | "all";
 type NodeStatusFilter = "all" | "healthy" | "circuit_open" | "error" | "disabled";
 type NodeDisplayStatus = "healthy" | "circuit_open" | "pending_test" | "error" | "disabled";
 type ProbeAction = "egress" | "latency";
@@ -116,6 +117,11 @@ function statusFromQuery(params: URLSearchParams): NodeStatusFilter {
   }
 
   return "all";
+}
+
+function scopeFromQuery(params: URLSearchParams): NodeScopeFilter {
+  const active = parseBoolParam(params.get("active"));
+  return active === false ? "all" : "active";
 }
 
 function trimQueryValue(params: URLSearchParams, key: string): string {
@@ -260,6 +266,7 @@ function regionToLabel(region: string | undefined): { label: string; title: stri
 export function NodesPage() {
   const { locale, t } = useI18n();
   const location = useLocation();
+  const [nodeScope, setNodeScope] = useState<NodeScopeFilter>(() => scopeFromQuery(new URLSearchParams(location.search)));
   const [draftFilters, setDraftFilters] = useState<NodeFilterDraft>(() => draftFromQuery(location.search));
   const [activeFilters, setActiveFilters] = useState<NodeListFilters>(() =>
     draftToActiveFilters(draftFromQuery(location.search))
@@ -307,9 +314,10 @@ export function NodesPage() {
   const subscriptions = subscriptionsQuery.data ?? [];
 
   const nodesQuery = useQuery({
-    queryKey: ["nodes", activeFilters, sortBy, sortOrder, page, pageSize],
+    queryKey: ["nodes", nodeScope, activeFilters, sortBy, sortOrder, page, pageSize],
     queryFn: () =>
       listNodes({
+        active: nodeScope === "active",
         ...activeFilters,
         sort_by: sortBy,
         sort_order: sortOrder,
@@ -494,6 +502,7 @@ export function NodesPage() {
   };
 
   const resetFilters = () => {
+    setNodeScope("active");
     setDraftFilters(defaultFilterDraft);
     setActiveFilters(draftToActiveFilters(defaultFilterDraft));
     setSelectedNodeHash("");
@@ -685,6 +694,26 @@ export function NodesPage() {
               alignItems: "flex-end",
             }}
           >
+            <div style={NODE_FILTER_ITEM_STYLE}>
+              <label htmlFor="node-scope" style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>
+                {t("范围")}
+              </label>
+              <Select
+                id="node-scope"
+                value={nodeScope}
+                onChange={(event) => {
+                  setNodeScope(event.target.value as NodeScopeFilter);
+                  setSelectedNodeHash("");
+                  setDrawerOpen(false);
+                  setPage(0);
+                }}
+                style={NODE_FILTER_CONTROL_STYLE}
+              >
+                <option value="active">{t("Active")}</option>
+                <option value="all">{t("全部")}</option>
+              </Select>
+            </div>
+
             <div style={NODE_FILTER_ITEM_STYLE}>
               <label htmlFor="node-tag-keyword" style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>
                 {t("节点名")}

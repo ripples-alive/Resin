@@ -78,6 +78,14 @@ type NodeLatencyKey struct {
 	Domain   string
 }
 
+// NodeInventory groups one persisted node with its dynamic state and current
+// non-evicted subscription relations.
+type NodeInventory struct {
+	Static    NodeStatic
+	Dynamic   *NodeDynamic
+	Relations []SubscriptionNode
+}
+
 // Lease represents a sticky routing lease.
 type Lease struct {
 	PlatformID     string `json:"platform_id"`

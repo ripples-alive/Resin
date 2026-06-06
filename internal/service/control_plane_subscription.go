@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,25 +40,166 @@ type SubscriptionResponse struct {
 	LastError               string `json:"last_error,omitempty"`
 }
 
-func (s *ControlPlaneService) subscriptionInventoryNodeCount(sub *subscription.Subscription) int {
-	fallback := func() int {
-		count := 0
-		if managed := sub.ManagedNodes(); managed != nil {
-			managed.RangeNodes(func(_ node.Hash, n subscription.ManagedNode) bool {
-				if !n.Evicted {
-					count++
-				}
-				return true
-			})
-		}
-		return count
+func subscriptionRuntimeNodeCount(sub *subscription.Subscription) int {
+	if sub == nil {
+		return 0
 	}
+	count := 0
+	if managed := sub.ManagedNodes(); managed != nil {
+		managed.RangeNodes(func(_ node.Hash, n subscription.ManagedNode) bool {
+			if !n.Evicted {
+				count++
+			}
+			return true
+		})
+	}
+	return count
+}
+
+type SubscriptionListFilters struct {
+	// Active controls the data source: nil/true lists the hot runtime manager,
+	// while false lists the persisted DB inventory. Enabled filters only the
+	// subscription's enable/disable switch.
+	Active  *bool
+	Enabled *bool
+	Keyword string
+}
+
+type SubscriptionListOptions struct {
+	SortBy    string
+	SortOrder string
+	Limit     int
+	Offset    int
+}
+
+type SubscriptionListResult struct {
+	Items  []SubscriptionResponse
+	Total  int
+	Limit  int
+	Offset int
+}
+
+type subscriptionListRow struct {
+	ID                        string
+	Name                      string
+	SourceType                string
+	URL                       string
+	Content                   string
+	UpdateIntervalNs          int64
+	Enabled                   bool
+	Ephemeral                 bool
+	EphemeralNodeEvictDelayNs int64
+	CreatedAtNs               int64
+	LastCheckedNs             int64
+	LastUpdatedNs             int64
+	LastError                 string
+	runtime                   *subscription.Subscription
+}
+
+func subscriptionInventoryRow(sub model.Subscription, runtime *subscription.Subscription) subscriptionListRow {
+	return subscriptionListRow{
+		ID:                        sub.ID,
+		Name:                      sub.Name,
+		SourceType:                sub.SourceType,
+		URL:                       sub.URL,
+		Content:                   sub.Content,
+		UpdateIntervalNs:          sub.UpdateIntervalNs,
+		Enabled:                   sub.Enabled,
+		Ephemeral:                 sub.Ephemeral,
+		EphemeralNodeEvictDelayNs: sub.EphemeralNodeEvictDelayNs,
+		CreatedAtNs:               sub.CreatedAtNs,
+		LastCheckedNs:             sub.LastCheckedNs,
+		LastUpdatedNs:             sub.LastUpdatedNs,
+		LastError:                 sub.LastError,
+		runtime:                   runtime,
+	}
+}
+
+func subscriptionRuntimeRow(sub *subscription.Subscription) subscriptionListRow {
+	if sub == nil {
+		return subscriptionListRow{}
+	}
+	return subscriptionListRow{
+		ID:                        sub.ID,
+		Name:                      sub.Name(),
+		SourceType:                sub.SourceType(),
+		URL:                       sub.URL(),
+		Content:                   sub.Content(),
+		UpdateIntervalNs:          sub.UpdateIntervalNs(),
+		Enabled:                   sub.Enabled(),
+		Ephemeral:                 sub.Ephemeral(),
+		EphemeralNodeEvictDelayNs: sub.EphemeralNodeEvictDelayNs(),
+		CreatedAtNs:               sub.CreatedAtNs,
+		LastCheckedNs:             sub.LastCheckedNs.Load(),
+		LastUpdatedNs:             sub.LastUpdatedNs.Load(),
+		LastError:                 sub.GetLastError(),
+		runtime:                   sub,
+	}
+}
+
+func subscriptionRowMatchesKeyword(row subscriptionListRow, rawKeyword string) bool {
+	keyword := strings.ToLower(strings.TrimSpace(rawKeyword))
+	if keyword == "" {
+		return true
+	}
+	contains := func(v string) bool {
+		return strings.Contains(strings.ToLower(v), keyword)
+	}
+	return contains(row.ID) || contains(row.Name) || contains(row.URL) || contains(row.SourceType)
+}
+
+func subscriptionRowSortKey(row subscriptionListRow, sortBy string) string {
+	switch sortBy {
+	case "created_at":
+		return fmt.Sprintf("%020d", row.CreatedAtNs)
+	case "last_checked":
+		return fmt.Sprintf("%020d", row.LastCheckedNs)
+	case "last_updated":
+		return fmt.Sprintf("%020d", row.LastUpdatedNs)
+	default:
+		return strings.ToLower(row.Name)
+	}
+}
+
+func sortSubscriptionRows(rows []subscriptionListRow, opts SubscriptionListOptions) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		left := subscriptionRowSortKey(rows[i], opts.SortBy)
+		right := subscriptionRowSortKey(rows[j], opts.SortBy)
+		if left == right {
+			if opts.SortOrder == "desc" {
+				return rows[i].ID > rows[j].ID
+			}
+			return rows[i].ID < rows[j].ID
+		}
+		if opts.SortOrder == "desc" {
+			return left > right
+		}
+		return left < right
+	})
+}
+
+func paginateSubscriptionRows(rows []subscriptionListRow, opts SubscriptionListOptions) []subscriptionListRow {
+	if opts.Offset >= len(rows) {
+		return []subscriptionListRow{}
+	}
+	end := opts.Offset + opts.Limit
+	if end > len(rows) {
+		end = len(rows)
+	}
+	return rows[opts.Offset:end]
+}
+
+func (s *ControlPlaneService) subscriptionInventoryNodeCount(sub *subscription.Subscription) (int, error) {
+	fallback := subscriptionRuntimeNodeCount(sub)
 	if s == nil || s.Engine == nil || sub == nil {
-		return fallback()
+		return fallback, nil
 	}
 	relations, err := s.Engine.LoadSubscriptionNodes(sub.ID)
-	if err != nil || len(relations) == 0 {
-		return fallback()
+	if err != nil {
+		return 0, err
+	}
+	if len(relations) == 0 {
+		return fallback, nil
 	}
 	count := 0
 	for _, rel := range relations {
@@ -65,11 +207,13 @@ func (s *ControlPlaneService) subscriptionInventoryNodeCount(sub *subscription.S
 			count++
 		}
 	}
-	return count
+	return count, nil
 }
 
-func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) SubscriptionResponse {
-	nodeCount := s.subscriptionInventoryNodeCount(sub)
+func (s *ControlPlaneService) subscriptionHealthyNodeCount(sub *subscription.Subscription) int {
+	if sub == nil {
+		return 0
+	}
 	healthyNodeCount := 0
 	var isHealthyAndEnabled func(*node.NodeEntry) bool
 	if sub.Enabled() && s != nil && s.Pool != nil {
@@ -89,7 +233,10 @@ func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) Subs
 			return true
 		})
 	}
+	return healthyNodeCount
+}
 
+func (s *ControlPlaneService) subToResponseWithCounts(sub *subscription.Subscription, nodeCount, healthyNodeCount int) SubscriptionResponse {
 	resp := SubscriptionResponse{
 		ID:                      sub.ID,
 		Name:                    sub.Name(),
@@ -114,20 +261,145 @@ func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) Subs
 	return resp
 }
 
-// ListSubscriptions returns all subscriptions, optionally filtered by enabled.
-func (s *ControlPlaneService) ListSubscriptions(enabled *bool) ([]SubscriptionResponse, error) {
-	var result []SubscriptionResponse
-	s.SubMgr.Range(func(id string, sub *subscription.Subscription) bool {
-		if enabled != nil && sub.Enabled() != *enabled {
+func (s *ControlPlaneService) subToResponseWithNodeCount(sub *subscription.Subscription, nodeCount int) SubscriptionResponse {
+	return s.subToResponseWithCounts(sub, nodeCount, s.subscriptionHealthyNodeCount(sub))
+}
+
+func (s *ControlPlaneService) subscriptionRowToResponse(row subscriptionListRow, nodeCount int) SubscriptionResponse {
+	healthyNodeCount := 0
+	if row.runtime != nil {
+		healthyNodeCount = s.subscriptionHealthyNodeCount(row.runtime)
+	}
+	resp := SubscriptionResponse{
+		ID:                      row.ID,
+		Name:                    row.Name,
+		SourceType:              row.SourceType,
+		URL:                     row.URL,
+		Content:                 row.Content,
+		UpdateInterval:          time.Duration(row.UpdateIntervalNs).String(),
+		NodeCount:               nodeCount,
+		HealthyNodeCount:        healthyNodeCount,
+		Ephemeral:               row.Ephemeral,
+		EphemeralNodeEvictDelay: time.Duration(row.EphemeralNodeEvictDelayNs).String(),
+		Enabled:                 row.Enabled,
+		CreatedAt:               time.Unix(0, row.CreatedAtNs).UTC().Format(time.RFC3339Nano),
+	}
+	if row.LastCheckedNs > 0 {
+		resp.LastChecked = time.Unix(0, row.LastCheckedNs).UTC().Format(time.RFC3339Nano)
+	}
+	if row.LastUpdatedNs > 0 {
+		resp.LastUpdated = time.Unix(0, row.LastUpdatedNs).UTC().Format(time.RFC3339Nano)
+	}
+	resp.LastError = row.LastError
+	return resp
+}
+
+func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) SubscriptionResponse {
+	nodeCount, err := s.subscriptionInventoryNodeCount(sub)
+	if err != nil {
+		// Single-object responses predate DB-backed inventory counts. Keep them
+		// available if cache.db is temporarily unreadable; bulk list endpoints
+		// return the error instead of silently falling back.
+		nodeCount = subscriptionRuntimeNodeCount(sub)
+	}
+	return s.subToResponseWithNodeCount(sub, nodeCount)
+}
+
+// ListSubscriptions returns subscriptions from the selected source. By default
+// it lists the hot runtime manager (Active); callers can set Active=false to
+// inspect the full persisted DB inventory. Enabled filters only the
+// subscription enable/disable flag. Expensive per-row counts are computed after
+// pagination so small pages do not scan every subscription's node set.
+func (s *ControlPlaneService) ListSubscriptions(filters SubscriptionListFilters, opts SubscriptionListOptions) (SubscriptionListResult, error) {
+	if opts.Limit <= 0 {
+		opts.Limit = 50
+	}
+	if opts.Offset < 0 {
+		opts.Offset = 0
+	}
+	if filters.Active == nil || *filters.Active {
+		return s.listRuntimeSubscriptions(filters, opts)
+	}
+	return s.listInventorySubscriptions(filters, opts)
+}
+
+func (s *ControlPlaneService) listRuntimeSubscriptions(filters SubscriptionListFilters, opts SubscriptionListOptions) (SubscriptionListResult, error) {
+	rows := make([]subscriptionListRow, 0)
+	if s == nil || s.SubMgr == nil {
+		return SubscriptionListResult{Items: []SubscriptionResponse{}, Total: 0, Limit: opts.Limit, Offset: opts.Offset}, nil
+	}
+	s.SubMgr.Range(func(_ string, sub *subscription.Subscription) bool {
+		row := subscriptionRuntimeRow(sub)
+		if row.ID == "" {
 			return true
 		}
-		result = append(result, s.subToResponse(sub))
+		if filters.Enabled != nil && row.Enabled != *filters.Enabled {
+			return true
+		}
+		if !subscriptionRowMatchesKeyword(row, filters.Keyword) {
+			return true
+		}
+		rows = append(rows, row)
 		return true
 	})
-	if result == nil {
-		result = []SubscriptionResponse{}
+	sortSubscriptionRows(rows, opts)
+	total := len(rows)
+	pageRows := paginateSubscriptionRows(rows, opts)
+	items := make([]SubscriptionResponse, 0, len(pageRows))
+	for _, row := range pageRows {
+		items = append(items, s.subscriptionRowToResponse(row, subscriptionRuntimeNodeCount(row.runtime)))
 	}
-	return result, nil
+	return SubscriptionListResult{Items: items, Total: total, Limit: opts.Limit, Offset: opts.Offset}, nil
+}
+
+func (s *ControlPlaneService) listInventorySubscriptions(filters SubscriptionListFilters, opts SubscriptionListOptions) (SubscriptionListResult, error) {
+	rows := make([]subscriptionListRow, 0)
+	if s == nil || s.Engine == nil {
+		return SubscriptionListResult{}, internal("load subscription inventory", errors.New("state engine unavailable"))
+	}
+
+	subs, err := s.Engine.ListSubscriptions()
+	if err != nil {
+		return SubscriptionListResult{}, internal("load subscription inventory", err)
+	}
+	for _, sub := range subs {
+		var runtime *subscription.Subscription
+		if s.SubMgr != nil {
+			runtime = s.SubMgr.Lookup(sub.ID)
+		}
+		row := subscriptionInventoryRow(sub, runtime)
+		if filters.Enabled != nil && row.Enabled != *filters.Enabled {
+			continue
+		}
+		if !subscriptionRowMatchesKeyword(row, filters.Keyword) {
+			continue
+		}
+		rows = append(rows, row)
+	}
+
+	sortSubscriptionRows(rows, opts)
+	total := len(rows)
+	pageRows := paginateSubscriptionRows(rows, opts)
+	items := make([]SubscriptionResponse, 0, len(pageRows))
+
+	ids := make([]string, 0, len(pageRows))
+	for _, row := range pageRows {
+		ids = append(ids, row.ID)
+	}
+	counts, err := s.Engine.CountSubscriptionNodes(ids)
+	if err != nil {
+		return SubscriptionListResult{}, internal("count subscription inventory nodes", err)
+	}
+	for _, row := range pageRows {
+		items = append(items, s.subscriptionRowToResponse(row, counts[row.ID]))
+	}
+
+	return SubscriptionListResult{
+		Items:  items,
+		Total:  total,
+		Limit:  opts.Limit,
+		Offset: opts.Offset,
+	}, nil
 }
 
 // GetSubscription returns a single subscription by ID.

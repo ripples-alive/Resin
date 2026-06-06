@@ -2,60 +2,30 @@ package api
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/Resinat/Resin/internal/service"
 )
 
-func subscriptionMatchesKeyword(s service.SubscriptionResponse, keyword string) bool {
-	contains := func(v string) bool {
-		return strings.Contains(strings.ToLower(v), keyword)
-	}
-
-	return contains(s.ID) || contains(s.Name) || contains(s.URL) || contains(s.SourceType)
-}
-
-func filterSubscriptionsByKeyword(subs []service.SubscriptionResponse, rawKeyword string) []service.SubscriptionResponse {
-	keyword := strings.ToLower(strings.TrimSpace(rawKeyword))
-	if keyword == "" {
-		return subs
-	}
-	filtered := make([]service.SubscriptionResponse, 0, len(subs))
-	for _, sub := range subs {
-		if subscriptionMatchesKeyword(sub, keyword) {
-			filtered = append(filtered, sub)
-		}
-	}
-	return filtered
-}
-
-func subscriptionSortKey(sortBy string, s service.SubscriptionResponse) string {
-	switch sortBy {
-	case "created_at":
-		return s.CreatedAt
-	case "last_checked":
-		return s.LastChecked
-	case "last_updated":
-		return s.LastUpdated
-	default:
-		return s.Name
+func subscriptionListPageResponse(result service.SubscriptionListResult) PageResponse[service.SubscriptionResponse] {
+	return PageResponse[service.SubscriptionResponse]{
+		Items:  result.Items,
+		Total:  result.Total,
+		Limit:  result.Limit,
+		Offset: result.Offset,
 	}
 }
 
 // HandleListSubscriptions returns a handler for GET /api/v1/subscriptions.
 func HandleListSubscriptions(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		active, ok := parseBoolQueryOrWriteInvalid(w, r, "active")
+		if !ok {
+			return
+		}
 		enabled, ok := parseBoolQueryOrWriteInvalid(w, r, "enabled")
 		if !ok {
 			return
 		}
-		subs, err := cp.ListSubscriptions(enabled)
-		if err != nil {
-			writeServiceError(w, err)
-			return
-		}
-		subs = filterSubscriptionsByKeyword(subs, r.URL.Query().Get("keyword"))
-
 		sorting, ok := parseSortingOrWriteInvalid(
 			w,
 			r,
@@ -66,15 +36,29 @@ func HandleListSubscriptions(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		SortSlice(subs, sorting, func(s service.SubscriptionResponse) string {
-			return subscriptionSortKey(sorting.SortBy, s)
-		})
-
 		pg, ok := parsePaginationOrWriteInvalid(w, r)
 		if !ok {
 			return
 		}
-		WritePage(w, http.StatusOK, subs, pg)
+
+		result, err := cp.ListSubscriptions(
+			service.SubscriptionListFilters{
+				Active:  active,
+				Enabled: enabled,
+				Keyword: r.URL.Query().Get("keyword"),
+			},
+			service.SubscriptionListOptions{
+				SortBy:    sorting.SortBy,
+				SortOrder: sorting.SortOrder,
+				Limit:     pg.Limit,
+				Offset:    pg.Offset,
+			},
+		)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		WriteJSON(w, http.StatusOK, subscriptionListPageResponse(result))
 	}
 }
 

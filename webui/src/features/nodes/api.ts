@@ -75,6 +75,9 @@ export async function listNodes(filters: NodeListQuery): Promise<PageResponse<No
   appendIfNotEmpty("egress_ip", filters.egress_ip);
   appendIfNotEmpty("probed_since", filters.probed_since);
 
+  if (filters.active !== undefined) {
+    query.set("active", String(filters.active));
+  }
   if (filters.circuit_open !== undefined) {
     query.set("circuit_open", String(filters.circuit_open));
   }

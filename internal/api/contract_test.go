@@ -890,6 +890,154 @@ func TestAPIContract_KeywordFilteringOnListEndpoints(t *testing.T) {
 	}
 }
 
+func TestAPIContract_ListSubscriptionsActiveDefaultsToRuntimeAndAllUsesInventory(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+
+	createRec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/subscriptions", map[string]any{
+		"name":                       "Runtime Feed",
+		"source_type":                "remote",
+		"url":                        "https://example.com/runtime-feed",
+		"update_interval":            "6h",
+		"ephemeral":                  false,
+		"ephemeral_node_evict_delay": "72h",
+		"enabled":                    true,
+	}, true)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create subscription status: got %d, want %d, body=%s", createRec.Code, http.StatusCreated, createRec.Body.String())
+	}
+	createBody := decodeJSONMap(t, createRec)
+	subID, _ := createBody["id"].(string)
+	if subID == "" {
+		t.Fatalf("create subscription missing id: body=%s", createRec.Body.String())
+	}
+	sub := cp.SubMgr.Lookup(subID)
+	if sub == nil {
+		t.Fatalf("created subscription not registered: %s", subID)
+	}
+
+	disabledRec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/subscriptions", map[string]any{
+		"name":                       "Disabled Feed",
+		"source_type":                "remote",
+		"url":                        "https://example.com/disabled-feed",
+		"update_interval":            "6h",
+		"ephemeral":                  false,
+		"ephemeral_node_evict_delay": "72h",
+		"enabled":                    false,
+	}, true)
+	if disabledRec.Code != http.StatusCreated {
+		t.Fatalf("create disabled subscription status: got %d, want %d, body=%s", disabledRec.Code, http.StatusCreated, disabledRec.Body.String())
+	}
+
+	now := time.Now()
+	inventoryOnlyID := "00000000-0000-0000-0000-000000000042"
+	if err := cp.Engine.UpsertSubscription(model.Subscription{
+		ID:                        inventoryOnlyID,
+		Name:                      "Inventory Only Feed",
+		SourceType:                subscription.SourceTypeRemote,
+		URL:                       "https://example.com/inventory-only-feed",
+		UpdateIntervalNs:          int64(6 * time.Hour),
+		Enabled:                   true,
+		Ephemeral:                 false,
+		EphemeralNodeEvictDelayNs: int64(72 * time.Hour),
+		CreatedAtNs:               now.Add(-3 * time.Minute).UnixNano(),
+		UpdatedAtNs:               now.Add(-3 * time.Minute).UnixNano(),
+	}); err != nil {
+		t.Fatalf("UpsertSubscription inventory-only: %v", err)
+	}
+
+	runtimeRaw := []byte(`{"type":"ss","server":"1.1.1.1","port":443}`)
+	coldRaw := []byte(`{"type":"ss","server":"2.2.2.2","port":443}`)
+	inventoryOnlyRaw := []byte(`{"type":"ss","server":"3.3.3.3","port":443}`)
+
+	runtimeHash := node.HashFromRawOptions(runtimeRaw)
+	coldHash := node.HashFromRawOptions(coldRaw)
+	inventoryOnlyHash := node.HashFromRawOptions(inventoryOnlyRaw)
+
+	cp.Pool.AddNodeFromSub(runtimeHash, runtimeRaw, subID)
+	sub.ManagedNodes().StoreNode(runtimeHash, subscription.ManagedNode{Tags: []string{"runtime"}})
+	entry, ok := cp.Pool.GetEntry(runtimeHash)
+	if !ok {
+		t.Fatal("runtime entry missing")
+	}
+	outbound := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&outbound)
+	cp.Pool.RecordResult(runtimeHash, true)
+
+	if err := cp.Engine.ReplaceSubscriptionRefresh(subID,
+		[]model.NodeStatic{
+			{Hash: runtimeHash.Hex(), RawOptions: runtimeRaw, CreatedAtNs: now.Add(-2 * time.Minute).UnixNano()},
+			{Hash: coldHash.Hex(), RawOptions: coldRaw, CreatedAtNs: now.Add(-time.Minute).UnixNano()},
+		},
+		[]model.SubscriptionNode{
+			{SubscriptionID: subID, NodeHash: runtimeHash.Hex(), Tags: []string{"runtime"}},
+			{SubscriptionID: subID, NodeHash: coldHash.Hex(), Tags: []string{"cold"}},
+		},
+		nil,
+	); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh runtime feed: %v", err)
+	}
+	if err := cp.Engine.ReplaceSubscriptionRefresh(inventoryOnlyID,
+		[]model.NodeStatic{{Hash: inventoryOnlyHash.Hex(), RawOptions: inventoryOnlyRaw, CreatedAtNs: now.UnixNano()}},
+		[]model.SubscriptionNode{{SubscriptionID: inventoryOnlyID, NodeHash: inventoryOnlyHash.Hex(), Tags: []string{"inventory-only"}}},
+		nil,
+	); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh inventory-only feed: %v", err)
+	}
+
+	findByName := func(items []any, name string) map[string]any {
+		t.Helper()
+		for _, raw := range items {
+			item := raw.(map[string]any)
+			if item["name"] == name {
+				return item
+			}
+		}
+		t.Fatalf("item %q not found in %v", name, items)
+		return nil
+	}
+
+	defaultRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/subscriptions?enabled=true&limit=50&offset=0", nil, true)
+	if defaultRec.Code != http.StatusOK {
+		t.Fatalf("default active list status: got %d, want %d, body=%s", defaultRec.Code, http.StatusOK, defaultRec.Body.String())
+	}
+	defaultBody := decodeJSONMap(t, defaultRec)
+	if got := defaultBody["total"]; got != float64(1) {
+		t.Fatalf("default active total: got %v, want 1 body=%s", got, defaultRec.Body.String())
+	}
+	defaultItems := defaultBody["items"].([]any)
+	defaultItem := findByName(defaultItems, "Runtime Feed")
+	if got := defaultItem["node_count"]; got != float64(1) {
+		t.Fatalf("default active node_count: got %v, want runtime count 1 body=%s", got, defaultRec.Body.String())
+	}
+
+	allRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/subscriptions?active=false&enabled=true&limit=50&offset=0", nil, true)
+	if allRec.Code != http.StatusOK {
+		t.Fatalf("all inventory list status: got %d, want %d, body=%s", allRec.Code, http.StatusOK, allRec.Body.String())
+	}
+	allBody := decodeJSONMap(t, allRec)
+	if got := allBody["total"]; got != float64(2) {
+		t.Fatalf("all inventory total: got %v, want 2 body=%s", got, allRec.Body.String())
+	}
+	allItems := allBody["items"].([]any)
+	runtimeItem := findByName(allItems, "Runtime Feed")
+	if got := runtimeItem["node_count"]; got != float64(2) {
+		t.Fatalf("all inventory runtime node_count: got %v, want DB inventory count 2 body=%s", got, allRec.Body.String())
+	}
+	inventoryOnlyItem := findByName(allItems, "Inventory Only Feed")
+	if got := inventoryOnlyItem["node_count"]; got != float64(1) {
+		t.Fatalf("all inventory-only node_count: got %v, want DB inventory count 1 body=%s", got, allRec.Body.String())
+	}
+
+	disabledOnlyRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/subscriptions?active=false&enabled=false&limit=50&offset=0", nil, true)
+	if disabledOnlyRec.Code != http.StatusOK {
+		t.Fatalf("disabled inventory list status: got %d, want %d, body=%s", disabledOnlyRec.Code, http.StatusOK, disabledOnlyRec.Body.String())
+	}
+	disabledOnlyBody := decodeJSONMap(t, disabledOnlyRec)
+	if got := disabledOnlyBody["total"]; got != float64(1) {
+		t.Fatalf("disabled inventory total: got %v, want 1 body=%s", got, disabledOnlyRec.Body.String())
+	}
+}
+
 func TestAPIContract_PlatformStickyTTLMustBePositive(t *testing.T) {
 	srv, _, _ := newControlPlaneTestServer(t)
 

@@ -342,3 +342,43 @@ func TestHandleListNodes_ListsActiveRuntimeNodesOnly(t *testing.T) {
 		t.Fatalf("active runtime hashes = %v, should not include inventory-only %s", seen, coldHash)
 	}
 }
+
+func TestHandleListNodes_AllInventoryPaginatesFromDBBeforeSummaryConstruction(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+
+	subA := subscription.NewSubscription("22222222-2222-2222-2222-222222222222", "sub-a", "https://example.com/a", true, false)
+	cp.SubMgr.Register(subA)
+	now := time.Now().UnixNano()
+	statics := make([]model.NodeStatic, 0, 5)
+	rels := make([]model.SubscriptionNode, 0, 5)
+	for i, tag := range []string{"a", "b", "c", "d", "e"} {
+		raw := []byte(`{"type":"ss","server":"198.51.100.` + string(rune('1'+i)) + `","port":443}`)
+		hash := node.HashFromRawOptions(raw).Hex()
+		statics = append(statics, model.NodeStatic{Hash: hash, RawOptions: raw, CreatedAtNs: now + int64(i)})
+		rels = append(rels, model.SubscriptionNode{SubscriptionID: subA.ID, NodeHash: hash, Tags: []string{tag}})
+	}
+	if err := cp.Engine.ReplaceSubscriptionRefresh(subA.ID, statics, rels, nil); err != nil {
+		t.Fatalf("seed inventory rows: %v", err)
+	}
+
+	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?active=false&limit=2&offset=1&sort_by=tag&sort_order=asc", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("inventory page status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := decodeJSONMap(t, rec)
+	if body["total"] != float64(5) {
+		t.Fatalf("total: got %v, want 5 body=%s", body["total"], rec.Body.String())
+	}
+	items := body["items"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("items len = %d, want 2 body=%s", len(items), rec.Body.String())
+	}
+	gotTags := []string{
+		items[0].(map[string]any)["display_tag"].(string),
+		items[1].(map[string]any)["display_tag"].(string),
+	}
+	wantTags := []string{"sub-a/b", "sub-a/c"}
+	if gotTags[0] != wantTags[0] || gotTags[1] != wantTags[1] {
+		t.Fatalf("display tags = %v, want %v", gotTags, wantTags)
+	}
+}

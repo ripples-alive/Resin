@@ -272,6 +272,90 @@ func TestCacheRepo_SubscriptionNodes_BulkDelete(t *testing.T) {
 	}
 }
 
+func TestCacheRepo_CountSubscriptionNodes_BatchedInventoryCounts(t *testing.T) {
+	repo := newTestCacheRepo(t)
+
+	if err := repo.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{
+		{SubscriptionID: "s1", NodeHash: "n1", Tags: []string{}, Evicted: false},
+		{SubscriptionID: "s1", NodeHash: "n2", Tags: []string{}, Evicted: true},
+		{SubscriptionID: "s2", NodeHash: "n3", Tags: []string{}, Evicted: false},
+		{SubscriptionID: "s2", NodeHash: "n4", Tags: []string{}, Evicted: false},
+	}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	got, err := repo.CountSubscriptionNodes([]string{"s2", "s1", "s1", "missing"})
+	if err != nil {
+		t.Fatalf("CountSubscriptionNodes: %v", err)
+	}
+	if got["s1"] != 1 || got["s2"] != 2 || got["missing"] != 0 {
+		t.Fatalf("counts: got %+v, want s1=1 s2=2 missing=0", got)
+	}
+}
+
+func TestCacheRepo_ListNodeInventoryPage_PaginatesAndCountsInDB(t *testing.T) {
+	stateDir := t.TempDir()
+	cacheDir := t.TempDir()
+	engine, closer, err := PersistenceBootstrap(stateDir, cacheDir)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	for _, sub := range []model.Subscription{
+		{ID: "sub-alpha", Name: "Alpha", URL: "https://example.com/a", UpdateIntervalNs: int64(30 * time.Second), Enabled: true, EphemeralNodeEvictDelayNs: int64(72 * time.Hour), CreatedAtNs: 20, UpdatedAtNs: 20},
+		{ID: "sub-beta", Name: "Beta", URL: "https://example.com/b", UpdateIntervalNs: int64(30 * time.Second), Enabled: true, EphemeralNodeEvictDelayNs: int64(72 * time.Hour), CreatedAtNs: 10, UpdatedAtNs: 10},
+	} {
+		if err := engine.UpsertSubscription(sub); err != nil {
+			t.Fatalf("UpsertSubscription(%s): %v", sub.ID, err)
+		}
+	}
+
+	statics := []model.NodeStatic{
+		{Hash: "hash-beta-z", RawOptions: json.RawMessage(`{"server":"1.1.1.1"}`), CreatedAtNs: 100},
+		{Hash: "hash-alpha-a", RawOptions: json.RawMessage(`{"server":"2.2.2.2"}`), CreatedAtNs: 200},
+		{Hash: "hash-beta-b", RawOptions: json.RawMessage(`{"server":"3.3.3.3"}`), CreatedAtNs: 300},
+	}
+	rels := []model.SubscriptionNode{
+		{SubscriptionID: "sub-beta", NodeHash: "hash-beta-z", Tags: []string{"z"}},
+		{SubscriptionID: "sub-alpha", NodeHash: "hash-alpha-a", Tags: []string{"a"}},
+		{SubscriptionID: "sub-beta", NodeHash: "hash-beta-b", Tags: []string{"b"}},
+	}
+	if err := engine.ReplaceSubscriptionRefresh("sub-beta", statics, rels, nil); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh: %v", err)
+	}
+	if err := engine.BulkUpsertNodesDynamic([]model.NodeDynamic{
+		{Hash: "hash-beta-z", EgressIP: "203.0.113.10", EgressRegion: "us", FailureCount: 2},
+		{Hash: "hash-alpha-a", EgressIP: "203.0.113.11", EgressRegion: "jp", FailureCount: 1},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
+
+	page, err := engine.ListNodeInventoryPage(NodeInventoryListOptions{
+		SortBy:    "tag",
+		SortOrder: "asc",
+		Limit:     2,
+		Offset:    1,
+	})
+	if err != nil {
+		t.Fatalf("ListNodeInventoryPage: %v", err)
+	}
+	if page.Total != 3 {
+		t.Fatalf("total = %d, want 3", page.Total)
+	}
+	if page.UniqueEgressIPs != 2 {
+		t.Fatalf("unique egress IPs = %d, want 2", page.UniqueEgressIPs)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("items len = %d, want 2: %+v", len(page.Items), page.Items)
+	}
+	gotHashes := []string{page.Items[0].Static.Hash, page.Items[1].Static.Hash}
+	wantHashes := []string{"hash-beta-b", "hash-beta-z"}
+	if !reflect.DeepEqual(gotHashes, wantHashes) {
+		t.Fatalf("page hashes = %v, want %v", gotHashes, wantHashes)
+	}
+}
+
 func TestMigrateCacheDB_BackfillsLegacyNextLatencyProbeDue(t *testing.T) {
 	dir := t.TempDir()
 	db, err := OpenDB(dir + "/cache.db")

@@ -2,15 +2,19 @@ package service
 
 import (
 	"net/netip"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/geoip"
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/probe"
+	"github.com/Resinat/Resin/internal/state"
 	"github.com/Resinat/Resin/internal/subscription"
 	"github.com/Resinat/Resin/internal/testutil"
 	"github.com/Resinat/Resin/internal/topology"
@@ -239,6 +243,364 @@ func TestGetNode_TagIncludesSubscriptionNamePrefix(t *testing.T) {
 	}
 	if got.Tags[0].Tag != "sub-a/tag" {
 		t.Fatalf("tag = %q, want %q", got.Tags[0].Tag, "sub-a/tag")
+	}
+}
+
+func TestListNodes_ActiveTrueUsesRuntimePoolActiveFalseMergesInventoryAndRuntimeWithRuntimePriority(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(filepath.Join(dir, "state"), filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	subMgr := topology.NewSubscriptionManager()
+	pool := newNodeListTestPool(subMgr)
+	sub := subscription.NewSubscription("sub-a", "sub-a", "https://example.com/a", true, false)
+	subMgr.Register(sub)
+
+	overlapRaw := []byte(`{"type":"ss","server":"1.1.1.1","port":443}`)
+	memoryOnlyRaw := []byte(`{"type":"ss","server":"3.3.3.3","port":443}`)
+	coldRaw := []byte(`{"type":"ss","server":"2.2.2.2","port":443}`)
+	overlapHash := addRoutableNodeForSubscriptionWithTag(t, pool, sub, overlapRaw, "203.0.113.30", "runtime-overlap")
+	memoryOnlyHash := addRoutableNodeForSubscriptionWithTag(t, pool, sub, memoryOnlyRaw, "203.0.113.31", "runtime-only")
+	coldHash := node.HashFromRawOptions(coldRaw)
+
+	if err := engine.ReplaceSubscriptionRefresh(sub.ID,
+		[]model.NodeStatic{
+			{Hash: overlapHash.Hex(), RawOptions: overlapRaw, CreatedAtNs: time.Now().Add(-2 * time.Minute).UnixNano()},
+			{Hash: coldHash.Hex(), RawOptions: coldRaw, CreatedAtNs: time.Now().Add(-time.Minute).UnixNano()},
+		},
+		[]model.SubscriptionNode{
+			{SubscriptionID: sub.ID, NodeHash: overlapHash.Hex(), Tags: []string{"inventory-overlap"}},
+			{SubscriptionID: sub.ID, NodeHash: coldHash.Hex(), Tags: []string{"cold"}},
+		},
+		nil,
+	); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh: %v", err)
+	}
+
+	cp := &ControlPlaneService{Engine: engine, Pool: pool, SubMgr: subMgr, GeoIP: &geoip.Service{}}
+	activeOnly := true
+	activeNodes, err := cp.ListNodes(NodeFilters{Active: &activeOnly})
+	if err != nil {
+		t.Fatalf("ListNodes(active=true): %v", err)
+	}
+	activeSeen := make(map[string]NodeSummary)
+	for _, n := range activeNodes {
+		activeSeen[n.NodeHash] = n
+	}
+	if len(activeSeen) != 2 || !activeSeen[overlapHash.Hex()].HasOutbound || !activeSeen[memoryOnlyHash.Hex()].HasOutbound {
+		t.Fatalf("active nodes = %+v, want only runtime overlap+memory-only", activeNodes)
+	}
+	if _, ok := activeSeen[coldHash.Hex()]; ok {
+		t.Fatalf("active nodes should not include DB-only cold hash %s: %+v", coldHash.Hex(), activeNodes)
+	}
+
+	allInventory := false
+	allNodes, err := cp.ListNodes(NodeFilters{Active: &allInventory})
+	if err != nil {
+		t.Fatalf("ListNodes(active=false): %v", err)
+	}
+	seen := make(map[string]NodeSummary)
+	for _, n := range allNodes {
+		seen[n.NodeHash] = n
+	}
+	if len(seen) != 3 {
+		t.Fatalf("inventory+runtime nodes len = %d, want 3: %+v", len(seen), allNodes)
+	}
+	overlap, ok := seen[overlapHash.Hex()]
+	if !ok {
+		t.Fatalf("merged nodes missing overlap hash %s: %+v", overlapHash.Hex(), allNodes)
+	}
+	if !overlap.HasOutbound || len(overlap.Tags) != 1 || overlap.Tags[0].Tag != "sub-a/runtime-overlap" {
+		t.Fatalf("overlap summary = %+v, want runtime summary to win", overlap)
+	}
+	memoryOnly, ok := seen[memoryOnlyHash.Hex()]
+	if !ok {
+		t.Fatalf("merged nodes missing memory-only hash %s: %+v", memoryOnlyHash.Hex(), allNodes)
+	}
+	if !memoryOnly.HasOutbound || len(memoryOnly.Tags) != 1 || memoryOnly.Tags[0].Tag != "sub-a/runtime-only" {
+		t.Fatalf("memory-only summary = %+v, want runtime summary", memoryOnly)
+	}
+	cold, ok := seen[coldHash.Hex()]
+	if !ok {
+		t.Fatalf("merged nodes missing DB-only cold hash %s: %+v", coldHash.Hex(), allNodes)
+	}
+	if cold.HasOutbound || len(cold.Tags) != 1 || cold.Tags[0].Tag != "sub-a/cold" {
+		t.Fatalf("cold summary = %+v, want DB inventory summary", cold)
+	}
+}
+
+func TestListNodes_ActiveFalseKeepsInventoryMatchWhenRuntimeDoesNotMatchFilter(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(filepath.Join(dir, "state"), filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	subMgr := topology.NewSubscriptionManager()
+	pool := newNodeListTestPool(subMgr)
+	sub := subscription.NewSubscription("sub-a", "sub-a", "https://example.com/a", true, false)
+	subMgr.Register(sub)
+
+	raw := []byte(`{"type":"ss","server":"4.4.4.4","port":443}`)
+	hash := addRoutableNodeForSubscriptionWithTag(t, pool, sub, raw, "203.0.113.40", "runtime-only")
+	if err := engine.ReplaceSubscriptionRefresh(sub.ID,
+		[]model.NodeStatic{{Hash: hash.Hex(), RawOptions: raw, CreatedAtNs: time.Now().Add(-time.Minute).UnixNano()}},
+		[]model.SubscriptionNode{{SubscriptionID: sub.ID, NodeHash: hash.Hex(), Tags: []string{"inventory-only"}}},
+		nil,
+	); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh: %v", err)
+	}
+
+	cp := &ControlPlaneService{Engine: engine, Pool: pool, SubMgr: subMgr, GeoIP: &geoip.Service{}}
+	allInventory := false
+	keyword := "inventory-only"
+	nodes, err := cp.ListNodes(NodeFilters{Active: &allInventory, TagKeyword: &keyword})
+	if err != nil {
+		t.Fatalf("ListNodes(active=false tag_keyword): %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].NodeHash != hash.Hex() {
+		t.Fatalf("nodes = %+v, want DB inventory match %s", nodes, hash.Hex())
+	}
+	if nodes[0].HasOutbound || len(nodes[0].Tags) != 1 || nodes[0].Tags[0].Tag != "sub-a/inventory-only" {
+		t.Fatalf("node = %+v, want inventory summary because runtime did not match filter", nodes[0])
+	}
+}
+
+type fixedGeoReader struct {
+	regions map[string]string
+}
+
+func (r fixedGeoReader) Lookup(ip netip.Addr) string {
+	if r.regions == nil {
+		return ""
+	}
+	return r.regions[ip.String()]
+}
+
+func (fixedGeoReader) Close() error { return nil }
+
+func newStartedFixedGeoIP(t *testing.T, regions map[string]string) *geoip.Service {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "country.mmdb"), []byte("test-db"), 0o644); err != nil {
+		t.Fatalf("write fake geoip db: %v", err)
+	}
+	svc := geoip.NewService(geoip.ServiceConfig{
+		CacheDir: dir,
+		OpenDB: func(string) (geoip.GeoReader, error) {
+			return fixedGeoReader{regions: regions}, nil
+		},
+	})
+	if err := svc.Start(); err != nil {
+		t.Fatalf("start fake geoip service: %v", err)
+	}
+	t.Cleanup(svc.Stop)
+	return svc
+}
+
+func TestListNodesPage_ActiveFalseSubscriptionIDUsesDBMetadataWhenRuntimeMissing(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(filepath.Join(dir, "state"), filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	now := time.Now()
+	subID := "db-only-sub"
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:                        subID,
+		Name:                      "DB Only",
+		URL:                       "https://example.com/db-only",
+		UpdateIntervalNs:          int64(6 * time.Hour),
+		Enabled:                   true,
+		EphemeralNodeEvictDelayNs: int64(72 * time.Hour),
+		CreatedAtNs:               now.Add(-time.Hour).UnixNano(),
+		UpdatedAtNs:               now.UnixNano(),
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	raw := []byte(`{"type":"ss","server":"5.5.5.5","port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	if err := engine.ReplaceSubscriptionRefresh(subID,
+		[]model.NodeStatic{{Hash: hash.Hex(), RawOptions: raw, CreatedAtNs: now.UnixNano()}},
+		[]model.SubscriptionNode{{SubscriptionID: subID, NodeHash: hash.Hex(), Tags: []string{"cold"}}},
+		nil,
+	); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh: %v", err)
+	}
+
+	cp := &ControlPlaneService{
+		Engine: engine,
+		Pool:   newNodeListTestPool(topology.NewSubscriptionManager()),
+		SubMgr: topology.NewSubscriptionManager(),
+		GeoIP:  &geoip.Service{},
+	}
+	allInventory := false
+	page, err := cp.ListNodesPage(NodeFilters{Active: &allInventory, SubscriptionID: &subID}, NodeListPageOptions{
+		SortBy: "created_at",
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatalf("ListNodesPage(active=false subscription_id DB-only): %v", err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].NodeHash != hash.Hex() {
+		t.Fatalf("page = %+v, want the DB-only subscription node %s", page, hash.Hex())
+	}
+	if page.Items[0].DisplayTag != "DB Only/cold" {
+		t.Fatalf("display_tag = %q, want %q", page.Items[0].DisplayTag, "DB Only/cold")
+	}
+}
+
+func TestListNodesPage_ActiveFalseInventoryRegionMatchesPersistedRegionOnly(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(filepath.Join(dir, "state"), filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	now := time.Now()
+	subID := "sub-a"
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:                        subID,
+		Name:                      "Sub A",
+		URL:                       "https://example.com/a",
+		UpdateIntervalNs:          int64(6 * time.Hour),
+		Enabled:                   true,
+		EphemeralNodeEvictDelayNs: int64(72 * time.Hour),
+		CreatedAtNs:               now.Add(-time.Hour).UnixNano(),
+		UpdatedAtNs:               now.UnixNano(),
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+
+	rawFallback := []byte(`{"type":"ss","server":"6.6.6.6","port":443}`)
+	hashFallback := node.HashFromRawOptions(rawFallback)
+	rawStored := []byte(`{"type":"ss","server":"7.7.7.7","port":443}`)
+	hashStored := node.HashFromRawOptions(rawStored)
+	if err := engine.ReplaceSubscriptionRefresh(subID,
+		[]model.NodeStatic{
+			{Hash: hashFallback.Hex(), RawOptions: rawFallback, CreatedAtNs: now.Add(-2 * time.Minute).UnixNano()},
+			{Hash: hashStored.Hex(), RawOptions: rawStored, CreatedAtNs: now.Add(-time.Minute).UnixNano()},
+		},
+		[]model.SubscriptionNode{
+			{SubscriptionID: subID, NodeHash: hashFallback.Hex(), Tags: []string{"fallback"}},
+			{SubscriptionID: subID, NodeHash: hashStored.Hex(), Tags: []string{"stored"}},
+		},
+		nil,
+	); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh: %v", err)
+	}
+	if err := engine.BulkUpsertNodesDynamic([]model.NodeDynamic{
+		{Hash: hashFallback.Hex(), EgressIP: "198.51.100.10", EgressRegion: ""},
+		{Hash: hashStored.Hex(), EgressIP: "198.51.100.11", EgressRegion: "jp"},
+	}); err != nil {
+		t.Fatalf("BulkUpsertNodesDynamic: %v", err)
+	}
+
+	cp := &ControlPlaneService{
+		Engine: engine,
+		Pool:   newNodeListTestPool(topology.NewSubscriptionManager()),
+		SubMgr: topology.NewSubscriptionManager(),
+		GeoIP:  newStartedFixedGeoIP(t, map[string]string{"198.51.100.10": "jp"}),
+	}
+	allInventory := false
+	page, err := cp.ListNodesPage(NodeFilters{Active: &allInventory}, NodeListPageOptions{
+		SortBy: "created_at",
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatalf("ListNodesPage(active=false): %v", err)
+	}
+	byHash := make(map[string]NodeSummary, len(page.Items))
+	for _, item := range page.Items {
+		byHash[item.NodeHash] = item
+	}
+	if got := byHash[hashFallback.Hex()].Region; got != "" {
+		t.Fatalf("DB inventory summary region with empty persisted region = %q, want empty even when GeoIP can resolve it", got)
+	}
+	if got := byHash[hashStored.Hex()].Region; got != "jp" {
+		t.Fatalf("DB inventory summary region with stored region = %q, want jp", got)
+	}
+
+	sortedByRegion, err := cp.ListNodesPage(NodeFilters{Active: &allInventory}, NodeListPageOptions{
+		SortBy: "region",
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatalf("ListNodesPage(active=false sort_by=region): %v", err)
+	}
+	if len(sortedByRegion.Items) != 2 || sortedByRegion.Items[0].NodeHash != hashFallback.Hex() || sortedByRegion.Items[1].NodeHash != hashStored.Hex() {
+		t.Fatalf("region-sorted page = %+v, want empty persisted region before jp", sortedByRegion.Items)
+	}
+
+	region := "jp"
+	filtered, err := cp.ListNodesPage(NodeFilters{Active: &allInventory, Region: &region}, NodeListPageOptions{
+		SortBy: "created_at",
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatalf("ListNodesPage(active=false region=jp): %v", err)
+	}
+	if filtered.Total != 1 || len(filtered.Items) != 1 || filtered.Items[0].NodeHash != hashStored.Hex() {
+		t.Fatalf("region-filtered page = %+v, want only persisted-region node %s", filtered, hashStored.Hex())
+	}
+}
+
+func TestListNodesPage_ActiveFalseHasOutboundFalseDoesNotReturnRuntimeOutboundAsInventoryCold(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(filepath.Join(dir, "state"), filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	subMgr := topology.NewSubscriptionManager()
+	pool := newNodeListTestPool(subMgr)
+	sub := subscription.NewSubscription("sub-a", "sub-a", "https://example.com/a", true, false)
+	sub.CreatedAtNs = time.Now().Add(-time.Hour).UnixNano()
+	subMgr.Register(sub)
+
+	raw := []byte(`{"type":"ss","server":"8.8.8.8","port":443}`)
+	hash := addRoutableNodeForSubscriptionWithTag(t, pool, sub, raw, "203.0.113.88", "runtime")
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:                        sub.ID,
+		Name:                      sub.Name(),
+		URL:                       sub.URL(),
+		Enabled:                   true,
+		UpdateIntervalNs:          int64(6 * time.Hour),
+		EphemeralNodeEvictDelayNs: int64(72 * time.Hour),
+		CreatedAtNs:               sub.CreatedAtNs,
+		UpdatedAtNs:               time.Now().UnixNano(),
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+	if err := engine.ReplaceSubscriptionRefresh(sub.ID,
+		[]model.NodeStatic{{Hash: hash.Hex(), RawOptions: raw, CreatedAtNs: time.Now().UnixNano()}},
+		[]model.SubscriptionNode{{SubscriptionID: sub.ID, NodeHash: hash.Hex(), Tags: []string{"inventory"}}},
+		nil,
+	); err != nil {
+		t.Fatalf("ReplaceSubscriptionRefresh: %v", err)
+	}
+
+	cp := &ControlPlaneService{Engine: engine, Pool: pool, SubMgr: subMgr, GeoIP: &geoip.Service{}}
+	allInventory := false
+	hasOutbound := false
+	page, err := cp.ListNodesPage(NodeFilters{Active: &allInventory, HasOutbound: &hasOutbound}, NodeListPageOptions{
+		SortBy: "created_at",
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatalf("ListNodesPage(active=false has_outbound=false): %v", err)
+	}
+	if page.Total != 0 || len(page.Items) != 0 {
+		t.Fatalf("page = %+v, want runtime node with outbound excluded instead of DB cold summary", page)
 	}
 }
 
