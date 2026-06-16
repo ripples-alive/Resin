@@ -35,6 +35,7 @@ func closeOutboundAsync(ob adapter.Outbound, reason string) {
 	select {
 	case asyncCloseCh <- ob:
 	default:
-		log.Printf("outbound: async close queue full; dropping %s close for type=%s tag=%s", reason, ob.Type(), ob.Tag())
+		log.Printf("outbound: async close queue full; closing %s synchronously for type=%s tag=%s", reason, ob.Type(), ob.Tag())
+		closeOutbound(ob)
 	}
 }
